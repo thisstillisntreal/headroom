@@ -6,8 +6,10 @@ The response is bound to the account by comparing the organization id the
 provider returns against the identity bound inside that slot's config home —
 a clobbered or swapped login can never report another account's headroom.
 
-Codex: the Codex CLI writes ``rate_limits`` telemetry into its session logs on
-every turn. We read the newest event from disk. No network, no tokens spent.
+Codex: read live from the Codex app-server (``codex app-server`` ->
+``account/rateLimits/read`` + ``account/read``), identity-bound to each slot's
+CODEX_HOME. Falls back to on-disk ``rate_limits`` session telemetry only when
+the app-server is unavailable (older Codex CLI). No inference tokens spent.
 
 Fail-closed rules:
   * an account with unverifiable identity or an out-of-range reading is HELD
@@ -240,6 +242,138 @@ def claude_identity(home, runner=subprocess.run):
         except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
             pass
     return claude_local_identity(home)
+
+
+def codex_bin():
+    return shutil.which("codex")
+
+
+def codex_app_server_read(home, timeout=None):
+    """Live Codex read via the codex app-server (`codex app-server`, JSON-RPC
+    over stdio): real-time rate limits AND the network-verified logged-in
+    account, both bound to this slot's CODEX_HOME. This replaces stale
+    session-log scraping — Codex usage becomes as live as Claude's.
+
+    Returns {"account": {...email, planType...}, "rate_limits": {...}} or
+    raises IdentityBindingError."""
+    import threading
+    timeout = int(os.environ.get("HEADROOM_CODEX_APPSERVER_TIMEOUT", "25")) \
+        if timeout is None else timeout
+    binary = codex_bin()
+    if not binary:
+        raise IdentityBindingError("codex_cli_missing")
+    env = scrubbed_env()
+    env["CODEX_HOME"] = home
+    try:
+        proc = subprocess.Popen(
+            [binary, "app-server"], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            env=env, bufsize=1)
+    except OSError as error:
+        raise IdentityBindingError("codex_app_server_spawn_failed") from error
+    stdin, stdout = proc.stdin, proc.stdout
+    if stdin is None or stdout is None:
+        raise IdentityBindingError("codex_app_server_spawn_failed")
+    responses = {}
+
+    def reader():
+        for line in stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if isinstance(message, dict) and "id" in message:
+                responses[message["id"]] = message
+
+    threading.Thread(target=reader, daemon=True).start()
+
+    def send(obj):
+        stdin.write(json.dumps(obj) + "\n")
+        stdin.flush()
+
+    deadline = time.time() + timeout
+    try:
+        send({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+              "params": {"clientInfo": {"name": "headroom", "version": "0.1"}}})
+        while 1 not in responses and time.time() < deadline:
+            time.sleep(0.05)
+        send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+        send({"jsonrpc": "2.0", "id": 2,
+              "method": "account/rateLimits/read", "params": {}})
+        send({"jsonrpc": "2.0", "id": 3, "method": "account/read", "params": {}})
+        while (2 not in responses or 3 not in responses) \
+                and time.time() < deadline:
+            time.sleep(0.05)
+    except (OSError, ValueError):
+        raise IdentityBindingError("codex_app_server_io_failed")
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=3)
+        except (subprocess.SubprocessError, OSError):
+            proc.kill()
+    if 2 not in responses or 3 not in responses:
+        raise IdentityBindingError("codex_app_server_no_response")
+    for request_id in (2, 3):
+        if responses[request_id].get("error"):
+            raise IdentityBindingError("codex_app_server_error")
+    account = (responses[3].get("result") or {}).get("account") or {}
+    rate_limits = (responses[2].get("result") or {}).get("rateLimits") or {}
+    return {"account": account, "rate_limits": rate_limits}
+
+
+def codex_window(window, now):
+    """Map an app-server RateLimitWindow to a headroom usage window (live)."""
+    if not isinstance(window, dict):
+        return None
+    used = window.get("usedPercent")
+    if not isinstance(used, (int, float)) or isinstance(used, bool) \
+            or not 0 <= used <= 100:
+        return None
+    return {
+        "used_percent": float(used),
+        "resets_at": iso_ep(window.get("resetsAt")),
+        "window_minutes": window.get("windowDurationMins"),
+        "observed_at": now,
+        "freshness": "fresh",
+    }
+
+
+def codex_live(home, expected_email=None, now=None):
+    """Full live Codex read: network-verified identity + real-time windows.
+    account_fingerprint/credential come from the local id token (stable);
+    email/plan/usage come live from the app-server."""
+    now = int(time.time()) if now is None else now
+    auth = paths.load_json(os.path.join(home, "auth.json"))
+    if not auth:
+        raise IdentityBindingError("codex_auth_missing")
+    claims = decode_jwt_payload((auth.get("tokens") or {}).get("id_token"))
+    provider_claims = claims.get("https://api.openai.com/auth") or {}
+    account_id = provider_claims.get("chatgpt_account_id") or claims.get("sub")
+    read = codex_app_server_read(home)
+    account = read["account"]
+    email = account.get("email") or claims.get("email")
+    if not email:
+        raise IdentityBindingError("codex_identity_email_missing")
+    if expected_email and email.lower() != expected_email.lower():
+        raise IdentityBindingError("slot_bound_to_unexpected_email")
+    plan_type = account.get("planType") or provider_claims.get("chatgpt_plan_type")
+    rate_limits = read["rate_limits"]
+    identity = {
+        "verified": True,
+        "email": email,
+        "account_fingerprint": fingerprint(account_id),
+        "method": "codex_app_server",
+        "plan_type": plan_type,
+        "credential_digest": credential_digest("codex", home),
+        "subscription": codex_subscription(provider_claims),
+    }
+    windows = {"5h": codex_window(rate_limits.get("primary"), now),
+               "7d": codex_window(rate_limits.get("secondary"), now)}
+    return identity, plan_type, windows
 
 
 def codex_identity(home, opener=open_authenticated):
@@ -584,29 +718,54 @@ def collect(accounts, backoff=None, persist_backoff=None):
                 validate_required_windows(result["windows"])
                 result["ok"] = True
             else:
-                identity = codex_identity(account["home"])
-                identity["credential_digest"] = credential_digest("codex", account["home"])
-                result["identity"] = identity
-                result["identity_verified"] = identity["verified"]
-                result["identity_method"] = identity["method"]
-                result["email"] = identity["email"]
-                result["subscription"] = identity.get("subscription")
                 expected = account.get("expected_email")
-                if expected and identity["email"].lower() != expected.lower():
-                    raise IdentityBindingError("slot_bound_to_unexpected_email")
-                telemetry = codex_limits(account["home"], now=now)
-                plan_type = str(telemetry.pop("plan_type", None)
-                                or identity.get("plan_type") or "")
-                result["plan"] = {"pro": "ChatGPT Pro", "plus": "ChatGPT Plus",
-                                  "prolite": "ChatGPT Pro Lite",
-                                  "free": "Free"}.get(plan_type,
-                                                      plan_type or "Unknown")
-                result.update(telemetry)
-                if "windows" in result:
+                try:
+                    # PRIMARY: live, identity-bound read via the codex app-server
+                    identity, plan_type, windows = codex_live(
+                        account["home"], expected, now)
+                    result["identity"] = identity
+                    result["identity_verified"] = True
+                    result["identity_method"] = identity["method"]
+                    result["email"] = identity["email"]
+                    result["subscription"] = identity.get("subscription")
+                    result["source"] = "codex_app_server"
+                    result["stale"] = False
+                    result["captured_at"] = now
+                    result["windows"] = windows
+                    result["plan"] = {
+                        "pro": "ChatGPT Pro", "plus": "ChatGPT Plus",
+                        "prolite": "ChatGPT Pro Lite", "free": "Free",
+                    }.get(str(plan_type or ""), plan_type or "Unknown")
                     validate_required_windows(result["windows"])
                     result["ok"] = True
-                else:
-                    result["ok"] = False
+                except IdentityBindingError as app_error:
+                    # FALLBACK for older Codex without the app-server: best-effort
+                    # session-log read (dashboard-only, may be stale/idle)
+                    if not str(app_error.code).startswith("codex_app_server"):
+                        raise
+                    identity = codex_identity(account["home"])
+                    identity["credential_digest"] = credential_digest(
+                        "codex", account["home"])
+                    result["identity"] = identity
+                    result["identity_verified"] = identity["verified"]
+                    result["identity_method"] = identity["method"]
+                    result["email"] = identity["email"]
+                    result["subscription"] = identity.get("subscription")
+                    if expected and identity["email"].lower() != expected.lower():
+                        raise IdentityBindingError("slot_bound_to_unexpected_email")
+                    telemetry = codex_limits(account["home"], now=now)
+                    plan_type = str(telemetry.pop("plan_type", None)
+                                    or identity.get("plan_type") or "")
+                    result["plan"] = {
+                        "pro": "ChatGPT Pro", "plus": "ChatGPT Plus",
+                        "prolite": "ChatGPT Pro Lite", "free": "Free",
+                    }.get(plan_type, plan_type or "Unknown")
+                    result.update(telemetry)
+                    if "windows" in result:
+                        validate_required_windows(result["windows"])
+                        result["ok"] = True
+                    else:
+                        result["ok"] = False
         except ProviderThrottleError as error:
             claude_backoff_until = max(claude_backoff_until, error.retry_at)
             if error.provider_response and persist_backoff is not None:

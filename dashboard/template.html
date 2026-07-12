@@ -308,7 +308,7 @@ button.refresh:disabled { opacity: .55; cursor: wait; }
     <span class="legend-item tone-red"><span class="swatch"></span>0–10% left</span>
     <span class="legend-item tone-unknown"><span class="swatch"></span>unknown</span>
   </footer>
-  <p class="credit">tracked by <a href="https://github.com/pauldomanski/headroom">headroom</a> —
+  <p class="credit">tracked by <a href="https://github.com/domanski-ai/headroom">headroom</a> —
     usage read straight from your providers, no tokens spent</p>
 </main>
 
@@ -397,7 +397,7 @@ function providerMarkup(provider,accounts){
   if(!accounts.length)return"";
   const columns=windowColumns(accounts);
   const title=provider==="claude"?"Claude":"Codex";
-  const sub=provider==="claude"?"real-time":"best-effort · updates as you use Codex";
+  const sub="real-time";
   return '<section class="provider"><header class="provider-head">'+
     '<h2 class="provider-name">'+title+'</h2><span class="provider-count">'+
     accounts.length+(accounts.length===1?" subscription":" subscriptions")+

@@ -14,10 +14,12 @@ job is to be trustworthy. Here is exactly what it does and doesn't do.
   - one to `api.anthropic.com/api/oauth/usage` per Claude account (the endpoint
     the Claude apps use for their own usage UI), authenticated with that
     account's existing token;
-  - one to `auth.openai.com/oauth/userinfo` per Codex account, to verify the
-    logged-in identity (it falls back to the local id-token if this fails).
-  Codex *usage numbers* are read from disk with no network call — but the
-  identity check above is a network request. No other outbound traffic.
+  - a live read per Codex account via the local `codex app-server`
+    (`account/rateLimits/read` + `account/read`), which the Codex CLI itself
+    uses; this returns real-time, identity-bound usage. (The older fallback
+    path reads usage from disk and hits `auth.openai.com/oauth/userinfo` for
+    identity instead.)
+  No other outbound traffic.
 - **Writes** its own state under `~/.headroom/` (override with `HEADROOM_DIR`):
   the private snapshot and config are `0600`; the sanitized public snapshot is
   `0644`.

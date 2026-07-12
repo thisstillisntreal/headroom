@@ -6,7 +6,7 @@ description: "Rotate to the next connected account with proven headroom when a u
 # rotator
 
 Rotate BETWEEN connected logins for the same provider when one hits a usage
-limit. Powered by the `headroom` CLI (https://github.com/pauldomanski/headroom).
+limit. Powered by the `headroom` CLI (https://github.com/domanski-ai/headroom).
 
 ## When to fire
 

@@ -15,17 +15,15 @@ unpinned — if an attacker controls your config home *before* first use, TOFU
 cannot detect it (they could also just take the credentials). Run
 `headroom collect` once right after connecting to close the window.
 
-## Codex is tracked, not routed (in this release)
+## Codex reads need a Codex CLI with the app-server
 
-Because Codex usage is log-derived and can't be cryptographically bound to the
-login (see below), headroom does NOT make capacity-based routing/rotation
-decisions for Codex accounts in this release — it would risk routing on
-another account's stale numbers. Codex accounts are fully tracked on the
-dashboard (best-effort), and `headroom codex` still launches on your first
-configured Codex account; but `headroom pick/rotate/run` for Codex is held
-with a clear message. Claude — which has a live, identity-bound usage API — is
-the fully-routed provider. (Set `HEADROOM_CODEX_ROUTING=1` to opt in anyway.)
-Codex routing returns once the app-server live read lands.
+Codex usage is read live from `codex app-server`
+(`account/rateLimits/read` + `account/read`), which requires a reasonably
+recent Codex CLI. On an older Codex without the app-server, headroom falls
+back to a best-effort read of the CLI's on-disk `rate_limits` session
+telemetry — which is only current while you're actively using that account
+and is held by the router (shown Idle/Waiting on the dashboard) until a fresh
+reading appears. Set `HEADROOM_CODEX_ROUTING=0` to force Codex dashboard-only.
 
 ## A project's own CLI settings can override the selected provider
 
@@ -39,29 +37,23 @@ settings (Bedrock/Vertex/custom gateways), headroom's account routing does not
 apply to those sessions — use headroom only with direct OAuth/subscription
 logins.
 
-## Codex tracking is best-effort (log-derived), not real-time
+## The Codex fallback path (only when the app-server is unavailable)
 
-Codex has no live usage API that headroom can call today, so Codex usage is
-read from the CLI's own `rate_limits` session telemetry on disk. Consequences,
-all surfaced honestly on the dashboard rather than hidden:
+The primary Codex read is the live app-server call above. If that fails (an
+older Codex CLI), headroom falls back to the CLI's on-disk `rate_limits`
+session telemetry, which is best-effort:
 
 - an account you're actively using shows **Live**;
-- an account that's been quiet shows **Idle — last seen Nh ago** with its last
-  known reading (never promoted to "live", never counted as verified headroom
-  by the router);
-- an account that has never run Codex shows **Waiting — run Codex once to
-  start tracking**;
-- a genuinely rate-limited account shows **Limited — resets …**.
+- a quiet account shows **Idle — last seen Nh ago** (held by the router);
+- an account that has never run Codex shows **Waiting — run Codex once**;
+- a rate-limited account shows **Limited — resets …**.
 
-This is why Claude is the real-time first-class provider and Codex is labelled
-best-effort. The durable fix is the Codex **app-server** (`account/rateLimits`)
-live read; it initializes cleanly and is on the roadmap, gated on the method
-being stable across Codex releases. Additional upstream gaps: session logs
-don't reliably identity-stamp which user a `rate_limits` event belongs to
-(openai/codex#16323) and some versions emit `rate_limits: null`
-(openai/codex#14880). headroom binds telemetry to the slot's directory and
-validates the event shape. If you recycle a Codex home between accounts,
-delete `sessions/` when switching.
+Upstream gaps that make the fallback best-effort: session logs don't reliably
+identity-stamp which user a `rate_limits` event belongs to (openai/codex#16323)
+and some versions emit `rate_limits: null` (openai/codex#14880). The live
+app-server read has none of these problems — it returns identity-bound,
+real-time data — so keeping your Codex CLI current is the way to get
+first-class Codex tracking.
 
 ## `verified_local` identities are routable
 

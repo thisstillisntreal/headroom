@@ -29,8 +29,8 @@ headroom fixes all three problems:
 
 1. **See** — every account's 5-hour, weekly, and model-scoped windows on one
    page, color-coded by what's *left*, not what's used.
-2. **Read for free** — usage comes from the same endpoints your CLIs already
-   use (Anthropic's OAuth usage API; Codex's on-disk session telemetry).
+2. **Read for free** — usage comes live from the same reads your CLIs already
+   use (Anthropic's OAuth usage API; the Codex app-server's rate-limits read).
    Checking your limits never consumes them.
 3. **Rotate** — `headroom claude` launches on the first account in your
    preference order with *proven* headroom. When a limit hits,
@@ -45,7 +45,7 @@ Claude accounts with a fresh `headroom connect` login rather than adopting the
 Keychain-backed default — see [docs/KNOWN-LIMITS.md](docs/KNOWN-LIMITS.md).)
 
 ```bash
-git clone https://github.com/pauldomanski/headroom
+git clone https://github.com/domanski-ai/headroom
 cd headroom
 ./install.sh              # symlinks bin/headroom onto your PATH
 headroom serve --demo     # OPTIONAL: preview it now with sample data, no setup
@@ -95,21 +95,18 @@ headroom rotate            # limit hit? cool this login, switch to the next
   organization the response belongs to matches the login bound to that slot —
   a swapped or clobbered login can never report another account's headroom.
   Claude usage is always live.
-- **Codex — best-effort.** The Codex CLI writes `rate_limits` telemetry into
-  its session logs on every turn, and headroom reads the newest event from
-  disk (zero network). This means Codex usage is live *while you're using
-  Codex* and shows an honest **`Idle · last seen …`** state when an account
-  has been quiet, or **`Waiting · run Codex once to start tracking`** before
-  it has ever run. It never fabricates a reading. A live Codex read (via the
-  Codex app-server) is on the roadmap; until then, treat Codex as an
-  informative best-effort panel, not a real-time gauge.
+- **Codex — real-time.** headroom reads Codex usage live from the Codex
+  **app-server** (`codex app-server` → `account/rateLimits/read` +
+  `account/read`), bound to each account's own config home. That's a live,
+  identity-verified read of the same rate-limit data ChatGPT/Codex uses — not
+  a scrape of stale session logs — so Codex usage is as current as Claude's,
+  and Codex accounts are **routed and rotated** just like Claude ones.
+  (On an older Codex CLI without the app-server, headroom falls back to a
+  best-effort session-log read and the router holds those accounts until a
+  fresh reading appears.)
 
-If you only run Claude, headroom is a fully real-time tool — Codex support is
-purely additive and every account is optional. In this release **routing and
-rotation are Claude-only** (Claude has a live, identity-bound usage API);
-Codex accounts are tracked on the dashboard and `headroom codex` launches
-them, but headroom won't make capacity-based routing decisions for Codex until
-its live read lands. See [docs/KNOWN-LIMITS.md](docs/KNOWN-LIMITS.md).
+Every account is optional — run only Claude, only Codex, or both. Both
+providers are read live, identity-bound, and fully routed.
 - Snapshots are written atomically. The dashboard gets a sanitized projection
   (optionally with emails redacted) — raw identity material stays in the
   private state directory with `0600` permissions.

@@ -128,12 +128,12 @@ def scoped_window_for(fam, windows):
     return None
 
 
-# Codex usage tracking is log-derived and can't be cryptographically bound to
-# the login (openai/codex#16323), so capacity-based ROUTING of Codex is
-# disabled in this release — Codex is tracked on the dashboard (best-effort)
-# but headroom only routes Claude. Re-enable once the app-server live read
-# lands. `headroom codex` still launches (see cmd_exec).
-CODEX_ROUTING_ENABLED = os.environ.get("HEADROOM_CODEX_ROUTING") == "1"
+# Codex usage is now read live and identity-bound via the codex app-server
+# (account/rateLimits/read + account/read), so Codex is fully routed like
+# Claude. Set HEADROOM_CODEX_ROUTING=0 to force dashboard-only (e.g. an older
+# Codex without the app-server, where reads fall back to stale session logs
+# and the router's freshness check already holds them).
+CODEX_ROUTING_ENABLED = os.environ.get("HEADROOM_CODEX_ROUTING", "1") != "0"
 
 
 def block_reason(account, fam, snapshot_row, cool, now):
