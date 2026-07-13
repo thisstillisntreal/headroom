@@ -27,6 +27,7 @@ POLL_SECONDS = 0.25
 BIND_TIMEOUT = 30.0
 TERM_TIMEOUT = 10.0
 QUIET_SECONDS = 5.0
+CAP_MODEL_TIMEOUT = QUIET_SECONDS + 1.0
 LOOP_WINDOW = 10 * 60
 LOOP_MAX = 3
 MAX_HOOK_BYTES = 1024 * 1024
@@ -63,6 +64,10 @@ class PermanentSupervisorError(SupervisorError):
     """A child-local condition that cannot become safe on a later hook."""
 
 
+class PendingCapTimeout(PermanentSupervisorError):
+    """A payload-proven cap whose transcript model never became available."""
+
+
 @dataclass(frozen=True)
 class Binding:
     session_id: str
@@ -86,6 +91,16 @@ class CapProof:
     transcript_stat: tuple
 
 
+@dataclass(frozen=True)
+class PendingCap:
+    event: dict
+    session_id: str
+    transcript_path: str
+    epoch: int
+    received_at: float
+    deadline: float
+
+
 @dataclass
 class Child:
     process: subprocess.Popen
@@ -105,6 +120,7 @@ class Child:
     dead_sessions: set = field(default_factory=set)
     session_epochs: dict = field(default_factory=dict)
     last_received_at: float = 0.0
+    pending_cap: PendingCap = None
 
 
 @dataclass(frozen=True)
@@ -730,26 +746,70 @@ class Supervisor:
     def _prove_cap(self, child, record):
         message = cap_message(record, child)
         if not message:
+            child.pending_cap = None
             return None
+        binding = child.binding
+        received_at = record["received_at"]
+        pending = child.pending_cap
+        if pending is None or (
+                pending.session_id != binding.session_id
+                or pending.transcript_path != binding.transcript_path
+                or pending.epoch != binding.epoch
+                or pending.received_at != received_at):
+            pending = PendingCap(
+                record, binding.session_id, binding.transcript_path,
+                binding.epoch, received_at, received_at + CAP_MODEL_TIMEOUT)
+            child.pending_cap = pending
+        try:
+            self._proof_current(child, pending)
+        except SupervisorError:
+            child.pending_cap = None
+            raise
         try:
             evidence = _last_transcript_cap_evidence(
-                child.binding.transcript_path)
+                binding.transcript_path)
             if evidence is None:
-                raise PermanentSupervisorError(
-                    "cap transcript has no unambiguous active model id")
+                if self.now() >= pending.deadline:
+                    child.pending_cap = None
+                    raise PendingCapTimeout(
+                        "could not determine the cap-time model before "
+                        f"{CAP_MODEL_TIMEOUT:g}s")
+                return pending
             source = handoff.SourceSession(
-                child.binding.session_id, child.binding.transcript_path,
+                binding.session_id, binding.transcript_path,
                 child.account, evidence["model"])
             family = handoff.resolve_model_family(source)
-            binding = child.binding
-            return CapProof(record, evidence["message"], family,
-                            binding.session_id,
-                            binding.transcript_path, binding.epoch,
-                            evidence["stat"])
+            proof = CapProof(record, evidence["message"], family,
+                             binding.session_id, binding.transcript_path,
+                             binding.epoch, evidence["stat"])
+            child.pending_cap = None
+            return proof
         except PermanentSupervisorError:
             raise
         except (handoff.HandoffError, registry.RegistryError) as error:
             raise PermanentSupervisorError(str(error)) from error
+
+    def _attempt_cap(self, child, record, announce_non_cap=False):
+        try:
+            candidate = self._prove_cap(child, record)
+            if isinstance(candidate, CapProof):
+                return candidate
+            if candidate is None and announce_non_cap:
+                print("[headroom] rate-limit hook was not a subscription cap; "
+                      "child continues", file=sys.stderr)
+        except PendingCapTimeout as error:
+            child.automation = False
+            print(f"[headroom] {error}; automatic handoff disabled — /exit then "
+                  "`headroom handoff` to move manually", file=sys.stderr)
+        except PermanentSupervisorError as error:
+            child.automation = False
+            child.pending_cap = None
+            print(f"[headroom] cap not corroborated ({error}); automatic "
+                  "handoff disabled for this child", file=sys.stderr)
+        except SupervisorError as error:
+            print(f"[headroom] cap not corroborated ({error}); child continues",
+                  file=sys.stderr)
+        return None
 
     @staticmethod
     def _proof_current(child, proof):
@@ -1054,8 +1114,10 @@ class Supervisor:
             print(f"[headroom] {error}; automatic handoff disabled for this child",
                   file=sys.stderr)
             child.automation = False
+            child.pending_cap = None
             return None
         _remember_binding(child)
+        saw_stop_failure = False
         for record in records:
             if not _namespace_matches(record, child):
                 continue
@@ -1066,6 +1128,10 @@ class Supervisor:
                 epoch = _event_epoch(child, source)
                 session_key = ((source.session_id, epoch)
                                if epoch is not None else None)
+                if hook_name == "StopFailure" and child.pending_cap is not None \
+                        and record["received_at"] \
+                        > child.pending_cap.received_at:
+                    child.pending_cap = None
                 if hook_name == "StopFailure" \
                         and session_key in child.dead_sessions:
                     proof = None
@@ -1075,9 +1141,11 @@ class Supervisor:
                 print(f"[headroom] malformed hook event ({error}); automatic "
                       "handoff disabled for this child", file=sys.stderr)
                 child.automation = False
+                child.pending_cap = None
                 return None
             if hook_name == "SessionStart":
                 try:
+                    child.pending_cap = None
                     child.binding = parse_session_start(record, child)
                     child.session_epoch = child.binding.epoch
                     child.session_epochs[
@@ -1107,6 +1175,9 @@ class Supervisor:
                             and source.transcript_path == current.transcript_path)
             if hook_name == "SessionEnd":
                 proof = None
+                if child.pending_cap is not None and session_key == (
+                        child.pending_cap.session_id, child.pending_cap.epoch):
+                    child.pending_cap = None
                 if epoch is None:
                     child.automation = False
                     print("[headroom] SessionEnd has no known session epoch; "
@@ -1123,23 +1194,17 @@ class Supervisor:
                     child.binding = replace(current, cwd=cwd)
                 continue
             if hook_name == "StopFailure":
+                saw_stop_failure = True
                 proof = None
                 if not same_session or not child.automation:
                     continue
-                try:
-                    proof = self._prove_cap(child, record)
-                    if proof is None:
-                        print("[headroom] rate-limit hook was not a subscription "
-                              "cap; child continues", file=sys.stderr)
-                except PermanentSupervisorError as error:
-                    child.automation = False
-                    print(f"[headroom] cap not corroborated ({error}); automatic "
-                          "handoff disabled for this child", file=sys.stderr)
-                except SupervisorError as error:
-                    print(f"[headroom] cap not corroborated ({error}); child "
-                          "continues", file=sys.stderr)
+                proof = self._attempt_cap(child, record, announce_non_cap=True)
+        if not saw_stop_failure and child.pending_cap is not None \
+                and child.automation:
+            proof = self._attempt_cap(child, child.pending_cap.event)
         if _binding_key(child.binding) in child.dead_sessions:
             child.automation = False
+            child.pending_cap = None
             print("[headroom] current session ended without a replacement "
                   "SessionStart; automatic handoff disabled for this child",
                   file=sys.stderr)

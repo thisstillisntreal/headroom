@@ -117,7 +117,7 @@ def main():
 
     cap_slots = set(filter(None, os.environ.get("FAKE_CAP_SLOTS", "source").split(",")))
     is_resume = "--resume" in args
-    if scenario == "handoff" and is_resume:
+    if scenario in ("handoff", "delayed-flush") and is_resume:
         time.sleep(0.35)
         return 0
     if scenario == "missing-end" and is_resume:
@@ -127,7 +127,7 @@ def main():
         time.sleep(0.35)
         return 0
 
-    if scenario != "corrupt":
+    if scenario not in ("corrupt", "delayed-flush"):
         append_event(transcript, cap_event)
 
     message = "rate limit: try again" if scenario == "transient" else \
@@ -135,6 +135,9 @@ def main():
     hook(settings, "StopFailure", dict(
         common, hook_event_name="StopFailure", error="rate_limit",
         last_assistant_message=message))
+    if scenario == "delayed-flush":
+        time.sleep(0.4)
+        append_event(transcript, cap_event)
 
     if scenario in ("clear", "resume-transition"):
         hook(settings, "SessionEnd", dict(

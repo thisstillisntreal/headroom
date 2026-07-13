@@ -556,6 +556,35 @@ class HookProof(unittest.TestCase):
             self.child, self.record("You've hit your session limit"))
         self.assertEqual(proof.family, "haiku")
 
+    def test_stopfailure_before_transcript_flush_is_transient_then_proves(self):
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({
+                "type": "assistant", "message": {
+                    "model": "claude-fable-5", "content": "real turn"}
+            }) + "\n")
+            out.write(json.dumps({"type": "attachment"}) + "\n")
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.child.account, supervisor_id=self.SUPERVISOR)
+        record = self.record("You've hit your session limit · resets 3pm (UTC)")
+
+        hold = runner._prove_cap(self.child, record)
+        self.assertIsInstance(hold, supervisor.PendingCap)
+        self.assertTrue(self.child.automation)
+        self.assertIs(self.child.pending_cap, hold)
+
+        with open(self.transcript, "a", encoding="utf-8") as out:
+            out.write(json.dumps({
+                "type": "assistant", "isApiErrorMessage": True,
+                "error": "rate_limit", "message": {
+                    "model": "<synthetic>", "content": [{
+                        "type": "text", "text":
+                        "You've hit your session limit · resets 3pm (UTC)"}]}
+            }) + "\n")
+        proof = runner._prove_cap(self.child, record)
+        self.assertIsInstance(proof, supervisor.CapProof)
+        self.assertEqual(proof.family, "fable")
+        self.assertIsNone(self.child.pending_cap)
+
     def test_successful_assistant_turn_after_cap_refuses_evidence(self):
         with open(self.transcript, "w", encoding="utf-8") as out:
             out.write(json.dumps({
@@ -571,18 +600,99 @@ class HookProof(unittest.TestCase):
         self.assertIsNone(
             supervisor._last_transcript_cap_evidence(self.transcript))
 
-    def test_cap_with_only_synthetic_models_refuses_automation(self):
+    def test_cap_with_only_synthetic_models_waits_then_refuses(self):
         with open(self.transcript, "w", encoding="utf-8") as out:
             out.write(json.dumps({
                 "type": "assistant", "isApiErrorMessage": True,
                 "message": {"model": "<synthetic>", "content": [{
                     "type": "text", "text": "You've hit your session limit"
                 }]}}) + "\n")
+        record = self.record("You've hit your session limit")
+        clock = [record["received_at"]]
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.child.account, now=lambda: clock[0],
+            supervisor_id=self.SUPERVISOR)
+        hold = runner._prove_cap(self.child, record)
+        self.assertIsInstance(hold, supervisor.PendingCap)
+        clock[0] += supervisor.CAP_MODEL_TIMEOUT
+        with self.assertRaises(supervisor.PendingCapTimeout):
+            runner._prove_cap(
+                self.child, hold.event)
+
+    def test_pending_cap_deadline_disables_without_model(self):
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({
+                "type": "assistant", "message": {
+                    "model": "claude-sonnet-4-5-20250929",
+                    "content": "real turn"}}) + "\n")
+            out.write(json.dumps({"type": "attachment"}) + "\n")
+        received = time.time()
+        clock = [received]
+        record = self.record(
+            "You've hit your session limit · resets 3pm (UTC)",
+            received_at=received)
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.child.account, now=lambda: clock[0],
+            supervisor_id=self.SUPERVISOR)
+        output = io.StringIO()
+        with mock.patch.object(supervisor, "_read_events",
+                               side_effect=[[record], []]), \
+                mock.patch("headroom.supervisor.os.kill") as kill, \
+                redirect_stderr(output):
+            self.assertIsNone(runner._handle_events(self.child, ""))
+            self.assertTrue(self.child.automation)
+            clock[0] += supervisor.CAP_MODEL_TIMEOUT
+            self.assertIsNone(runner._handle_events(self.child, ""))
+        self.assertFalse(self.child.automation)
+        self.assertIsNone(self.child.pending_cap)
+        kill.assert_not_called()
+        self.assertIn(
+            f"could not determine the cap-time model before "
+            f"{supervisor.CAP_MODEL_TIMEOUT:g}s", output.getvalue())
+        self.assertIn("/exit then `headroom handoff` to move manually",
+                      output.getvalue())
+
+    def test_pending_cap_discarded_on_session_transition(self):
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({
+                "type": "assistant", "message": {
+                    "model": "claude-sonnet-4-5-20250929",
+                    "content": "real turn"}}) + "\n")
+            out.write(json.dumps({"type": "attachment"}) + "\n")
+        other_sid = "22222222-2222-4222-8222-222222222222"
+        other_path = os.path.join(
+            os.path.dirname(self.transcript), other_sid + ".jsonl")
+        with open(other_path, "w", encoding="utf-8") as out:
+            out.write("{}\n")
+        base = time.time() - 3
+        stop = self.record(
+            "You've hit your session limit · resets 3pm (UTC)",
+            received_at=base)
+        end = self.record(payload={"hook_event_name": "SessionEnd"},
+                          received_at=base + 1)
+        start = self.record(payload={
+            "hook_event_name": "SessionStart", "session_id": other_sid,
+            "transcript_path": other_path,
+            "model": {"display_name": "Sonnet"}}, received_at=base + 2)
         runner = supervisor.Supervisor(
             "sonnet", [], self.child.account, supervisor_id=self.SUPERVISOR)
-        with self.assertRaises(supervisor.PermanentSupervisorError):
-            runner._prove_cap(
-                self.child, self.record("You've hit your session limit"))
+        with mock.patch.object(supervisor, "_read_events",
+                               side_effect=[[stop], [end, start], []]), \
+                mock.patch("headroom.supervisor.os.kill") as kill:
+            self.assertIsNone(runner._handle_events(self.child, ""))
+            self.assertIsNotNone(self.child.pending_cap)
+            self.assertIsNone(runner._handle_events(self.child, ""))
+            self.assertIsNone(self.child.pending_cap)
+            with open(self.transcript, "a", encoding="utf-8") as out:
+                out.write(json.dumps({
+                    "type": "assistant", "isApiErrorMessage": True,
+                    "message": {"model": "<synthetic>", "content": [{
+                        "type": "text", "text":
+                        "You've hit your session limit"}]}}) + "\n")
+            self.assertIsNone(runner._handle_events(self.child, ""))
+        self.assertEqual(self.child.binding.session_id, other_sid)
+        self.assertTrue(self.child.automation)
+        kill.assert_not_called()
 
     def test_sidechain_assistant_models_cannot_poison_cap_family(self):
         with open(self.transcript, "w", encoding="utf-8") as out:
@@ -911,6 +1021,17 @@ class SupervisorIntegration(unittest.TestCase):
                             for path in runner.settings_files))
         self.assertFalse(os.path.exists(supervisor.event_path(
             runner.supervisor_id)))
+
+    def test_fake_child_handoffs_after_delayed_cap_transcript_flush(self):
+        os.environ["FAKE_CLAUDE_SCENARIO"] = "delayed-flush"
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.accounts[0], collect_fn=self.snapshot)
+        self.assertEqual(runner.run(), 0)
+        self.assertTrue(os.path.exists(
+            os.path.join(self.fake_state, "sigterm-source")))
+        actions = [row.get("action") for row in self.ledger_actions()]
+        self.assertIn("cap_confirmed", actions)
+        self.assertIn("stop_sent", actions)
 
     def test_banner_alone_never_terminates(self):
         os.environ["FAKE_CLAUDE_SCENARIO"] = "banner"
