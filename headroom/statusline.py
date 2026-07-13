@@ -9,14 +9,87 @@ Wire it up in ~/.claude/settings.json:
 
     {"statusLine": {"type": "command", "command": "headroom statusline"}}
 """
+import fcntl
 import json
 import os
+import re
 import sys
+import time
 
 from . import paths, registry
 
 GREEN, YELLOW, ORANGE, RED, DIM, RESET = (
     "\x1b[32m", "\x1b[33m", "\x1b[38;5;208m", "\x1b[31m", "\x1b[2m", "\x1b[0m")
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def journal_session(payload, now=None):
+    """Leave a cheap breadcrumb so handoff can identify the current session.
+
+    Status lines run frequently and sit on Claude Code's render path, so a
+    per-session mtime makes the common throttled case one stat rather than a
+    scan of an ever-growing journal. This public edge swallows every failure
+    because capacity rendering is more important than handoff discovery.
+    """
+    try:
+        return _journal_session(payload, now)
+    except Exception:  # noqa: BLE001 — statusline output is load-bearing
+        return False
+
+
+def _journal_session(payload, now=None):
+    if not isinstance(payload, dict):
+        return False
+    session_id = payload.get("session_id")
+    transcript_path = payload.get("transcript_path")
+    cwd = payload.get("cwd")
+    if not cwd and isinstance(payload.get("workspace"), dict):
+        cwd = payload["workspace"].get("current_dir")
+    if (not isinstance(session_id, str) or not SESSION_ID_RE.fullmatch(session_id)
+            or not isinstance(transcript_path, str) or not transcript_path
+            or not isinstance(cwd, str) or not cwd):
+        return False
+    now = time.time() if now is None else now
+    state = paths.ensure_private(paths.state_dir())
+    markers = paths.ensure_private(os.path.join(state, "session-journal"))
+    marker = os.path.join(markers, session_id)
+    try:
+        marker_fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        created = True
+    except FileNotFoundError:
+        return False
+    except FileExistsError:
+        marker_fd = os.open(marker, os.O_WRONLY)
+        created = False
+    try:
+        fcntl.flock(marker_fd, fcntl.LOCK_EX)
+        if not created and now - os.fstat(marker_fd).st_mtime < 60:
+            return False
+        model = payload.get("model")
+        model = model.get("display_name", "") if isinstance(model, dict) else ""
+        model = model if isinstance(model, str) else ""
+        version = payload.get("version", "")
+        version = version if isinstance(version, str) else ""
+        entry = {
+            "ts": int(now), "session_id": session_id,
+            "transcript_path": transcript_path, "cwd": cwd,
+            "model": model, "version": version,
+            "config_dir": os.environ.get("CLAUDE_CONFIG_DIR") or "",
+        }
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        descriptor = os.open(os.path.join(state, "sessions.jsonl"), flags, 0o600)
+        try:
+            os.fchmod(descriptor, 0o600)
+            encoded = (json.dumps(entry, separators=(",", ":")) + "\n").encode()
+            if os.write(descriptor, encoded) != len(encoded):
+                return False
+        finally:
+            os.close(descriptor)
+        os.utime(marker, (now, now))
+        return True
+    finally:
+        fcntl.flock(marker_fd, fcntl.LOCK_UN)
+        os.close(marker_fd)
 
 
 def color(used):
@@ -40,9 +113,14 @@ def window_text(windows, key, label):
 
 
 def main():
+    payload = None
     try:
-        json.load(sys.stdin)  # payload available if ever needed; presence only
+        payload = json.load(sys.stdin)
     except (ValueError, OSError):
+        pass
+    try:
+        journal_session(payload)
+    except Exception:  # noqa: BLE001 — statusline rendering must never fail
         pass
     snapshot = paths.load_json(paths.private_snapshot_path())
     if not snapshot:
@@ -68,7 +146,9 @@ def main():
         parts.append(window_text(windows, "5h", "5h"))
         parts.append(window_text(windows, "7d", "7d"))
         used = (windows.get("5h") or {}).get("used_percent")
-        if used is not None and used >= 75:
+        if used is not None and used >= 99:
+            parts.append(f"{DIM}capped -> /exit, then: headroom handoff{RESET}")
+        elif used is not None and used >= 75:
             from . import route
             candidate = next(
                 (account for account, reason in route.candidates(

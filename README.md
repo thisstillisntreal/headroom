@@ -93,10 +93,21 @@ headroom rotate            # limit hit? cool this login, switch to the next
 | `headroom claude` / `codex [args]` | launch the CLI on the best account |
 | `headroom run <model> -- <cmd>` | headless run with automatic rotation on limit-hit |
 | `headroom rotate [model]` | cool the current account, hand you the next |
+| `headroom handoff` | hand a capped session to a fresh account — conversation continues |
 | `headroom serve [--open]` | local live dashboard (auto-refreshes stale data) |
 | `headroom serve --demo` | preview the dashboard with bundled sample data — no accounts needed |
 | `headroom statusline` | color-coded capacity for your Claude Code status line |
 | `headroom doctor` | environment + config health check (handy for bug reports) |
+
+## Hand off a capped session
+
+**EXPERIMENTAL.** After Claude reaches its 5-hour cap, run `/exit`, then run
+`headroom handoff`. It verifies and copies the conversation transcript to the
+best other Claude account, cools the capped slot, and resumes from the same
+working directory with a new session id. Use `--print` to stage the handoff and
+print the exact resume command without running it. The source transcript is
+never changed or deleted. Background tasks, MCP connections, and per-session
+permission approvals do not carry across; only the conversation history does.
 
 ## How the reads work (and why they're safe)
 

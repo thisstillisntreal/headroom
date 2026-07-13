@@ -70,6 +70,15 @@ the provider's own `resets_at` when known, else a conservative future floor
 own; `headroom clear <account>` (or `<account>:<scope>`) removes them early,
 and `headroom clear` with no argument resets all.
 
+## Session handoff (EXPERIMENTAL)
+
+`headroom handoff` stages a verified copy of one Claude conversation transcript
+in another eligible account home, writes an auditable baton to
+`state/handoffs.jsonl`, and resumes with `--fork-session` from the same working
+directory. The old transcript remains untouched and the target receives a new
+session id. This carries conversation history only: background tasks, MCP
+connections, and per-session permission approvals must be started again.
+
 ## Staleness
 
 Routing decisions require a snapshot younger than `HEADROOM_SNAPSHOT_MAX_AGE`

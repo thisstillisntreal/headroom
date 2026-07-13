@@ -6,15 +6,19 @@ Covers the load-bearing safety logic: config validation, the fail-closed
 router (`block_reason`), redaction, and the public-snapshot projection.
 """
 import json
+import hashlib
+import io
 import os
 import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from headroom import collect, connect, registry, route  # noqa: E402
+from headroom import collect, connect, handoff, registry, route, statusline  # noqa: E402
 
 
 def _claude_row(name="a", used5h=10.0, used7d=20.0, ok=True, **over):
@@ -494,6 +498,343 @@ class KeychainNamespacing(unittest.TestCase):
             self.assertEqual(calls[0], namespaced)
         finally:
             collect.sys.platform, collect.shutil.which = platform, which
+
+
+class StatuslineJournal(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.old_headroom = os.environ.get("HEADROOM_DIR")
+        os.environ["HEADROOM_DIR"] = self.temp.name
+        self.payload = {
+            "session_id": "11111111-1111-4111-8111-111111111111",
+            "transcript_path": "/tmp/session.jsonl", "cwd": "/tmp/work",
+            "model": {"display_name": "Sonnet"}, "version": "1.2.3",
+        }
+
+    def tearDown(self):
+        if self.old_headroom is None:
+            os.environ.pop("HEADROOM_DIR", None)
+        else:
+            os.environ["HEADROOM_DIR"] = self.old_headroom
+        self.temp.cleanup()
+
+    def test_writes_payload_and_throttles_for_60_seconds(self):
+        with mock.patch.object(statusline.time, "time",
+                               side_effect=[1000, 1030, 1061]):
+            self.assertTrue(statusline.journal_session(self.payload))
+            self.assertFalse(statusline.journal_session(self.payload))
+            self.assertTrue(statusline.journal_session(self.payload))
+        journal = os.path.join(self.temp.name, "state", "sessions.jsonl")
+        with open(journal) as handle:
+            rows = [json.loads(line) for line in handle]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["model"], "Sonnet")
+        self.assertEqual(rows[0]["config_dir"],
+                         os.environ.get("CLAUDE_CONFIG_DIR") or "")
+        self.assertEqual(os.stat(journal).st_mode & 0o777, 0o600)
+
+    def test_malformed_payload_never_raises(self):
+        for payload in (None, [], {}, {"session_id": "../bad"},
+                        {"session_id": 4, "transcript_path": []}):
+            self.assertFalse(statusline.journal_session(payload, now=1000))
+
+    def test_capped_hint_replaces_next_candidate(self):
+        snapshot = {"accounts": [{"name": "source", "provider": "claude",
+                                   "windows": {"5h": {"used_percent": 99},
+                                               "7d": {"used_percent": 20}}}]}
+        output = io.StringIO()
+        account = {"name": "source", "provider": "claude", "home": "/tmp/source"}
+        with mock.patch.object(statusline.sys, "stdin", io.StringIO("{}")), \
+                mock.patch.object(statusline.paths, "load_json", return_value=snapshot), \
+                mock.patch.object(statusline.registry, "accounts", return_value=[account]), \
+                mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/tmp/source"}), \
+                redirect_stdout(output):
+            self.assertEqual(statusline.main(), 0)
+        self.assertIn("capped -> /exit, then: headroom handoff", output.getvalue())
+
+
+class HandoffSafety(unittest.TestCase):
+    SID = "11111111-1111-4111-8111-111111111111"
+    OTHER_SID = "22222222-2222-4222-8222-222222222222"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.old_headroom = os.environ.get("HEADROOM_DIR")
+        os.environ["HEADROOM_DIR"] = os.path.join(self.temp.name, "headroom")
+        self.old_cwd = os.getcwd()
+        self.cwd = os.path.join(self.temp.name, "work")
+        os.makedirs(self.cwd)
+        os.chdir(self.cwd)
+        self.source_home = os.path.join(self.temp.name, "source")
+        self.target_home = os.path.join(self.temp.name, "target")
+        self.accounts = [
+            {"name": "source", "provider": "claude", "home": self.source_home,
+             "expected_email": "one@example.com"},
+            {"name": "target", "provider": "claude", "home": self.target_home,
+             "expected_email": "two@example.com"},
+        ]
+        self.transcript = self._transcript(self.source_home, self.SID)
+        self.bytes = (json.dumps({"type": "user", "message": {
+            "content": [{"type": "text", "text": "hello"}]}}) + "\n").encode()
+        with open(self.transcript, "wb") as handle:
+            handle.write(self.bytes)
+        old = time.time() - 20
+        os.utime(self.transcript, (old, old))
+
+    def tearDown(self):
+        os.chdir(self.old_cwd)
+        if self.old_headroom is None:
+            os.environ.pop("HEADROOM_DIR", None)
+        else:
+            os.environ["HEADROOM_DIR"] = self.old_headroom
+        self.temp.cleanup()
+
+    def _transcript(self, home, session_id):
+        slug = handoff._claude_slug(os.path.realpath(self.cwd))
+        directory = os.path.join(home, "projects", slug)
+        os.makedirs(directory, exist_ok=True)
+        return os.path.join(directory, session_id + ".jsonl")
+
+    def _journal(self, rows):
+        state = os.path.join(os.environ["HEADROOM_DIR"], "state")
+        os.makedirs(state, exist_ok=True)
+        with open(os.path.join(state, "sessions.jsonl"), "w") as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+
+    def _journal_row(self, session_id, path, ts=100, model="Sonnet"):
+        return {"ts": ts, "session_id": session_id,
+                "transcript_path": path, "cwd": self.cwd, "model": model,
+                "version": "1", "config_dir": self.source_home}
+
+    def test_explicit_session_wins_over_ambiguous_journal(self):
+        other = self._transcript(self.source_home, self.OTHER_SID)
+        with open(other, "w") as handle:
+            handle.write("{}\n")
+        self._journal([self._journal_row(self.OTHER_SID, other),
+                       self._journal_row("33333333-3333-4333-8333-333333333333",
+                                         "/missing", ts=200)])
+        source = handoff.resolve_source(self.SID, self.accounts, self.cwd)
+        self.assertEqual(source.session_id, self.SID)
+        self.assertEqual(source.transcript_path, self.transcript)
+
+    def test_journal_current_cwd_resolves_source(self):
+        self._journal([self._journal_row(self.SID, self.transcript)])
+        source = handoff.resolve_source(accounts=self.accounts, cwd=self.cwd)
+        self.assertEqual(source.account["name"], "source")
+
+    def test_journal_ambiguity_requires_session(self):
+        self._journal([self._journal_row(self.SID, self.transcript),
+                       self._journal_row(self.OTHER_SID, "/tmp/other", ts=200)])
+        with self.assertRaisesRegex(handoff.HandoffError, "multiple sessions"):
+            handoff.resolve_source(accounts=self.accounts, cwd=self.cwd, now=300)
+
+    def test_single_recent_cwd_scan_is_offered(self):
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            source = handoff.resolve_source(accounts=self.accounts, cwd=self.cwd)
+        self.assertEqual(source.session_id, self.SID)
+        self.assertIn("found session", errors.getvalue())
+
+    def test_claude_slug_replaces_every_non_slug_character(self):
+        self.assertEqual(handoff._claude_slug("/tmp/x/slug_test.dir/a_b.c"),
+                         "-tmp-x-slug-test-dir-a-b-c")
+
+    def test_scan_uses_claude_slug_for_special_characters(self):
+        cwd = os.path.join(self.temp.name, "slug_test.dir", "a_b.c")
+        os.makedirs(cwd)
+        directory = os.path.join(self.source_home, "projects",
+                                 handoff._claude_slug(os.path.realpath(cwd)))
+        os.makedirs(directory)
+        transcript = os.path.join(directory, self.OTHER_SID + ".jsonl")
+        with open(transcript, "wb") as handle:
+            handle.write(self.bytes)
+        old = time.time() - 20
+        os.utime(transcript, (old, old))
+        source = handoff.resolve_source(accounts=self.accounts, cwd=cwd)
+        self.assertEqual(source.transcript_path, transcript)
+
+    def test_fresh_mtime_refuses_still_running_source(self):
+        os.utime(self.transcript, None)
+        with self.assertRaisesRegex(handoff.HandoffError, "/exit"):
+            handoff.guard_source_stable(self.transcript, now=time.time(), sleep=lambda n: None)
+
+    def test_truncated_final_line_refused(self):
+        with open(self.transcript, "ab") as handle:
+            handle.write(b'{"type":')
+        with self.assertRaisesRegex(handoff.HandoffError,
+                                   "incomplete final line"):
+            handoff.inspect_transcript(self.transcript)
+
+    def test_unresolved_tool_use_refused(self):
+        event = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "x", "name": "Read"}]}}
+        with open(self.transcript, "w") as handle:
+            handle.write(json.dumps(event) + "\n")
+        with self.assertRaisesRegex(handoff.HandoffError, "mid-tool-call"):
+            handoff.inspect_transcript(self.transcript)
+
+    def test_destination_collision_refused(self):
+        destination = self._transcript(self.target_home, self.SID)
+        with open(destination, "w") as handle:
+            handle.write("existing")
+        digest = hashlib.sha256(self.bytes).hexdigest()
+        with self.assertRaisesRegex(handoff.HandoffError, "does not overwrite"):
+            handoff.stage_transcript(self.transcript, destination, digest)
+
+    def test_command_delegates_collision_check_to_atomic_staging(self):
+        self._journal([self._journal_row(self.SID, self.transcript)])
+        destination = handoff.destination_path(self.target_home, self.transcript,
+                                               self.SID)
+        os.makedirs(os.path.dirname(destination))
+        with open(destination, "w") as handle:
+            handle.write("existing")
+        errors = io.StringIO()
+        collision = handoff.HandoffError("atomic collision sentinel")
+        with mock.patch.object(handoff.registry, "accounts",
+                               return_value=self.accounts), \
+                mock.patch.object(handoff.route, "ensure_fresh_snapshot",
+                                  return_value={"accounts": []}), \
+                mock.patch.object(handoff.route, "candidates",
+                                  return_value=[(self.accounts[1], None)]), \
+                mock.patch.object(handoff, "guard_source_stable"), \
+                mock.patch.object(handoff, "stage_transcript",
+                                  side_effect=collision) as stage, \
+                redirect_stderr(errors):
+            result = handoff.cmd_handoff(["--session", self.SID, "--print"])
+        self.assertEqual(result, 2)
+        stage.assert_called_once_with(self.transcript, destination, mock.ANY)
+        self.assertIn("atomic collision sentinel", errors.getvalue())
+
+    def test_symlink_source_refused(self):
+        link = os.path.join(self.temp.name, "link.jsonl")
+        os.symlink(self.transcript, link)
+        with self.assertRaisesRegex(handoff.HandoffError, "symlink"):
+            handoff.inspect_transcript(link)
+
+    def test_double_handoff_refused_and_force_overrides(self):
+        digest = hashlib.sha256(self.bytes).hexdigest()
+        handoff.append_ledger({"session_id": self.SID,
+                               "transcript_sha256": digest,
+                               "target_slot": "target", "ts": 100})
+        with self.assertRaisesRegex(handoff.HandoffError, "different --to"):
+            handoff.guard_not_duplicate(self.SID, digest)
+        handoff.guard_not_duplicate(self.SID, digest, force=True)
+
+    def test_handoff_ledger_disambiguates_source_after_copy(self):
+        target = self._transcript(self.target_home, self.SID)
+        with open(target, "wb") as handle:
+            handle.write(self.bytes)
+        digest = hashlib.sha256(self.bytes).hexdigest()
+        handoff.append_ledger({"session_id": self.SID, "ts": 100,
+                               "target_slot": "target", "source_slot": "source",
+                               "transcript_sha256": digest})
+
+        source = handoff.resolve_source(self.SID, self.accounts, self.cwd)
+
+        self.assertEqual(source.transcript_path, self.transcript)
+        self.assertEqual(source.account["name"], "source")
+        with self.assertRaisesRegex(handoff.HandoffError, "already handed off"):
+            handoff.guard_not_duplicate(self.SID, digest)
+
+    def test_copy_hash_permissions_and_source_untouched(self):
+        destination = handoff.destination_path(self.target_home, self.transcript,
+                                               self.SID)
+        digest = hashlib.sha256(self.bytes).hexdigest()
+        handoff.stage_transcript(self.transcript, destination, digest)
+        with open(self.transcript, "rb") as handle:
+            self.assertEqual(handle.read(), self.bytes)
+        with open(destination, "rb") as handle:
+            copied = handle.read()
+        self.assertEqual(hashlib.sha256(copied).hexdigest(), digest)
+        self.assertEqual(os.stat(destination).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(os.path.dirname(destination)).st_mode & 0o777,
+                         0o700)
+
+    def test_destination_reuses_source_project_directory_basename(self):
+        directory = os.path.join(self.source_home, "projects", "weird.slug_dir")
+        source = os.path.join(directory, self.SID + ".jsonl")
+        os.makedirs(directory)
+        with open(source, "wb") as handle:
+            handle.write(self.bytes)
+        destination = handoff.destination_path(self.target_home, source, self.SID)
+        self.assertEqual(destination, os.path.join(
+            self.target_home, "projects", "weird.slug_dir", self.SID + ".jsonl"))
+
+    def test_target_selection_uses_router_and_excludes_source(self):
+        blocked = [(self.accounts[1], "5h at 100%"), (self.accounts[0], None)]
+        with mock.patch.object(handoff.route, "candidates", return_value=blocked) as call:
+            with self.assertRaisesRegex(handoff.HandoffError, "proven headroom"):
+                handoff.select_target("source", {}, requested="target")
+            call.assert_called_with("claude", {})
+        ranked = [(self.accounts[0], None), (self.accounts[1], None)]
+        with mock.patch.object(handoff.route, "candidates", return_value=ranked):
+            target = handoff.select_target("source", {})
+        self.assertEqual(target["name"], "target")
+
+    def test_print_handoff_writes_baton_ledger_and_cools_source(self):
+        now = time.time()
+        snapshot = {"generated": now, "accounts": [
+            {"name": "source", "email": "one@example.com", "windows": {
+                "5h": {"used_percent": 100.0, "resets_at": now + 1200}}},
+            {"name": "target", "email": "two@other.test", "windows": {
+                "5h": {"used_percent": 10.0}}},
+        ]}
+        output = io.StringIO()
+        errors = io.StringIO()
+        with mock.patch.object(handoff.registry, "accounts", return_value=self.accounts), \
+                mock.patch.object(handoff.route, "ensure_fresh_snapshot",
+                                  return_value=snapshot), \
+                mock.patch.object(handoff.route, "candidates",
+                                  return_value=[(self.accounts[0], "5h at 100%"),
+                                                (self.accounts[1], None)]), \
+                mock.patch.object(handoff, "guard_source_stable"), \
+                mock.patch.object(handoff.route, "mark") as mark, \
+                redirect_stdout(output), redirect_stderr(errors):
+            result = handoff.cmd_handoff(["--session", self.SID, "--print"])
+        self.assertEqual(result, 0, errors.getvalue())
+        ledger = os.path.join(os.environ["HEADROOM_DIR"], "state", "handoffs.jsonl")
+        with open(ledger) as handle:
+            record = json.loads(handle.readline())
+        required = {"schema", "ts", "session_id", "source_slot",
+                    "source_email_redacted", "target_slot", "cwd",
+                    "transcript_sha256", "transcript_bytes", "source_5h_used",
+                    "reason", "resume_command"}
+        self.assertTrue(required.issubset(record))
+        expected = (f"CLAUDE_CONFIG_DIR={self.target_home} claude --resume "
+                    f"{self.SID} --fork-session")
+        self.assertEqual(record["resume_command"], expected)
+        self.assertIn("NEXT COMMAND:\n" + expected, output.getvalue())
+        self.assertIn("background tasks / MCP connections / permission approvals",
+                      output.getvalue())
+        self.assertIn("data boundary", output.getvalue())
+        self.assertEqual(os.stat(ledger).st_mode & 0o777, 0o600)
+        mark.assert_called_once_with("source", "claude", mock.ANY,
+                                     account_wide=True, window="5h")
+
+    def test_decline_repeats_resume_command_after_staging(self):
+        output = io.StringIO()
+        expected = (f"CLAUDE_CONFIG_DIR={self.target_home} claude --resume "
+                    f"{self.SID} --fork-session")
+        stdin = mock.Mock()
+        stdin.isatty.return_value = True
+        with mock.patch.object(handoff.sys, "stdin", stdin), \
+                mock.patch("builtins.input", return_value="n"), \
+                mock.patch.object(handoff.registry, "accounts",
+                                  return_value=self.accounts), \
+                mock.patch.object(handoff.route, "ensure_fresh_snapshot",
+                                  return_value={"accounts": []}), \
+                mock.patch.object(handoff.route, "candidates",
+                                  return_value=[(self.accounts[1], None)]), \
+                mock.patch.object(handoff, "guard_source_stable"), \
+                mock.patch.object(handoff.route, "mark"), \
+                redirect_stdout(output):
+            result = handoff.cmd_handoff(["--session", self.SID])
+        self.assertEqual(result, 0)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(lines[-2], "handoff staged; resume command not run")
+        self.assertEqual(lines[-1], expected)
+        self.assertEqual(lines.count(expected), 2)
 
 
 if __name__ == "__main__":

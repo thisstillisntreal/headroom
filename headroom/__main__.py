@@ -13,6 +13,8 @@ usage:
   headroom codex [args...]          launch Codex on the best account
   headroom run <model> -- <cmd...>  headless run with auto-rotation on limit-hit
   headroom rotate [model]           cool the current account down, pick the next
+  headroom handoff [--session UUID] [--to SLOT] [--print] [--force]
+                                    hand a Claude conversation to another account
   headroom mark <name> <model> [epoch]   manual cooldown
   headroom clear [name:family]      clear cooldown(s)
   headroom repin <name>             re-bind a Claude slot's usage org
@@ -119,6 +121,9 @@ def _dispatch(argv):
     if command == "rotate":
         from . import route
         return route.cmd_rotate(registry.family(args[0] if args else "claude"))
+    if command == "handoff":
+        from . import handoff
+        return handoff.cmd_handoff(args)
     if command == "mark":
         import time
 
