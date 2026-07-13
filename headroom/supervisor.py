@@ -1323,6 +1323,18 @@ class Supervisor:
                         automatic = False
                 outcome = self._monitor(child, pending_handoff_id)
                 if isinstance(outcome, Relaunch):
+                    # the child has exited and the terminal is ours for a
+                    # moment: this is the one place the user can actually see
+                    # the handoff happen (anything printed earlier is hidden
+                    # by Claude's alternate screen)
+                    if outcome.automatic:
+                        print(f"[headroom] {child.account['name']} hit its "
+                              f"limit — continuing this conversation on "
+                              f"{outcome.account['name']}",
+                              file=sys.stderr)
+                    else:
+                        print(f"[headroom] recovering your session on "
+                              f"{outcome.account['name']}", file=sys.stderr)
                     account, args, cwd = outcome.account, outcome.argv, outcome.cwd
                     automatic = outcome.automatic
                     pending_handoff_id = outcome.handoff_id
