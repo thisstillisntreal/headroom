@@ -42,7 +42,19 @@ cp -r integrations/claude-code/skills/rotator ~/.claude/skills/
 
 Restart Claude Code and type `/rotator`.
 
-## 3. Keeping usage fresh in the background (optional)
+## 3. Opt-in automatic handoff
+
+Run `headroom setup` and answer Yes to the explicit automatic-handoff consent,
+then launch interactive sessions through `headroom claude`. Headroom injects
+private per-run hooks through `--settings`; it does not edit this file. A
+missing hook handshake leaves Claude running and disables automation.
+
+Conversation history, model-family routing, and the latest cwd carry. Background
+tasks, MCP connections/approvals, permission approvals/mode, and other
+ephemeral launch flags do not. See `docs/KNOWN-LIMITS.md`, especially the
+interrupted-tool double-execution warning and the pending macOS E2E gate.
+
+## 4. Keeping usage fresh in the background (optional)
 
 `headroom serve` refreshes on demand, and `headroom status`/`pick` refresh
 automatically when the snapshot is stale — cron is NOT required. But if you

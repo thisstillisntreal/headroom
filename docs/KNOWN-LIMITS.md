@@ -4,6 +4,43 @@ Findings from an adversarial cross-model review (GPT-5.6, x-high effort,
 2026-07-11) that are deliberate tradeoffs or blocked on upstream, documented
 here so users can judge them for their own threat model.
 
+## Auto-handoff is not yet release-proven on macOS
+
+The one-`SIGTERM` child-stop contract has been exercised live against Claude
+Code 2.1.x on Linux: an idle interactive process exited promptly and left a
+complete JSONL transcript. The equivalent end-to-end signal, foreground
+process-group, terminal restoration, descendant-cleanup, and resume test has
+not yet been completed on macOS. v0.2 therefore remains `0.2.0-dev`; do not
+treat automatic termination as macOS-release-proven until that E2E gate passes.
+Headroom never escalates to `SIGKILL`.
+
+## Managed Claude policy can override injected hooks
+
+The supervisor passes a private settings fragment through Claude's `--settings`
+option; it does not rewrite account settings. Managed policy, `disableAllHooks`,
+or a future settings-precedence change can suppress or replace those hooks. A
+matching `SessionStart` handshake is mandatory. If it is absent for 30 seconds,
+headroom disables automation for that child and leaves the child running.
+
+## An interrupted tool call may execute again after handoff
+
+A live cross-account test showed that Claude can resume a transcript ending in
+an unresolved `tool_use`: Claude re-drives the dangling call and reaches a
+usable prompt. Automatic handoff therefore copies the capped transcript
+byte-for-byte and prints `the interrupted tool call may re-run on resume`.
+If the interrupted tool had an external side effect, that side effect may run
+twice. Manual handoff of a source that is not shown capped still refuses a
+dangling call unless `--force` is explicit.
+
+## Handoff carries conversation state, not process state
+
+The fork preserves conversation continuity, routes for the same model family,
+and launches from the latest hook-reported cwd. Background tasks, live MCP
+connections, pending MCP or permission approvals, permission mode, extra
+directories, IDE state, and other ephemeral launch flags are not migrated.
+The local session and handoff JSONL journals are append-only and unbounded in
+v0.2; protect the private state directory and compact them manually if needed.
+
 ## Claude usage binding is trust-on-first-use
 
 The Anthropic usage endpoint identifies its organization in a response

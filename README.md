@@ -46,6 +46,48 @@ headroom fixes all three problems:
    **reserve** (e.g. 10%) and it skips any account already below that much
    headroom, so a session starts fresh instead of hitting a wall mid-task.
 
+## New in v0.2: automatic Claude conversation handoff
+
+Automatic handoff is an explicit opt-in, off by default. When enabled,
+`headroom claude` stays resident around an interactive Claude process. If that
+exact session reaches a subscription cap, headroom requires three independent
+proofs before it acts: a current-session `StopFailure` hook matched as
+`rate_limit`, a narrow session/weekly-cap message, and a new identity-bound
+usage read showing at least 99% used in the corresponding account or model
+window. Missing or ambiguous evidence leaves Claude running.
+
+After every non-mutating preflight succeeds, headroom sends Claude one
+`SIGTERM`, requires its `SessionEnd` cleanup hook, verifies the final transcript
+again, publishes a byte-identical copy without overwriting anything in the
+target account, and resumes with a forked session. The source transcript is
+never modified. If post-stop validation fails, the source session is relaunched
+with automation disabled. Three automatic handoffs in any rolling ten minutes
+trips the loop guard; the fourth child stays alive.
+
+Enable it in `headroom setup`, or explicitly in config:
+
+```json
+{
+  "routing": {
+    "reserve_percent": 0,
+    "auto_handoff": true
+  }
+}
+```
+
+One-run overrides are `headroom claude --headroom-auto-handoff` and
+`--headroom-no-auto-handoff`. Supervision only activates when stdin, stdout,
+and stderr are TTYs and no hook-incompatible Claude flag is present; otherwise
+the normal direct-exec launch path is used.
+
+What carries is the conversation, model-family routing, and latest session cwd.
+Background tasks, live MCP connections, pending MCP/permission approvals,
+permission mode, and other ephemeral launch flags do not carry. If termination
+races a tool call, Claude may re-drive that interrupted call on resume; headroom
+prints a notice because a side effect could therefore execute twice. See
+[Known limits](docs/KNOWN-LIMITS.md) before enabling automation on a new
+platform.
+
 ## Quickstart
 
 Requirements: Python 3.9+ (stdlib only — no pip installs), macOS or Linux,
@@ -90,10 +132,10 @@ headroom rotate            # limit hit? cool this login, switch to the next
 | `headroom status [model]` | table: every account, its windows, and exactly why any is skipped |
 | `headroom pick <model>` | print the best account name (exit 2 if none) — script-friendly |
 | `headroom env <model>` | print the `export CLAUDE_CONFIG_DIR=...` line for the best account |
-| `headroom claude` / `codex [args]` | launch the CLI on the best account |
+| `headroom claude` / `codex [args]` | launch the CLI on the best account; Claude supervises auto-handoff when opted in |
 | `headroom run <model> -- <cmd>` | headless run with automatic rotation on limit-hit |
 | `headroom rotate [model]` | cool the current account, hand you the next |
-| `headroom handoff` | hand a capped session to a fresh account — conversation continues |
+| `headroom handoff` | transactional manual handoff (`--yes`, `--print`, `--model FAMILY`) |
 | `headroom serve [--open]` | local live dashboard (auto-refreshes stale data) |
 | `headroom serve --demo` | preview the dashboard with bundled sample data — no accounts needed |
 | `headroom statusline` | color-coded capacity for your Claude Code status line |
@@ -101,13 +143,15 @@ headroom rotate            # limit hit? cool this login, switch to the next
 
 ## Hand off a capped session
 
-**EXPERIMENTAL.** After Claude reaches its 5-hour cap, run `/exit`, then run
+**EXPERIMENTAL.** With automatic handoff off, after Claude reaches its cap run `/exit`, then run
 `headroom handoff`. It verifies and copies the conversation transcript to the
 best other Claude account, cools the capped slot, and resumes from the same
 working directory with a new session id. Use `--print` to stage the handoff and
-print the exact resume command without running it. The source transcript is
-never changed or deleted. Background tasks, MCP connections, and per-session
-permission approvals do not carry across; only the conversation history does.
+print the exact resume command without running it; use `--yes` for a confirmed
+non-interactive handoff. If the journal lacks a model, pass `--model FAMILY`.
+`--yes` and `--print` are mutually exclusive. The source transcript is never
+changed or deleted. A non-capped manual handoff refuses an unresolved tool call
+unless `--force` is given.
 
 ## How the reads work (and why they're safe)
 
@@ -158,7 +202,7 @@ not *start* a session on an account that's about to run out, set a reserve —
 the setup wizard asks, or add it to `~/.headroom/config.json`:
 
 ```json
-{ "routing": { "reserve_percent": 10 } }
+{ "routing": { "reserve_percent": 10, "auto_handoff": false } }
 ```
 
 Now any account with less than 10% headroom left on its 5-hour, weekly, or
