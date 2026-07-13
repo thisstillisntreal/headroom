@@ -337,17 +337,50 @@ body.is-compact .statusline:not(.is-error) { display: none; }
 const CONFIG = /*__HEADROOM_CONFIG__*/ null;
 const DATA_URL = "usage.json";
 const CACHE_KEY = "headroom-cache-" + ((CONFIG && CONFIG.redact) ? "r" : "f");
+const SNAPSHOT_MAX_AGE = CONFIG&&Number.isFinite(CONFIG.snapshot_max_age)?CONFIG.snapshot_max_age:900;
+const OBSERVATION_MAX_AGE = CONFIG&&Number.isFinite(CONFIG.observation_max_age)?CONFIG.observation_max_age:1800;
 let requestNumber = 0;
 
 /* ------------------------------------------------------------- helpers */
 function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
 function clamp(v,lo,hi){return Math.min(hi,Math.max(lo,v));}
-function capacity(w){return w&&Number.isFinite(w.used_percent)?clamp(100-w.used_percent,0,100):null;}
 function tone(left){if(left==null)return"unknown";if(left<=10)return"red";if(left<=30)return"orange";if(left<=50)return"yellow";return"green";}
 function age(epoch){if(!Number.isFinite(epoch))return"time unknown";const s=Math.max(0,Math.floor(Date.now()/1e3-epoch));if(s<60)return s+"s ago";if(s<3600)return Math.floor(s/60)+"m ago";if(s<86400)return Math.floor(s/3600)+"h "+Math.floor(s%3600/60)+"m ago";return Math.floor(s/86400)+"d ago";}
 function untilReset(epoch){if(!Number.isFinite(epoch))return"reset not reported";const s=epoch-Math.floor(Date.now()/1e3);if(s<=0)return"reset due";if(s<86400){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return"resets in "+(h?h+"h ":"")+m+"m";}return"resets "+new Intl.DateTimeFormat(undefined,{weekday:"short",hour:"2-digit",minute:"2-digit"}).format(new Date(1e3*epoch));}
-let snapStale=false,sourceFailed=false; /* old/failed sources demote every row */
-function isCurrent(a){return Boolean(!snapStale&&!sourceFailed&&a&&a.ok===true&&a.routable===true&&a.stale!==true);}
+let snapshotState="held",sourceFailed=false; /* old/failed sources demote every row */
+function epochState(epoch,maxAge){const now=Date.now()/1e3;if(!Number.isFinite(epoch)||epoch>now)return"held";return now-epoch>maxAge?"stale":"current";}
+function projected(a){return a&&a.__display&&typeof a.__display==="object"?a.__display:null;}
+function intrinsicWindowState(a,key){
+  const d=projected(a),w=d&&d.windows&&d.windows[key];
+  if(!w||w.state==="held")return"held";
+  if(w.state==="stale")return"stale";
+  const timed=epochState(w.observed_at,OBSERVATION_MAX_AGE);
+  if(timed!=="current")return timed;
+  return w.state==="limited"?"limited":(w.state==="current"?"current":"held");
+}
+function displayState(a){
+  if(sourceFailed)return"stale";
+  if(snapshotState!=="current")return snapshotState;
+  const d=projected(a);
+  if(!d||d.state==="held")return"held";
+  if(d.state==="stale")return"stale";
+  const captured=epochState(a&&a.captured_at,OBSERVATION_MAX_AGE);
+  if(captured!=="current")return captured;
+  const states=["5h","7d"].map(k=>intrinsicWindowState(a,k));
+  if(states.includes("held"))return"held";
+  if(states.includes("stale"))return"stale";
+  return states.includes("limited")?"limited":"current";
+}
+function windowState(a,key){const state=displayState(a);return state==="held"||state==="stale"?state:intrinsicWindowState(a,key);}
+function windowView(a,key){
+  const d=projected(a),w=d&&d.windows&&d.windows[key],state=windowState(a,key),accountState=displayState(a);
+  const live=accountState==="current"&&state==="current";
+  const limited=accountState==="limited"&&state==="limited";
+  const left=live&&w&&Number.isFinite(w.left_percent)?w.left_percent:(limited&&w&&Number.isFinite(w.last_observed_left_percent)?w.last_observed_left_percent:null);
+  const safeTone=live&&w&&["green","orange","red"].includes(w.tone)?w.tone:(limited?"red":"unknown");
+  return{state:state,left:left,tone:safeTone};
+}
+function isCurrent(a){return displayState(a)==="current";}
 
 function windowLabel(key){
   if(key==="5h")return"Session 5h";
@@ -363,39 +396,37 @@ function windowColumns(accounts){
 }
 
 /* -------------------------------------------------------------- render */
-function meterMarkup(left){
+function meterMarkup(left,displayTone){
   let cells="";
   for(let i=0;i<10;i++){
     const fill=left==null?0:clamp((left-10*i)*10,0,100);
     cells+='<span class="cell" style="--fill:'+fill+'%"></span>';
   }
-  return '<div class="meter tone-'+tone(left)+'" role="img" aria-label="'+(left==null?"unknown":Math.round(left)+"% remaining")+'">'+cells+"</div>";
+  return '<div class="meter tone-'+(displayTone||tone(left))+'" role="img" aria-label="'+(left==null?"unknown":Math.round(left)+"% remaining")+'">'+cells+"</div>";
 }
 function windowMarkup(account,key){
   const w=(account.windows||{})[key]||null;
-  /* Held/stale rows retain labels and resets, but never capacity colours. */
-  const left=isCurrent(account)?capacity(w):null;
+  const view=windowView(account,key),left=view.left;
   const unknown=left==null;
   const value=unknown?"n/a":Math.round(left)+"% left";
   const note=unknown?(w?"reading unavailable":(key.startsWith("scoped:")?"no scoped cap":"no reading yet")):untilReset(w.resets_at);
   return '<div class="win"><span class="win-name">'+esc(windowLabel(key))+
-    '</span><span class="win-value tone-'+tone(left)+'">'+esc(value)+"</span>"+
-    meterMarkup(left)+'<p class="win-note">'+esc(note)+"</p></div>";
+    '</span><span class="win-value tone-'+view.tone+'">'+esc(value)+"</span>"+
+    meterMarkup(left,view.tone)+'<p class="win-note">'+esc(note)+"</p></div>";
 }
 // Calm, specific state per account. Codex reads its CLI's own telemetry, so
 // idle/limited are EXPECTED states — label them clearly, never as "broken".
 function accountState(account){
-  if(isCurrent(account)){
-    // a fresh reading can still be at 100% — that's "at limit", not "live"
-    const w=account.windows||{};
-    const exhausted=["5h","7d"].some(k=>w[k]&&Number.isFinite(w[k].used_percent)&&w[k].used_percent>=100);
-    if(exhausted)return{cls:"limited",label:"At limit",note:"window full · observed "+age(account.captured_at)};
+  const state=displayState(account);
+  if(state==="current"){
     return{cls:"live",label:"Live",note:"observed "+age(account.captured_at)};
   }
+  if(state==="limited")return{cls:"limited",label:"At limit",note:"window full · observed "+age(account.captured_at)};
+  if(state==="stale")return{cls:"held",label:"Stale",note:"last verified "+age(account.captured_at)};
   const code=account.error_code||"";
   const isCodex=account.provider==="codex";
   if(code==="codex_usage_limit"||/usage limit/i.test(account.note||""))
-    return{cls:"limited",label:"Limited",note:account.retry_at?("resets "+untilReset(account.retry_at)):"resets soon"};
+    return{cls:"held",label:"Held",note:account.retry_at?("resets "+untilReset(account.retry_at)):"usage limit reported"};
   if(code==="codex_reauth_required")
     return{cls:"held",label:"Sign-in expired",note:"run `codex login` on this account"};
   if(isCodex&&account.stale)
@@ -428,6 +459,9 @@ function providerMarkup(provider,accounts){
 function validate(data){
   if(!data||!Number.isFinite(data.generated)||!Array.isArray(data.accounts))
     throw new Error("usage snapshot invalid");
+  const display=data._headroom_display;
+  if(!display||display.schema!=="headroom_widget@1"||!display.freshness||typeof display.freshness.state!=="string"||!Array.isArray(display.accounts)||display.accounts.length!==data.accounts.length)
+    throw new Error("display projection invalid");
   data.accounts.forEach(a=>{
     if(!a||typeof a.name!=="string")throw new Error("invalid account record");
     Object.values(a.windows||{}).forEach(w=>{
@@ -435,14 +469,17 @@ function validate(data){
         throw new Error("invalid usage percentage");});});
   return data;
 }
-function render(data){
-  snapStale=!Number.isFinite(data.generated)||Date.now()/1e3-data.generated>1800;
-  sourceFailed=data.refresh_failed===true;
-  const accounts=data.accounts;
+function render(data,forceNoncurrent){
+  const now=Date.now()/1e3,display=data._headroom_display;
+  if(display.freshness.state==="held"||!Number.isFinite(data.generated)||data.generated>now) snapshotState="held";
+  else if(display.freshness.state!=="current"||now-data.generated>SNAPSHOT_MAX_AGE) snapshotState="stale";
+  else snapshotState="current";
+  sourceFailed=forceNoncurrent===true||data.refresh_failed===true;
+  const accounts=data.accounts.map((a,i)=>Object.assign({},a,{__display:display.accounts[i]}));
   const current=accounts.filter(isCurrent);
   const readings=[];
-  current.forEach(a=>Object.entries(a.windows||{}).forEach(([k,w])=>{
-    const left=capacity(w);if(left!=null&&(k==="5h"||k==="7d"))readings.push({left,who:a.email||a.name});}));
+  current.forEach(a=>["5h","7d"].forEach(k=>{
+    const left=windowView(a,k).left;if(left!=null)readings.push({left,who:a.email||a.name});}));
   const avg=readings.length?Math.round(readings.reduce((s,r)=>s+r.left,0)/readings.length):null;
   const lowest=readings.length?readings.reduce((b,r)=>r.left<b.left?r:b):null;
   const claude=accounts.filter(a=>a.provider==="claude");
@@ -461,9 +498,9 @@ function render(data){
   gauge.querySelector(".gauge-fill").style.setProperty("--fill",(avg==null?0:avg)+"%");
   document.getElementById("lowest-viz").innerHTML=meterMarkup(lowest?lowest.left:null);
   document.getElementById("fleet-viz").innerHTML=accounts.map(a=>{
-    const left=capacity((a.windows||{})["5h"]);
+    const view=windowView(a,"5h"),left=view.left;
     if(!isCurrent(a)||left==null)return'<span class="fbar is-unknown" title="'+esc(a.name)+': unknown"></span>';
-    return'<span class="fbar tone-'+tone(left)+'" style="--h:'+Math.max(4,left)+'%" title="'+esc(a.name)+": "+Math.round(left)+'% session left"></span>';
+    return'<span class="fbar tone-'+view.tone+'" style="--h:'+Math.max(4,left)+'%" title="'+esc(a.name)+": "+Math.round(left)+'% session left"></span>';
   }).join("");
   set("snapshot-age","snapshot "+age(data.generated));
   set("source-line",current.length+" of "+accounts.length+" verified");
@@ -471,7 +508,7 @@ function render(data){
     providerMarkup("claude",claude)+providerMarkup("codex",codex);
   const warnings=(data.integrity_warnings||[]).slice();
   if(sourceFailed)warnings.unshift("refresh failed — readings shown as held until collection succeeds");
-  if(snapStale)warnings.unshift("snapshot is over 30 minutes old — readings shown as held until a fresh collect");
+  if(snapshotState!=="current")warnings.unshift("snapshot is noncurrent (maximum "+Math.floor(SNAPSHOT_MAX_AGE/60)+" minutes) — readings shown as held until a fresh collect");
   const status=document.getElementById("status");
   status.textContent=warnings.length?("⚠ "+warnings.join(" — ")):"Full meters are available capacity. Colors show what's left, not what's used.";
   status.className="statusline"+(warnings.length?" is-error":"");
@@ -509,12 +546,12 @@ async function load(manual){
   }catch(error){
     if(requestId===requestNumber){
       let cached=null;
-      try{cached=JSON.parse(localStorage.getItem(CACHE_KEY)||"null");}catch(e){}
+      try{cached=validate(JSON.parse(localStorage.getItem(CACHE_KEY)||"null"));}catch(e){}
       // Only reuse a RECENT, non-future cache. An old cache may predate a
       // privacy change or a limit change; beyond an hour (or dated in the
       // future) we refuse it rather than resurface stale data as a snapshot.
       const cacheAge=cached&&Number.isFinite(cached.generated)?(Date.now()/1e3-cached.generated):Infinity;
-      if(cached&&cacheAge>=0&&cacheAge<=3600){render(cached);
+      if(cached&&cacheAge>=0&&cacheAge<=3600){render(cached,true);
         const status=document.getElementById("status");
         status.textContent="Feed unreachable ("+(error&&error.message||"error")+"). Showing last snapshot ("+age(cached.generated)+").";
         status.className="statusline is-error";}

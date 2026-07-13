@@ -5,6 +5,7 @@ import math
 import os
 import re
 import struct
+import subprocess
 import tempfile
 import time
 import unittest
@@ -55,7 +56,8 @@ class MutableClock:
         return self.value
 
 
-def memory_get(handler_class, directory, route, host="127.0.0.1:8377"):
+def memory_get(handler_class, directory, route, host="127.0.0.1:8377",
+               server_port=None):
     """Drive the real request handler without opening a sandbox-blocked socket."""
     handler = object.__new__(handler_class)
     handler.directory = directory
@@ -65,6 +67,10 @@ def memory_get(handler_class, directory, route, host="127.0.0.1:8377"):
     handler.request_version = "HTTP/1.1"
     handler.requestline = "GET %s HTTP/1.1" % route
     handler.client_address = ("127.0.0.1", 1)
+    if server_port is not None:
+        server = object.__new__(dashboard.http.server.ThreadingHTTPServer)
+        server.server_address = ("127.0.0.1", server_port)
+        handler.server = server
     handler.close_connection = True
     handler.wfile = io.BytesIO()
     handler.do_GET()
@@ -129,8 +135,24 @@ class WidgetContractTests(unittest.TestCase):
         del account["windows"]["7d"]
         projected = widget.project(usage_snapshot(account), NOW)["accounts"][0]
         self.assertEqual(projected["state"], "held")
+        self.assertEqual(projected["windows"]["5h"]["state"], "held")
+        self.assertIsNone(projected["windows"]["5h"]["left_percent"])
+        self.assertEqual(projected["windows"]["5h"][
+            "last_observed_left_percent"], 80.0)
         self.assertEqual(projected["windows"]["7d"]["state"], "held")
         self.assertIsNone(projected["windows"]["7d"]["left_percent"])
+
+    def test_one_stale_window_demotes_every_child_window(self):
+        account = usage_account()
+        account["windows"]["7d"]["observed_at"] = (
+            NOW - widget.OBSERVATION_MAX_AGE - 1)
+        projected = widget.project(usage_snapshot(account), NOW)["accounts"][0]
+        self.assertEqual(projected["state"], "stale")
+        for key, last in (("5h", 80.0), ("7d", 60.0)):
+            self.assertEqual(projected["windows"][key]["state"], "stale")
+            self.assertIsNone(projected["windows"][key]["left_percent"])
+            self.assertEqual(projected["windows"][key][
+                "last_observed_left_percent"], last)
 
     def test_widget_projection_rejects_out_of_range_values(self):
         bad_values = [-0.1, 100.1, float("inf"), float("nan"), "20", True]
@@ -233,6 +255,46 @@ class WidgetRendererTests(unittest.TestCase):
         account["provider"] = "bad | bash=/tmp/x shell=yes terminal=true param1=x"
         rendered = widget.render_swiftbar(usage_snapshot(account), NOW).lower()
         self.assertIsNone(re.search(r"(?:bash|shell|terminal|param\d+)=", rendered))
+
+    def test_schema_marker_never_bypasses_projection(self):
+        poisoned = {
+            "schema": widget.SCHEMA,
+            "headline": {"current_accounts":
+                         "1 | shell=/bin/sh param1=-c",
+                         "total_accounts": 1,
+                         "fullest_5h_left_percent": 99},
+            "accounts": [],
+        }
+        rendered = widget.render_swiftbar(poisoned, NOW)
+        self.assertIn("hr 0/0 · -- | color=gray", rendered)
+        self.assertNotIn("shell=", rendered)
+
+    def test_dashboard_href_is_parsed_and_reconstructed(self):
+        valid = widget.render_swiftbar(
+            None, dashboard_href="http://localhost:49152")
+        self.assertIn("href=http://127.0.0.1:49152/", valid)
+        attacks = (
+            "http://127.0.0.1:8377@evil.example/",
+            "http://localhost:8377@evil.example/",
+            "http://127.0.0.1:8377/ | shell=/bin/sh",
+            "http://127.0.0.1:8377/?x=1",
+            "http://127.0.0.1:8377/#x",
+            "http://127.0.0.1:0/",
+            "http://127.0.0.1:65536/",
+        )
+        for href in attacks:
+            with self.subTest(href=href):
+                rendered = widget.render_swiftbar(None, dashboard_href=href)
+                self.assertIn("href=" + widget.DASHBOARD_HREF, rendered)
+                self.assertNotIn("evil.example", rendered)
+                self.assertNotIn("shell=", rendered)
+
+    def test_aggregate_noncurrent_rows_never_retain_live_colors(self):
+        account = usage_account()
+        del account["windows"]["7d"]
+        rendered = widget.render_swiftbar(usage_snapshot(account), NOW)
+        self.assertRegex(rendered, r"(?m)^--5h: .*\(held\).* \| color=gray$")
+        self.assertNotRegex(rendered, r"(?m)^--5h: .* \| color=green$")
 
     def test_widget_feed_without_snapshot_is_static_offline(self):
         with mock.patch.object(paths, "load_json", return_value=None):
@@ -468,17 +530,98 @@ class DashboardHttpTests(unittest.TestCase):
                                       "/widget.json", "/widget.txt", "/missing")]
         self.assertEqual(statuses, [403] * 6)
 
-    def test_stale_and_held_fleet_bars_are_gray(self):
-        template = self.template_text()
-        self.assertIn("if(!isCurrent(a)||left==null)return'<span class=\"fbar is-unknown\"",
-                      template)
-        self.assertIn("const left=isCurrent(account)?capacity(w):null", template)
-        self.assertIn(".fbar.is-unknown { background: var(--unknown)", template)
+    def test_dashboard_dom_projection_uses_widget_trust_and_freshness(self):
+        held = usage_account(routable=True, trust_state="held")
+        cases = (
+            (usage_snapshot(usage_account(), generated=NOW - 1000), "stale"),
+            (usage_snapshot(held), "held"),
+        )
+        for snapshot, expected in cases:
+            with self.subTest(expected=expected):
+                display = dashboard.display_snapshot(snapshot, NOW)[
+                    "_headroom_display"]
+                central = widget.project(snapshot, NOW)
+                self.assertEqual(display["accounts"][0]["state"], expected)
+                self.assertEqual(display["accounts"][0]["state"],
+                                 central["accounts"][0]["state"])
+                for window in display["accounts"][0]["windows"].values():
+                    self.assertIsNone(window["left_percent"])
+                    self.assertEqual(window["tone"], "unknown")
 
-    def test_current_fleet_bars_retain_capacity_colors(self):
-        template = self.template_text()
-        self.assertIn("'<span class=\"fbar tone-'+tone(left)", template)
-        self.assertIn("function tone(left)", template)
+    def test_dashboard_dom_projection_colors_and_cache_fallback(self):
+        snapshot = usage_snapshot(
+            usage_account("green", used5=20),
+            usage_account("yellow", used5=60),
+            usage_account("orange", used5=80),
+            usage_account("red", used5=95))
+        display = dashboard.display_snapshot(snapshot, NOW)["_headroom_display"]
+        account = display["accounts"][0]
+        self.assertEqual(account["state"], "current")
+        self.assertEqual(account["windows"]["5h"]["left_percent"], 80.0)
+        self.assertEqual(account["windows"]["5h"]["tone"], "green")
+        self.assertEqual([row["windows"]["5h"]["tone"]
+                          for row in display["accounts"]],
+                         ["green", "yellow", "orange", "red"])
+        limited = dashboard.display_snapshot(
+            usage_snapshot(usage_account(used5=100)), NOW)[
+                "_headroom_display"]["accounts"][0]
+        self.assertEqual(limited["state"], "limited")
+        self.assertEqual(limited["windows"]["5h"]["tone"], "red")
+        self.assertEqual(limited["windows"]["7d"]["tone"], "unknown")
+        forced = dashboard.display_snapshot(
+            usage_snapshot(usage_account()), NOW, "cache_fallback")[
+                "_headroom_display"]
+        self.assertEqual(forced["accounts"][0]["state"], "stale")
+        self.assertEqual(forced["accounts"][0]["windows"]["5h"]["tone"],
+                         "unknown")
+        script = self.template_text().split("<script>", 1)[1].split(
+            "</script>", 1)[0]
+        render_body = script.split("function render(data,forceNoncurrent){",
+                                   1)[1].split("\n}", 1)[0]
+        fallback = script.split("async function load(manual){", 1)[1].split(
+            "/* --------------------------------------------------------------- theme */",
+            1)[0]
+        self.assertRegex(render_body,
+                         r"sourceFailed=forceNoncurrent===true\|\|")
+        self.assertRegex(fallback, r"render\(cached,true\)")
+
+    def test_static_dashboard_injects_shared_thresholds_and_projection(self):
+        config = {"schema_version": 1,
+                  "dashboard": {"theme": "midnight", "title": "test"},
+                  "accounts": []}
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "out")
+            os.makedirs(output)
+            source = os.path.join(output, "usage.json")
+            with open(source, "w") as handle:
+                json.dump(usage_snapshot(usage_account()), handle)
+            with redirect_stdout(io.StringIO()), \
+                    mock.patch.object(widget.time, "time", return_value=NOW):
+                dashboard.build(config, output, source)
+            with open(os.path.join(output, "index.html")) as handle:
+                html = handle.read()
+            with open(os.path.join(output, "usage.json")) as handle:
+                payload = json.load(handle)
+        match = re.search(r"const CONFIG = (\{.*?\});", html)
+        self.assertIsNotNone(match)
+        injected = json.loads(match.group(1))
+        self.assertEqual(injected["snapshot_max_age"],
+                         widget.SNAPSHOT_MAX_AGE)
+        self.assertEqual(injected["observation_max_age"],
+                         widget.OBSERVATION_MAX_AGE)
+        self.assertEqual(payload["_headroom_display"]["accounts"][0][
+            "windows"]["5h"]["tone"], "green")
+
+    def test_widget_href_uses_actual_server_address_port(self):
+        port = 49152
+        with mock.patch.object(widget.time, "time", return_value=NOW), \
+                self.demo_server() as server:
+            status, _, body = memory_get(
+                *server, "/widget.txt", server_port=port)
+        body = body.decode("utf-8")
+        self.assertEqual(status, 200)
+        self.assertIn("Open dashboard | href=http://127.0.0.1:%d/" % port,
+                      body)
 
     def test_compact_mode_retains_state_disclosure(self):
         # Compact may hide decorative chrome, but every element that
@@ -504,57 +647,152 @@ class DashboardHttpTests(unittest.TestCase):
 
 class SwiftBarPluginTests(unittest.TestCase):
     @staticmethod
-    def script():
-        with open(PLUGIN) as handle:
-            return handle.read()
+    def valid_body(port=8377):
+        return ("headroom_widget_txt@1\n"
+                "hr 1/1 · 80% | color=green\n"
+                "---\n"
+                "alpha · claude · CURRENT | color=green\n"
+                "Refresh | refresh=true\n"
+                f"Open dashboard | href=http://127.0.0.1:{port}/\n")
+
+    @classmethod
+    def run_plugin(cls, body, url="http://127.0.0.1:8377", local=False):
+        with tempfile.TemporaryDirectory() as directory:
+            body_path = os.path.join(directory, "body.txt")
+            log_path = os.path.join(directory, "args.log")
+            with open(body_path, "w") as handle:
+                handle.write(body)
+            env = os.environ.copy()
+            env["HEADROOM_TEST_BODY"] = body_path
+            env["HEADROOM_TEST_CURL_LOG"] = log_path
+            if local:
+                client = os.path.join(directory, "headroom-test")
+                with open(client, "w") as handle:
+                    handle.write(
+                        "#!/bin/sh\n"
+                        "printf '%s\\n' \"$@\" >\"$HEADROOM_TEST_CURL_LOG\"\n"
+                        "cat \"$HEADROOM_TEST_BODY\"\n")
+                os.chmod(client, 0o755)
+                env.pop("HEADROOM_WIDGET_URL", None)
+                env["HEADROOM_BIN"] = client
+            else:
+                client = os.path.join(directory, "curl")
+                with open(client, "w") as handle:
+                    handle.write(
+                        "#!/bin/sh\n"
+                        "printf '%s\\n' \"$@\" >\"$HEADROOM_TEST_CURL_LOG\"\n"
+                        "[ -z \"${HEADROOM_TEST_CURL_EXIT:-}\" ] || exit \"$HEADROOM_TEST_CURL_EXIT\"\n"
+                        "out=\n"
+                        "seen=0\n"
+                        "while [ \"$#\" -gt 0 ]; do\n"
+                        "  case \"$1\" in\n"
+                        "    --output) shift; out=$1 ;;\n"
+                        "    --) shift; [ \"$#\" -eq 1 ] || exit 91; seen=1; break ;;\n"
+                        "  esac\n"
+                        "  shift\n"
+                        "done\n"
+                        "[ \"$seen\" -eq 1 ] && [ -n \"$out\" ] || exit 92\n"
+                        "cp \"$HEADROOM_TEST_BODY\" \"$out\"\n")
+                os.chmod(client, 0o755)
+                env["PATH"] = directory + os.pathsep + env.get("PATH", "")
+                env["HEADROOM_WIDGET_URL"] = url
+                env.pop("HEADROOM_BIN", None)
+            result = subprocess.run(
+                [PLUGIN], env=env, text=True, capture_output=True,
+                timeout=5, check=False)
+            arguments = []
+            if os.path.exists(log_path):
+                with open(log_path) as handle:
+                    arguments = handle.read().splitlines()
+            return result, arguments
+
+    @classmethod
+    def run_failed_curl(cls):
+        with mock.patch.dict(os.environ, {"HEADROOM_TEST_CURL_EXIT": "22"}):
+            return cls.run_plugin(cls.valid_body())
 
     def test_plugin_filename_requests_one_minute_polling(self):
         self.assertEqual(os.path.basename(PLUGIN), "headroom.1m.sh")
         self.assertTrue(os.access(PLUGIN, os.X_OK))
 
     def test_plugin_local_mode_runs_installed_binary(self):
-        script = self.script()
-        local = script.split("else", 1)[1]
-        self.assertIn("${HEADROOM_BIN:-headroom} widget-feed --swiftbar", local)
-        self.assertNotIn("curl", local.split("fi", 1)[0])
+        result, arguments = self.run_plugin(self.valid_body(), local=True)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(arguments, ["widget-feed", "--swiftbar"])
+        self.assertIn("hr 1/1 · 80% | color=green", result.stdout)
 
     def test_plugin_remote_mode_uses_bounded_curl(self):
-        script = self.script()
-        self.assertIn("curl --fail --silent --max-time 3", script)
-        self.assertIn("--max-filesize 65536", script)
-        self.assertIn("[ \"$bytes\" -gt 65536 ]", script)
-
-    def test_plugin_accepts_only_exact_sentinel(self):
-        script = self.script()
-        self.assertIn("sentinel='headroom_widget_txt@1'", script)
-        self.assertIn('[ "$first" != "$sentinel" ]', script)
-        self.assertIn("sed '1d' \"$tmp\"", script)
+        result, arguments = self.run_plugin(self.valid_body())
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(arguments[-2:],
+                         ["--", "http://127.0.0.1:8377/widget.txt"])
+        self.assertIn("--fail", arguments)
+        self.assertIn("--silent", arguments)
+        self.assertEqual(arguments[arguments.index("--max-time") + 1], "3")
+        self.assertEqual(arguments[arguments.index("--max-filesize") + 1],
+                         "65536")
+        self.assertNotIn("headroom_widget_txt@1", result.stdout)
 
     def test_plugin_rejects_missing_or_wrong_sentinel(self):
-        script = self.script()
-        guard = script.split('if [ "$bytes" -gt 65536 ]', 1)[1]
-        self.assertIn('[ "$lines" -lt 2 ]', guard)
-        self.assertIn('[ "$first" != "$sentinel" ]', guard)
-        self.assertIn("offline", guard.split("\nfi\n", 1)[0])
-
-    def test_plugin_curl_failure_is_visible_offline(self):
-        script = self.script()
-        remote = script.split("if ! curl", 1)[1].split("else", 1)[0]
-        self.assertIn("offline", remote)
-        self.assertIn("exit 0", remote)
-        self.assertIn("hr OFFLINE | color=gray", script)
+        for body in ("PWN | color=green\n", "wrong\nPWN | color=green\n"):
+            with self.subTest(body=body):
+                result, _ = self.run_plugin(body)
+                self.assertIn("hr OFFLINE | color=gray", result.stdout)
+                self.assertNotIn("PWN", result.stdout)
 
     def test_plugin_rejects_oversized_response(self):
-        script = self.script()
-        self.assertIn("--max-filesize 65536", script)
-        oversized = script.split('[ "$bytes" -gt 65536 ]', 1)[1]
-        self.assertIn("offline", oversized.split("\nfi\n", 1)[0])
+        result, _ = self.run_plugin(
+            "headroom_widget_txt@1\n" + "x" * 65536 + "\n")
+        self.assertIn("hr OFFLINE | color=gray", result.stdout)
+        self.assertNotIn("x" * 100, result.stdout)
 
-    def test_plugin_never_evaluates_response(self):
-        script = self.script().lower()
-        for forbidden in ("eval", "source", "bash -c", "sh -c", "exec $",
-                          "`$", "$(cat"):
-            self.assertNotIn(forbidden, script)
+    def test_plugin_curl_failure_is_visible_offline(self):
+        result, arguments = self.run_failed_curl()
+        self.assertNotEqual(arguments, [])
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("hr OFFLINE | color=gray", result.stdout)
+
+    def test_plugin_rejects_hostile_fetched_parameter_sections(self):
+        attacks = (
+            "headroom_widget_txt@1\nPWN | shell=/bin/sh param1=-c\n",
+            self.valid_body().replace(
+                "color=green\n", "color=green shell=/bin/sh\n", 1),
+            self.valid_body().replace(
+                "href=http://127.0.0.1:8377/",
+                "href=http://127.0.0.1:8377@evil.example/"),
+        )
+        for body in attacks:
+            with self.subTest(body=body):
+                result, _ = self.run_plugin(body)
+                self.assertEqual(result.returncode, 0)
+                self.assertIn("hr OFFLINE | color=gray", result.stdout)
+                self.assertNotIn("PWN", result.stdout)
+                self.assertNotIn("shell=", result.stdout)
+                self.assertNotIn("evil.example", result.stdout)
+
+    def test_plugin_rejects_hostile_url_before_curl(self):
+        attacks = (
+            "http://127.0.0.1:8377 | shell=/bin/sh",
+            "http://localhost:8377@evil.example/widget.txt",
+            "http://127.0.0.1:8377/widget.txt?x=1",
+            "http://127.0.0.1:0/widget.txt",
+            "https://127.0.0.1:8377/widget.txt",
+        )
+        for url in attacks:
+            with self.subTest(url=url):
+                result, arguments = self.run_plugin(self.valid_body(), url)
+                self.assertEqual(arguments, [])
+                self.assertIn("hr OFFLINE | color=gray", result.stdout)
+                self.assertIn("href=http://127.0.0.1:8377/", result.stdout)
+                self.assertNotIn("shell=", result.stdout)
+                self.assertNotIn("evil.example", result.stdout)
+
+    def test_plugin_canonicalizes_localhost_origin(self):
+        result, arguments = self.run_plugin(
+            self.valid_body(49152), "http://localhost:49152/widget.txt")
+        self.assertEqual(arguments[-1],
+                         "http://127.0.0.1:49152/widget.txt")
+        self.assertIn("href=http://127.0.0.1:49152/", result.stdout)
 
 
 class ExperimentalWindowsTests(unittest.TestCase):
@@ -599,12 +837,44 @@ class ExperimentalWindowsTests(unittest.TestCase):
 
     def test_windows_failure_always_selects_gray_offline(self):
         script = self.script()
-        failure = script.split("\n    catch {", 1)[1].split("\n    }", 1)[0]
-        self.assertIn('Set-TrayStatus "gray" "headroom OFFLINE"', failure)
-        for validation in ("schema mismatch", "not current", "clock invalid",
-                           "fields missing", "counts invalid",
-                           "percentage invalid", "response too large"):
-            self.assertIn(validation, script)
+        refresh = script.split("function Refresh-Headroom {", 1)[1].split(
+            "\n}\n\n$menu", 1)[0]
+        self.assertEqual(refresh.count("\n    catch {"), 1)
+        attempt, failure = refresh.split("\n    catch {", 1)
+        self.assertRegex(failure, r'^\s*Set-TrayStatus "gray" '
+                         r'"headroom OFFLINE"\s*\}\s*$')
+        thrown = set(re.findall(r'throw "([^"]+)"', attempt))
+        self.assertEqual(thrown, {
+            "widget response too large", "widget schema mismatch",
+            "widget is not current", "widget clock invalid",
+            "widget fields missing", "widget counts invalid",
+            "widget percentage invalid",
+        })
+        guards = (
+            r'if \(\[Text\.Encoding\]::UTF8\.GetByteCount\('
+            r'\$response\.Content\) -gt 65536\) \{\s*'
+            r'throw "widget response too large"\s*\}',
+            r'if \(\$data\.schema -ne "headroom_widget@1"\) '
+            r'\{ throw "widget schema mismatch" \}',
+            r'if \(\$null -eq \$data\.freshness -or '
+            r'\$data\.freshness\.state -ne "current"\) \{\s*'
+            r'throw "widget is not current"\s*\}',
+            r'if \(\$null -eq \$data\.accounts -or '
+            r'\$null -eq \$data\.headline\) \{\s*'
+            r'throw "widget fields missing"\s*\}',
+            r'if \(\$evaluatedAt -gt \$now -or '
+            r'\(\$now - \$evaluatedAt\) -gt 300 -or\s*'
+            r'\$ageSeconds -lt 0 -or \$ageSeconds -gt 900\) \{\s*'
+            r'throw "widget clock invalid"\s*\}',
+            r'if \(\$current -lt 0 -or \$total -lt \$current -or\s*'
+            r'\$total -ne \$accountCount\) \{ throw "widget counts invalid" \}',
+            r'if \(\[Double\]::IsNaN\(\$percent\) -or '
+            r'\[Double\]::IsInfinity\(\$percent\) -or\s*'
+            r'\$percent -lt 0 -or \$percent -gt 100\) \{\s*'
+            r'throw "widget percentage invalid"\s*\}',
+        )
+        for guard in guards:
+            self.assertRegex(attempt, guard)
 
     def test_windows_script_has_no_gdi_or_rotation_actions(self):
         script = self.script().lower()

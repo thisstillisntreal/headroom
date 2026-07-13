@@ -12,7 +12,6 @@ import ipaddress
 import json
 import math
 import os
-import shutil
 import sys
 import threading
 import time
@@ -21,7 +20,7 @@ import webbrowser
 from dataclasses import dataclass
 
 from . import collect as collector
-from . import paths, registry
+from . import paths, registry, widget
 
 TEMPLATE = os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "dashboard", "template.html")
@@ -30,6 +29,14 @@ FAILURE_BACKOFF_BASE = int(os.environ.get(
     "HEADROOM_SERVE_FAILURE_BACKOFF_BASE", "5"))
 FAILURE_BACKOFF_CAP = int(os.environ.get(
     "HEADROOM_SERVE_FAILURE_BACKOFF_CAP", "300"))
+
+
+def display_snapshot(snapshot, evaluated_at=None, force_noncurrent_reason=None):
+    """Attach the central display projection consumed by dashboard JavaScript."""
+    value = dict(snapshot)
+    value["_headroom_display"] = widget.project_dashboard(
+        snapshot, evaluated_at, force_noncurrent_reason)
+    return value
 
 
 @dataclass(frozen=True)
@@ -149,7 +156,7 @@ def build_demo(out_dir=None):
                                 for a in data["accounts"]]}
     build(demo_config, out_dir)
     with open(os.path.join(out_dir, "usage.json"), "w") as handle:
-        json.dump(data, handle)
+        json.dump(display_snapshot(data), handle, allow_nan=False)
     return out_dir
 
 
@@ -164,6 +171,8 @@ def build(config=None, out_dir=None, snapshot_file=None):
         "theme": settings["theme"],
         "title": settings["title"],
         "redact": bool(settings.get("redact_emails", True)),
+        "snapshot_max_age": widget.SNAPSHOT_MAX_AGE,
+        "observation_max_age": widget.OBSERVATION_MAX_AGE,
         "accounts": [{"name": account["name"], "provider": account["provider"]}
                      for account in registry.accounts(config)],
     }
@@ -177,9 +186,11 @@ def build(config=None, out_dir=None, snapshot_file=None):
     with open(index, "w") as handle:
         handle.write(html)
     target = os.path.join(out_dir, "usage.json")
-    if snapshot_file and os.path.exists(snapshot_file) \
-            and os.path.realpath(snapshot_file) != os.path.realpath(target):
-        shutil.copy2(snapshot_file, target)
+    if snapshot_file and os.path.exists(snapshot_file):
+        with open(snapshot_file) as handle:
+            snapshot = json.load(handle)
+        with open(target, "w") as handle:
+            json.dump(display_snapshot(snapshot), handle, allow_nan=False)
     print(f"dashboard built: {index}")
     return index
 
@@ -265,8 +276,6 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def _serve_feed(self, route):
-        from . import widget
-
         result = self._snapshot_result()
         if not isinstance(result.snapshot, dict):
             if route == "/widget.txt":
@@ -281,7 +290,8 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         reason = result.reason if result.refresh_failed else None
         try:
             if route == "/usage.json":
-                value = dict(result.snapshot)
+                value = display_snapshot(
+                    result.snapshot, force_noncurrent_reason=reason)
                 if result.refresh_failed:
                     value["refresh_failed"] = True
                 body = json.dumps(value, allow_nan=False,

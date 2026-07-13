@@ -1329,7 +1329,7 @@ class Supervisor:
                     # by Claude's alternate screen)
                     if outcome.automatic:
                         print(f"[headroom] {child.account['name']} hit its "
-                              f"limit — continuing this conversation on "
+                              f"limit, continuing this conversation on "
                               f"{outcome.account['name']}",
                               file=sys.stderr)
                     else:

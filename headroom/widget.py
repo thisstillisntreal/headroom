@@ -9,6 +9,7 @@ import math
 import os
 import time
 import unicodedata
+from urllib.parse import urlsplit
 
 
 SCHEMA = "headroom_widget@1"
@@ -112,6 +113,14 @@ def _window_projection(raw, captured_at, base_state, evaluated_at):
     }
 
 
+def _demote_windows(windows, state):
+    for window in windows.values():
+        if _number(window.get("left_percent")):
+            window["last_observed_left_percent"] = window["left_percent"]
+        window["left_percent"] = None
+        window["state"] = state
+
+
 def calculate_headline(accounts):
     """Return the one glanceable metric: fullest current 5h tank."""
     current = sum(1 for account in accounts
@@ -160,6 +169,8 @@ def project(snapshot, evaluated_at=None, force_noncurrent_reason=None):
             state = "limited"
         else:
             state = "current"
+        if state in {"held", "stale"}:
+            _demote_windows(windows, state)
         accounts.append({
             "name": raw.get("name") if isinstance(raw.get("name"), str)
             else "unknown",
@@ -221,12 +232,71 @@ def _tone(value):
     return "green"
 
 
+def _dashboard_tone(value):
+    if not _number(value):
+        return "unknown"
+    if value <= 10:
+        return "red"
+    if value <= 30:
+        return "orange"
+    if value <= 50:
+        return "yellow"
+    return "green"
+
+
+def _canonical_dashboard_href(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (parsed.scheme != "http" or parsed.hostname not in
+            {"127.0.0.1", "localhost"} or port is None
+            or not 1 <= port <= 65535
+            or parsed.username is not None or parsed.password is not None
+            or parsed.path not in {"", "/"} or parsed.query or parsed.fragment):
+        return None
+    return "http://127.0.0.1:{}/".format(port)
+
+
+def project_dashboard(snapshot, evaluated_at=None, force_noncurrent_reason=None):
+    """Return the central projection plus inert tones used by dashboard DOM."""
+    evaluated_at = time.time() if evaluated_at is None else evaluated_at
+    result = project(snapshot, evaluated_at, force_noncurrent_reason)
+    raw_accounts = snapshot.get("accounts") if isinstance(snapshot, dict) else []
+    for index, account in enumerate(result["accounts"]):
+        raw = raw_accounts[index] if index < len(raw_accounts) else {}
+        raw = raw if isinstance(raw, dict) else {}
+        raw_windows = raw.get("windows")
+        raw_windows = raw_windows if isinstance(raw_windows, dict) else {}
+        base_state = _account_base_state(raw, result["freshness"], evaluated_at)
+        for key, raw_window in raw_windows.items():
+            if not isinstance(key, str) or key in account["windows"]:
+                continue
+            window = _window_projection(
+                raw_window, _epoch(raw.get("captured_at")), base_state,
+                evaluated_at)
+            if account["state"] in {"held", "stale"}:
+                _demote_windows({key: window}, account["state"])
+            account["windows"][key] = window
+        for window in account["windows"].values():
+            if (account["state"] == "current"
+                    and window["state"] == "current"):
+                window["tone"] = _dashboard_tone(window["left_percent"])
+            elif (account["state"] == "limited"
+                  and window["state"] == "limited"):
+                window["tone"] = "red"
+            else:
+                window["tone"] = "unknown"
+    return result
+
+
 def render_swiftbar(value, evaluated_at=None, force_noncurrent_reason=None,
                     dashboard_href=None):
     """Render the one trusted SwiftBar representation, including sentinel."""
-    href = dashboard_href if isinstance(dashboard_href, str) \
-        and dashboard_href.startswith(("http://127.0.0.1:",
-                                       "http://localhost:")) else DASHBOARD_HREF
+    href = _canonical_dashboard_href(dashboard_href) or DASHBOARD_HREF
     if value is None:
         return "\n".join([
             TEXT_SCHEMA,
@@ -237,8 +307,7 @@ def render_swiftbar(value, evaluated_at=None, force_noncurrent_reason=None,
             "Open dashboard | href=" + href,
             "",
         ])
-    widget = value if isinstance(value, dict) and value.get("schema") == SCHEMA \
-        else project(value, evaluated_at, force_noncurrent_reason)
+    widget = project(value, evaluated_at, force_noncurrent_reason)
     summary = widget["headline"]
     fullest = summary["fullest_5h_left_percent"]
     shown = _display_percent(fullest)
@@ -264,18 +333,20 @@ def render_swiftbar(value, evaluated_at=None, force_noncurrent_reason=None,
             name, provider, state.upper(), color))
         for key in WINDOW_KEYS:
             window = (account.get("windows") or {}).get(key) or {}
+            window_state = window.get("state")
             current_value = window.get("left_percent")
             last_value = window.get("last_observed_left_percent")
             display = current_value if _number(current_value) else last_value
             percent = _display_percent(display)
             if percent != "--":
                 percent += "% left"
-            label = percent if window.get("state") == "current" \
-                else "{} ({})".format(percent, sanitize(window.get("state") or "held"))
+            live = state == "current" and window_state == "current"
+            limited = state == "limited" and window_state == "limited"
+            label = percent if live else "{} ({})".format(
+                percent, sanitize(window_state or "held"))
             lines.append("--{}: {} · {} | color={}".format(
                 key, label, _reset_label(window.get("resets_at")),
-                _tone(current_value) if window.get("state") == "current"
-                else ("red" if window.get("state") == "limited" else "gray")))
+                _tone(current_value) if live else ("red" if limited else "gray")))
     lines.extend(["---", "Refresh | refresh=true",
                   "Open dashboard | href=" + href])
     return "\n".join(lines) + "\n"
