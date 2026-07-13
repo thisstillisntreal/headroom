@@ -9,11 +9,13 @@ usage:
   headroom status [model]           who has headroom right now (default: claude)
   headroom pick <model>             print the best account name (exit 2 if none)
   headroom env <model>              print the export line for the best account
-  headroom claude [args...]         launch Claude Code on the best account
+  headroom claude [args...]         launch Claude; supervise opted-in auto-handoff
+    --headroom-auto-handoff / --headroom-no-auto-handoff   one-run override
   headroom codex [args...]          launch Codex on the best account
   headroom run <model> -- <cmd...>  headless run with auto-rotation on limit-hit
   headroom rotate [model]           cool the current account down, pick the next
-  headroom handoff [--session UUID] [--to SLOT] [--print] [--force]
+  headroom handoff [--session UUID] [--to SLOT] [--model FAMILY]
+                   [--print | --yes] [--force]
                                     hand a Claude conversation to another account
   headroom mark <name> <model> [epoch]   manual cooldown
   headroom clear [name:family]      clear cooldown(s)
@@ -60,6 +62,10 @@ def _dispatch(argv):
         print(__doc__)
         return 0
     command, args = argv[0], argv[1:]
+
+    if command == "_hook-event":
+        from . import supervisor
+        return supervisor.write_hook_event()
 
     if command in ("-V", "--version", "version"):
         print(f"headroom {__version__}")
@@ -110,6 +116,27 @@ def _dispatch(argv):
                   f"{registry.family_provider(fam)} model ({model}) — use "
                   f"`headroom {registry.family_provider(fam)}`", file=sys.stderr)
             return 2
+        if command == "claude":
+            from . import supervisor
+            auto_flag = "--headroom-auto-handoff" in args
+            no_auto_flag = "--headroom-no-auto-handoff" in args
+            if auto_flag and no_auto_flag:
+                print("headroom: auto-handoff overrides are mutually exclusive",
+                      file=sys.stderr)
+                return 2
+            args = [arg for arg in args if arg not in (
+                "--headroom-auto-handoff", "--headroom-no-auto-handoff")]
+            configured = registry.auto_handoff()
+            enabled = auto_flag or (configured and not no_auto_flag)
+            if enabled:
+                incompatible = supervisor.incompatible_args(args)
+                all_tty = (sys.stdin.isatty() and sys.stdout.isatty()
+                           and sys.stderr.isatty())
+                if all_tty and not incompatible:
+                    return supervisor.cmd_claude(fam, args)
+                why = incompatible or "stdin/stdout/stderr are not all TTYs"
+                print(f"[headroom] auto-handoff disabled for this run: {why}",
+                      file=sys.stderr)
         return route.cmd_exec(fam, [command] + args)
     if command == "run":
         from . import route

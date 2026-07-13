@@ -1,4 +1,4 @@
 """headroom — usage tracking, a live dashboard, and fail-closed account
 rotation for Claude Code and Codex subscriptions."""
 
-__version__ = "0.1.2"
+__version__ = "0.2.0-dev"

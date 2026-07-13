@@ -141,7 +141,11 @@ def run_setup():
     })
 
     # -- routing preference: keep a reserve so sessions start fresh -----------
-    current_reserve = (config.get("routing") or {}).get("reserve_percent", 0)
+    routing = config.get("routing")
+    if not isinstance(routing, dict):
+        routing = {}
+        config["routing"] = routing
+    current_reserve = routing.get("reserve_percent", 0)
     reserve_raw = ask(
         "Skip an account once it drops below this % headroom left, so sessions "
         "start fresh instead of hitting a limit mid-task (0 = use every account "
@@ -151,7 +155,13 @@ def run_setup():
         reserve = reserve if 0 <= reserve <= 99 else 0.0
     except ValueError:
         reserve = 0.0
-    config.setdefault("routing", {})["reserve_percent"] = reserve
+    routing["reserve_percent"] = reserve
+
+    auto_handoff = ask_yes_no(
+        "Enable automatic Claude handoff? This permits headroom to terminate "
+        "a proven-capped Claude process and copy its conversation into another "
+        "configured Claude account", False)
+    routing["auto_handoff"] = auto_handoff
 
     registry.save(config)
     print(f"\nSaved {paths.config_path()}")
