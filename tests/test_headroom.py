@@ -496,5 +496,34 @@ class KeychainNamespacing(unittest.TestCase):
             collect.sys.platform, collect.shutil.which = platform, which
 
 
+class ClaudePlan(unittest.TestCase):
+    """rateLimitTier is unreliable on team seats — one seat of an org can
+    carry a per-user tier (default_claude_max_5x) while another carries the
+    org's shared-pool tier (default_raven), and the field is cached at login
+    and never refreshed. subscriptionType must win for team."""
+
+    def _home_with(self, home, **oauth):
+        with open(os.path.join(home, ".credentials.json"), "w") as fh:
+            json.dump({"claudeAiOauth": dict({"accessToken": "tok"}, **oauth)}, fh)
+
+    def test_team_wins_over_per_user_tier(self):
+        with tempfile.TemporaryDirectory() as home:
+            self._home_with(home, subscriptionType="team",
+                            rateLimitTier="default_claude_max_5x")
+            self.assertEqual(collect.claude_plan(home), "Team")
+
+    def test_team_with_org_pool_tier(self):
+        with tempfile.TemporaryDirectory() as home:
+            self._home_with(home, subscriptionType="team",
+                            rateLimitTier="default_raven")
+            self.assertEqual(collect.claude_plan(home), "Team")
+
+    def test_non_team_keeps_tier_first(self):
+        with tempfile.TemporaryDirectory() as home:
+            self._home_with(home, subscriptionType="max",
+                            rateLimitTier="default_claude_max_20x")
+            self.assertEqual(collect.claude_plan(home), "Max 20x")
+
+
 if __name__ == "__main__":
     unittest.main()
