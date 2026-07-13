@@ -640,12 +640,11 @@ class WidgetDocumentationTests(unittest.TestCase):
 
     def test_widgets_hero_capture_exists(self):
         readme = self.readme()
-        reference = ("![Placeholder: Mac menu bar and compact dashboard capture "
-                     "will be added after E2E](marketing/hr-widgets.png)")
+        reference = ("![Menu bar widget and compact dashboard, rendered from "
+                     "live fleet data](marketing/hr-widgets.png)")
         self.assertIn(reference, readme)
-        # The build brief reserves capture creation for the orchestrator.
-        self.assertFalse(os.path.exists(os.path.join(ROOT,
-                                                     "marketing/hr-widgets.png")))
+        self.assertTrue(os.path.exists(os.path.join(ROOT,
+                                                    "marketing/hr-widgets.png")))
 
 
 if __name__ == "__main__":

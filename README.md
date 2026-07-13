@@ -126,7 +126,7 @@ headroom rotate            # limit hit? cool this login, switch to the next
 
 ## Widgets
 
-![Placeholder: Mac menu bar and compact dashboard capture will be added after E2E](marketing/hr-widgets.png)
+![Menu bar widget and compact dashboard, rendered from live fleet data](marketing/hr-widgets.png)
 
 Widgets are display-only views of the same fail-closed public snapshot. The
 mini dashboard app is the existing dashboard in a compact layout: open
