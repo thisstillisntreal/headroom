@@ -875,6 +875,35 @@ class HandoffSafety(unittest.TestCase):
         self.assertFalse(os.path.exists(handoff.destination_path(
             self.target_home, self.transcript, self.SID)))
 
+    def test_manual_exec_rechecks_pinned_identity_after_commit(self):
+        snapshot = {"generated": time.time(), "accounts": [
+            _claude_row("source", used5h=100.0), _claude_row("target")]}
+        errors = io.StringIO()
+        with mock.patch.object(handoff.registry, "accounts",
+                               return_value=self.accounts), \
+                mock.patch.object(handoff.route, "ensure_fresh_snapshot",
+                                  return_value=snapshot), \
+                mock.patch.object(handoff.route, "candidates",
+                                  return_value=[(self.accounts[0], "capped"),
+                                                (self.accounts[1], None)]), \
+                mock.patch.object(handoff, "guard_source_stable"), \
+                mock.patch.object(handoff.route, "mark"), \
+                mock.patch.object(
+                    collect, "local_binding",
+                    side_effect=[("AAAA", "BBBB"),
+                                 ("AAAA", "BBBB"),
+                                 ("OTHER", "CHANGED")]) as binding, \
+                mock.patch.object(handoff.os, "execvpe") as execute, \
+                redirect_stderr(errors):
+            result = handoff.cmd_handoff([
+                "--session", self.SID, "--model", "sonnet", "--yes"])
+        self.assertEqual(result, 2)
+        self.assertEqual(binding.call_count, 3)
+        execute.assert_not_called()
+        self.assertIn("identity or credential changed", errors.getvalue())
+        self.assertTrue(os.path.exists(handoff.destination_path(
+            self.target_home, self.transcript, self.SID)))
+
 
 if __name__ == "__main__":
     unittest.main()

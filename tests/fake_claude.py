@@ -88,7 +88,8 @@ def main():
     model_id = os.environ.get(
         "FAKE_CAP_MODEL", "claude-sonnet-4-5-20250929")
     cap_event = {"type": "assistant", "isApiErrorMessage": True,
-                 "message": {"model": model_id, "content": [
+                 "error": "rate_limit", "apiErrorStatus": 429,
+                 "message": {"model": "<synthetic>", "content": [
                  {"type": "text", "text":
                   "You've hit your session limit · resets 12:20pm (UTC)"}]}}
     with open(transcript, "w", encoding="utf-8") as out:
@@ -97,6 +98,9 @@ def main():
         else:
             out.write(json.dumps({"type": "user", "message": {
                 "content": [{"type": "text", "text": "hello"}]}}) + "\n")
+            out.write(json.dumps({"type": "assistant", "message": {
+                "model": model_id, "content": [
+                    {"type": "text", "text": "real assistant turn"}]}}) + "\n")
             out.flush()
             os.fsync(out.fileno())
     common = {"session_id": sid, "transcript_path": transcript,

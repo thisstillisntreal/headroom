@@ -963,12 +963,22 @@ def _validated_automatic_rows(rows):
     return rows
 
 
-def _verify_target_unlocked(plan, now=None):
-    current = collect.local_binding(plan.target["provider"], plan.target["home"])
-    expected = (plan.target_identity["account_fingerprint"],
-                plan.target_identity["credential_digest"])
+def verify_target_binding(plan):
+    """Re-derive both pinned target identity components at the launch edge."""
+    try:
+        current = collect.local_binding(
+            plan.target["provider"], plan.target["home"])
+        expected = (plan.target_identity["account_fingerprint"],
+                    plan.target_identity["credential_digest"])
+    except Exception as error:
+        raise HandoffError(
+            f"could not verify target identity or credential: {error}") from error
     if current != expected:
         raise HandoffError("target identity or credential changed since planning")
+
+
+def _verify_target_unlocked(plan, now=None):
+    verify_target_binding(plan)
     cool = route.preflight_cooldowns()
     row = _snapshot_rows(plan.snapshot).get(plan.target["name"])
     reason = route.block_reason(plan.target, plan.family, row, cool,
@@ -980,7 +990,7 @@ def _verify_target_unlocked(plan, now=None):
 
 def _active_reservation(rows, plan, now):
     released = {row.get("handoff_id") for row in rows
-                if row.get("action") in ("failure", "resume_spawned")}
+                if row.get("action") in ("failure", "resume_bound")}
     for row in rows:
         if (row.get("handoff_id") == plan.handoff_id
                 and row.get("action") == "cap_confirmed"
@@ -1012,7 +1022,7 @@ def reserve_automatic(plan, now=None, *, loop_window=600.0, loop_max=3):
                 raise HandoffError(
                     "automatic handoff loop guard: 3 handoffs in 10 minutes")
             released = {row.get("handoff_id") for row in rows
-                        if row.get("action") in ("failure", "resume_spawned")}
+                        if row.get("action") in ("failure", "resume_bound")}
             for row in confirmed:
                 until = row.get("reservation_until")
                 until = until if _number(until) else \
@@ -1241,6 +1251,7 @@ def cmd_handoff(args):
         environment["CLAUDE_CONFIG_DIR"] = target["home"]
         try:
             argv = resume_argv(result)
+            verify_target_binding(plan)
             os.execvpe(argv[0], argv, environment)
         except OSError as error:
             print(f"headroom: cannot exec claude: {error}", file=sys.stderr)

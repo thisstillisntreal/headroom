@@ -330,6 +330,20 @@ class TranscriptAndTransaction(unittest.TestCase):
         with self.assertRaisesRegex(handoff.HandoffError, "no longer"):
             handoff.commit_handoff(plan)
 
+    def test_target_reservation_is_held_through_spawn_until_bind(self):
+        first = self.automatic_plan()
+        second = self.automatic_plan()
+        handoff.reserve_automatic(first)
+        handoff.append_action(
+            first.handoff_id, "resume_spawned", automatic=True,
+            target_slot=first.target["name"])
+        with self.assertRaisesRegex(handoff.HandoffError, "reserved"):
+            handoff.reserve_automatic(second)
+        handoff.append_action(
+            first.handoff_id, "resume_bound", automatic=True,
+            target_slot=first.target["name"], new_session_id=self.SID)
+        handoff.reserve_automatic(second)
+
     def test_incomplete_publication_is_reconciled_on_next_lock(self):
         plan = self.automatic_plan()
         with handoff._handoff_lock():
@@ -386,10 +400,16 @@ class HookProof(unittest.TestCase):
         os.makedirs(directory)
         self.transcript = os.path.join(directory, self.SID + ".jsonl")
         event = {"type": "assistant", "isApiErrorMessage": True,
-                 "message": {"model": "claude-sonnet-4-5-20250929",
+                 "error": "rate_limit", "apiErrorStatus": 429,
+                 "message": {"model": "<synthetic>",
                  "content": [{"type": "text", "text":
                  "You've hit your session limit · resets 12:20pm (UTC)"}]}}
         with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({
+                "type": "assistant", "message": {
+                    "model": "claude-sonnet-4-5-20250929",
+                    "content": [{"type": "text", "text": "real turn"}]}
+            }) + "\n")
             out.write(json.dumps(event) + "\n")
         account = {"name": "source", "provider": "claude", "home": self.home}
         process = mock.Mock(pid=999)
@@ -410,7 +430,8 @@ class HookProof(unittest.TestCase):
         if text is not None:
             payload["last_assistant_message"] = text
         payload.update(over.pop("payload", {}))
-        record = {"supervisor_id": self.SUPERVISOR, "generation": 1,
+        record = {"schema": "headroom_hook_event@1",
+                  "supervisor_id": self.SUPERVISOR, "generation": 1,
                   "source_slot": "source", "config_dir": self.home,
                   "matcher": "rate_limit", "received_at": time.time(),
                   "payload": payload}
@@ -459,8 +480,13 @@ class HookProof(unittest.TestCase):
         self.assertEqual(supervisor.cap_message(
             self.record("rate limit"), self.child), "")
 
-    def test_cap_family_comes_from_final_api_error_not_session_start(self):
+    def test_cap_event_model_is_never_used(self):
         with open(self.transcript, "w", encoding="utf-8") as out:
+            out.write(json.dumps({
+                "type": "assistant", "message": {
+                    "model": "claude-opus-4-8",
+                    "content": [{"type": "text", "text": "real turn"}]}
+            }) + "\n")
             out.write(json.dumps({
                 "type": "assistant", "isApiErrorMessage": True,
                 "message": {"model": "claude-fable-5-20260701", "content": [{
@@ -470,7 +496,7 @@ class HookProof(unittest.TestCase):
             "sonnet", [], self.child.account, supervisor_id=self.SUPERVISOR)
         proof = runner._prove_cap(
             self.child, self.record("You've hit your weekly limit"))
-        self.assertEqual(proof.family, "fable")
+        self.assertEqual(proof.family, "opus")
         self.assertEqual(self.child.binding.model, "Sonnet")
 
     def test_cap_family_survives_synthetic_model_on_the_cap_event(self):
@@ -513,6 +539,28 @@ class HookProof(unittest.TestCase):
         with self.assertRaises(supervisor.PermanentSupervisorError):
             runner._prove_cap(
                 self.child, self.record("You've hit your session limit"))
+
+    def test_sidechain_assistant_models_cannot_poison_cap_family(self):
+        with open(self.transcript, "w", encoding="utf-8") as out:
+            for event in (
+                {"type": "assistant", "message": {
+                    "model": "claude-fable-5", "content": "main"}},
+                {"type": "assistant", "isSidechain": True, "message": {
+                    "model": "claude-sonnet-4-5", "content": "poison"}},
+                {"type": "assistant", "message": {
+                    "model": "claude-opus-4-8", "isSidechain": True,
+                    "content": "nested poison"}},
+                {"type": "assistant", "isApiErrorMessage": True,
+                 "message": {"model": "<synthetic>", "content": [{
+                     "type": "text",
+                     "text": "You've hit your session limit"}]}},
+            ):
+                out.write(json.dumps(event) + "\n")
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.child.account, supervisor_id=self.SUPERVISOR)
+        proof = runner._prove_cap(
+            self.child, self.record("You've hit your session limit"))
+        self.assertEqual(proof.family, "fable")
 
     def test_transcript_quiet_gate_runs_before_fresh_collect(self):
         collect_fn = mock.Mock()
@@ -569,6 +617,53 @@ class HookProof(unittest.TestCase):
         self.assertEqual(self.child.binding.session_id, other_sid)
         self.assertEqual(self.child.session_epoch, 1)
         self.assertFalse(self.child.session_ended)
+
+    def test_session_end_then_delayed_stop_failure_cannot_rearm_proof(self):
+        base = time.time() - 2
+        end = self.record(
+            payload={"hook_event_name": "SessionEnd"},
+            received_at=base + 1)
+        delayed = self.record(
+            "You've hit your session limit", received_at=base)
+        with open(self.child.event_path, "w", encoding="utf-8") as out:
+            for record in (end, delayed):
+                out.write(json.dumps(record) + "\n")
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.child.account, supervisor_id=self.SUPERVISOR)
+        proof = runner._handle_events(self.child, "")
+        self.assertIsNone(proof)
+        self.assertFalse(self.child.automation)
+        self.assertIn((self.SID, 0), self.child.dead_sessions)
+
+    def test_late_old_session_start_never_rolls_binding_backward(self):
+        other_sid = "22222222-2222-4222-8222-222222222222"
+        other_path = os.path.join(
+            os.path.dirname(self.transcript), other_sid + ".jsonl")
+        with open(other_path, "w", encoding="utf-8") as out:
+            out.write("{}\n")
+        base = time.time() - 2
+        replacement = self.record(payload={
+            "hook_event_name": "SessionStart", "session_id": other_sid,
+            "transcript_path": other_path}, received_at=base + 1)
+        old_start = self.record(payload={
+            "hook_event_name": "SessionStart"}, received_at=base)
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.child.account, supervisor_id=self.SUPERVISOR)
+        with mock.patch.object(supervisor, "_read_events",
+                               side_effect=[[replacement], [old_start]]):
+            runner._handle_events(self.child, "")
+            runner._handle_events(self.child, "")
+        self.assertEqual(self.child.binding.session_id, other_sid)
+        self.assertFalse(self.child.automation)
+
+    def test_lost_replacement_session_start_permanently_disables(self):
+        end = self.record(payload={"hook_event_name": "SessionEnd"})
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.child.account, supervisor_id=self.SUPERVISOR)
+        with mock.patch.object(supervisor, "_read_events", return_value=[end]):
+            self.assertIsNone(runner._handle_events(self.child, ""))
+        self.assertTrue(self.child.session_ended)
+        self.assertFalse(self.child.automation)
 
     def test_malformed_matching_control_events_permanently_disable(self):
         runner = supervisor.Supervisor(
@@ -630,6 +725,27 @@ class CliWiring(unittest.TestCase):
             "--headroom-auto-handoff"])
         self.assertFalse(auto)
         self.assertTrue(no_auto)
+
+    def test_brief_style_boolean_flags_do_not_swallow_overrides_or_settings(self):
+        cleaned, auto, no_auto = supervisor.strip_headroom_overrides([
+            "--brief", "--headroom-no-auto-handoff", "--future-boolean",
+            "--headroom-auto-handoff"])
+        self.assertEqual(cleaned, ["--brief", "--future-boolean"])
+        self.assertTrue(auto)
+        self.assertTrue(no_auto)
+        self.assertEqual(supervisor.incompatible_args(
+            ["--brief", "--settings", "custom.json"]),
+            "user-supplied --settings")
+
+    def test_settings_detection_scans_every_pre_separator_position(self):
+        self.assertEqual(supervisor.incompatible_args(
+            ["--model", "--settings", "--", "--settings=after.json"]),
+            "user-supplied --settings")
+        self.assertEqual(supervisor.incompatible_args(
+            ["--brief", "--settings=custom.json"]),
+            "user-supplied --settings")
+        self.assertEqual(supervisor.incompatible_args(
+            ["--brief", "--", "--settings=prompt-text"]), "")
 
     def test_statusline_distinguishes_armed_supervisor(self):
         snapshot = {"accounts": [{"name": "source", "provider": "claude",
@@ -858,6 +974,74 @@ class SupervisorIntegration(unittest.TestCase):
                   encoding="utf-8") as source:
             self.assertIn("--resume", source.read())
 
+    def test_post_commit_target_spawn_failure_recovers_source(self):
+        real_popen = supervisor.subprocess.Popen
+        attempts = {"count": 0}
+
+        def fail_target(argv, **kwargs):
+            attempts["count"] += 1
+            if attempts["count"] == 2:
+                raise OSError("target spawn exploded")
+            return real_popen(argv, **kwargs)
+
+        result = supervisor.Supervisor(
+            "sonnet", [], self.accounts[0], collect_fn=self.snapshot,
+            popen=fail_target).run()
+        self.assertEqual(result, 0)
+        self.assertEqual(attempts["count"], 3)
+        with open(os.path.join(self.fake_state, "recovered"),
+                  encoding="utf-8") as source:
+            self.assertIn("--resume", source.read())
+
+    def test_spawn_time_target_identity_swap_recovers_source(self):
+        source_sid = str(__import__("uuid").uuid5(
+            __import__("uuid").NAMESPACE_DNS, "headroom-fake-source-1"))
+        destination = os.path.join(
+            self.accounts[1]["home"], "projects", "fake-project",
+            source_sid + ".jsonl")
+
+        def swap_after_commit(_provider, home):
+            if home == self.accounts[1]["home"] and os.path.exists(destination):
+                return "OTHER", "CHANGED"
+            return "AAAA", "BBBB"
+
+        self.local_binding.side_effect = swap_after_commit
+        result = supervisor.Supervisor(
+            "sonnet", [], self.accounts[0], collect_fn=self.snapshot).run()
+        self.assertEqual(result, 0)
+        with open(os.path.join(self.fake_state, "launches.jsonl"),
+                  encoding="utf-8") as source:
+            launches = [json.loads(line) for line in source]
+        self.assertEqual(len(launches), 2)
+        self.assertEqual(launches[1]["config_dir"], self.accounts[0]["home"])
+        with open(os.path.join(self.fake_state, "recovered"),
+                  encoding="utf-8") as source:
+            self.assertIn("--resume", source.read())
+
+    def test_failed_source_recovery_prints_both_manual_resume_commands(self):
+        real_popen = supervisor.subprocess.Popen
+        attempts = {"count": 0}
+
+        def fail_target_and_recovery(argv, **kwargs):
+            attempts["count"] += 1
+            if attempts["count"] in (2, 3):
+                raise OSError(f"spawn {attempts['count']} exploded")
+            return real_popen(argv, **kwargs)
+
+        errors = io.StringIO()
+        with redirect_stderr(errors):
+            result = supervisor.Supervisor(
+                "sonnet", [], self.accounts[0], collect_fn=self.snapshot,
+                popen=fail_target_and_recovery).run()
+        self.assertEqual(result, 127)
+        source_sid = str(__import__("uuid").uuid5(
+            __import__("uuid").NAMESPACE_DNS, "headroom-fake-source-1"))
+        self.assertIn(handoff.resume_command(
+            self.accounts[1]["home"], source_sid), errors.getvalue())
+        self.assertIn(
+            f"CLAUDE_CONFIG_DIR={self.accounts[0]['home']} claude --resume "
+            f"{source_sid}", errors.getvalue())
+
     def test_target_relogin_after_stop_recovers_source_without_publication(self):
         original_commit = handoff.commit_handoff
 
@@ -925,6 +1109,52 @@ class SupervisorIntegration(unittest.TestCase):
         with open(os.path.join(self.fake_state, "recovered"),
                   encoding="utf-8") as source:
             self.assertIn("--resume", source.read())
+
+    def test_fast_session_end_after_sigterm_is_accepted(self):
+        runner = supervisor.Supervisor(
+            "sonnet", [], self.accounts[0], collect_fn=self.snapshot)
+        real_kill = supervisor.os.kill
+        observed = {"ledger_before_kill": False}
+        source_sid = str(__import__("uuid").uuid5(
+            __import__("uuid").NAMESPACE_DNS, "headroom-fake-source-1"))
+        transcript = os.path.join(
+            self.accounts[0]["home"], "projects", "fake-project",
+            source_sid + ".jsonl")
+
+        def emit_end_before_kill_returns(pid, sig):
+            observed["ledger_before_kill"] = any(
+                row.get("action") == "stop_sent"
+                for row in self.ledger_actions())
+            record = {
+                "schema": "headroom_hook_event@1",
+                "received_at": time.time(),
+                "supervisor_id": runner.supervisor_id,
+                "generation": runner.generation,
+                "source_slot": "source",
+                "config_dir": self.accounts[0]["home"],
+                "matcher": "",
+                "payload": {
+                    "hook_event_name": "SessionEnd",
+                    "session_id": source_sid,
+                    "transcript_path": transcript,
+                    "cwd": self.cwd,
+                    "reason": "other",
+                },
+            }
+            with open(supervisor.event_path(runner.supervisor_id), "a",
+                      encoding="utf-8") as out:
+                out.write(json.dumps(record) + "\n")
+                out.flush()
+                os.fsync(out.fileno())
+            return real_kill(pid, sig)
+
+        with mock.patch.object(supervisor.os, "kill",
+                               side_effect=emit_end_before_kill_returns):
+            result = runner.run()
+        self.assertEqual(result, 0)
+        self.assertTrue(observed["ledger_before_kill"])
+        actions = [row.get("action") for row in self.ledger_actions()]
+        self.assertIn("staged", actions)
 
     def test_three_handoffs_then_fourth_is_held(self):
         self.accounts = self.make_accounts("a", "b", "c", "d", "e")

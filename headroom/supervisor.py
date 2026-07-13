@@ -19,7 +19,7 @@ import sys
 import termios
 import time
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from . import collect, handoff, paths, registry, route
 
@@ -48,11 +48,9 @@ CLAUDE_VALUE_FLAGS = {
     "--input-format", "--output-format", "--debug-file", "--betas",
     "--plugin-dir", "--session-id", "--resume", "-r",
 }
-CLAUDE_BOOLEAN_FLAGS = {
-    "--verbose", "--version", "--continue", "-c", "--fork-session",
-    "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
-    "--strict-mcp-config", "--debug", "--chrome", "--no-chrome",
-}
+# Every other maintained Claude flag (including current flags such as --brief)
+# is the boolean complement.  Unknown flags are boolean too; only this known
+# value-taking list may consume the following argument.
 HEADROOM_OVERRIDE_FLAGS = {
     "--headroom-auto-handoff", "--headroom-no-auto-handoff"}
 
@@ -74,6 +72,7 @@ class Binding:
     version: str
     config_dir: str
     epoch: int = 0
+    received_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -103,6 +102,9 @@ class Child:
     event_offset: int = 0
     hint_printed: bool = False
     resume_bound: bool = False
+    dead_sessions: set = field(default_factory=set)
+    session_epochs: dict = field(default_factory=dict)
+    last_received_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -112,6 +114,7 @@ class Relaunch:
     cwd: str
     automatic: bool
     handoff_id: str = ""
+    plan: object = None
 
 
 def _supervisors_dir():
@@ -220,6 +223,11 @@ def write_hook_event(stream=None, environ=None, now=None):
 
 
 def incompatible_args(args):
+    for arg in args:
+        if arg == "--":
+            break
+        if arg == "--settings" or arg.startswith("--settings="):
+            return "user-supplied --settings"
     value_expected = False
     for arg in args:
         if value_expected:
@@ -227,16 +235,11 @@ def incompatible_args(args):
             continue
         if arg == "--":
             break
-        if arg == "--settings" or arg.startswith("--settings="):
-            return "user-supplied --settings"
         if arg in INCOMPATIBLE_FLAGS or any(
                 arg.startswith(flag + "=")
                 for flag in ("--output-format", "--input-format")):
             return arg
         if arg in CLAUDE_VALUE_FLAGS:
-            value_expected = True
-        elif arg.startswith("-") and "=" not in arg \
-                and arg not in CLAUDE_BOOLEAN_FLAGS:
             value_expected = True
     return ""
 
@@ -268,9 +271,6 @@ def strip_headroom_overrides(args):
             continue
         cleaned.append(arg)
         if arg in CLAUDE_VALUE_FLAGS:
-            value_expected = True
-        elif arg.startswith("-") and "=" not in arg \
-                and arg not in CLAUDE_BOOLEAN_FLAGS:
             value_expected = True
     return cleaned, auto, no_auto
 
@@ -306,9 +306,12 @@ SYNTHETIC_MODEL = "<synthetic>"
 
 
 def _real_assistant_model(event):
-    if not isinstance(event, dict) or event.get("type") != "assistant":
+    if (not isinstance(event, dict) or event.get("type") != "assistant"
+            or event.get("isSidechain") is True):
         return ""
     message = event.get("message")
+    if isinstance(message, dict) and message.get("isSidechain") is True:
+        return ""
     model = message.get("model") if isinstance(message, dict) else None
     if not isinstance(model, str) or not model.strip() \
             or model.strip() == SYNTHETIC_MODEL:
@@ -323,9 +326,6 @@ def _active_model(lines, cap_event):
     the authoritative source is the LAST preceding assistant event with a real
     model id — that reflects in-session /model switches, unlike SessionStart.
     """
-    model = _real_assistant_model(cap_event)
-    if model:
-        return model
     for raw in reversed(lines[:-1]):
         try:
             event = json.loads(raw.decode("utf-8"))
@@ -450,7 +450,8 @@ def parse_session_start(record, child):
         source.session_id, source.transcript_path, cwd,
         _model_name(payload.get("model")),
         payload.get("version", "") if isinstance(payload.get("version"), str)
-        else "", record["config_dir"], child.session_epoch + 1)
+        else "", record["config_dir"], child.session_epoch + 1,
+        record["received_at"])
 
 
 def cap_message(record, child):
@@ -512,9 +513,40 @@ def _read_events(child):
                 raise ValueError
             events.append(record)
         child.event_offset += len(data)
+        events.sort(key=lambda record: record["received_at"])
         return events
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         raise SupervisorError("hook event file is unreadable") from error
+
+
+def _binding_key(binding):
+    return (binding.session_id, binding.epoch) if binding is not None else None
+
+
+def _remember_binding(child):
+    binding = child.binding
+    if binding is None:
+        return
+    child.session_epochs.setdefault(
+        (binding.session_id, binding.transcript_path), binding.epoch)
+    child.last_received_at = max(child.last_received_at, binding.received_at)
+
+
+def _event_epoch(child, source):
+    binding = child.binding
+    if (binding is not None and source.session_id == binding.session_id
+            and source.transcript_path == binding.transcript_path):
+        return binding.epoch
+    return child.session_epochs.get(
+        (source.session_id, source.transcript_path))
+
+
+def _accept_event_order(child, record):
+    received = record["received_at"]
+    if received <= child.last_received_at:
+        raise PermanentSupervisorError(
+            "hook event order is ambiguous for the current binding")
+    child.last_received_at = received
 
 
 @contextlib.contextmanager
@@ -644,7 +676,7 @@ class Supervisor:
                 environment.pop(key, None)
         return environment
 
-    def _spawn(self, account, args, cwd, automatic):
+    def _spawn(self, account, args, cwd, automatic, plan=None):
         self.generation += 1
         settings = self._settings_file(self.generation) if automatic else ""
         argv = ["claude"]
@@ -654,7 +686,11 @@ class Supervisor:
         environment = self._environment(account, self.generation, automatic)
         launched_at = self.now()
         try:
+            if plan is not None:
+                handoff.verify_target_binding(plan)
             process = self.popen(argv, env=environment, cwd=cwd)
+        except handoff.HandoffError as error:
+            raise SupervisorError(str(error)) from error
         except OSError as error:
             raise SupervisorError(f"cannot start Claude: {error}") from error
         return Child(process, account, self.generation,
@@ -706,7 +742,8 @@ class Supervisor:
         if (binding is None or binding.session_id != proof.session_id
                 or binding.transcript_path != proof.transcript_path
                 or binding.epoch != proof.epoch
-                or child.session_epoch != proof.epoch):
+                or child.session_epoch != proof.epoch
+                or (proof.session_id, proof.epoch) in child.dead_sessions):
             raise SupervisorError("cap proof expired after a session transition")
 
     @staticmethod
@@ -821,12 +858,25 @@ class Supervisor:
         return returncode
 
     def _consume_stop_events(self, child, proof, stop_sent_at):
+        _remember_binding(child)
         for record in _read_events(child):
             if not _namespace_matches(record, child):
                 continue
             source, cwd = _validated_event(record, child)
             payload = record["payload"]
             hook_name = payload.get("hook_event_name")
+            epoch = _event_epoch(child, source)
+            session_key = ((source.session_id, epoch)
+                           if epoch is not None else None)
+            if hook_name == "StopFailure" \
+                    and session_key in child.dead_sessions:
+                continue
+            _accept_event_order(child, record)
+            if session_key in child.dead_sessions:
+                if hook_name in ("SessionEnd", "StopFailure"):
+                    continue
+                raise SupervisorError(
+                    "cap proof expired after its session ended")
             if hook_name == "CwdChanged" \
                     and source.session_id == proof.session_id \
                     and source.transcript_path == proof.transcript_path:
@@ -838,10 +888,12 @@ class Supervisor:
                     "cap proof expired during the stop transition")
             if (record["received_at"] < stop_sent_at
                     or source.session_id != proof.session_id
-                    or source.transcript_path != proof.transcript_path):
+                    or source.transcript_path != proof.transcript_path
+                    or epoch != proof.epoch):
                 raise SupervisorError(
                     "SessionEnd does not prove the stopped session epoch")
             self._proof_current(child, proof)
+            child.dead_sessions.add(session_key)
             child.session_ended = True
             child.session_end_received_at = record["received_at"]
 
@@ -870,13 +922,24 @@ class Supervisor:
                 target_slot=plan.target["name"], reason=reason,
                 old_session_id=plan.source.session_id,
                 child_generation=plan.child_generation)
-        except handoff.HandoffError:
+        except Exception:  # recovery must proceed even if the ledger is broken
             pass
 
     @staticmethod
     def _source_relaunch(plan):
         return Relaunch(plan.source.account,
                         ["--resume", plan.source.session_id], plan.cwd, False)
+
+    @staticmethod
+    def _print_manual_recovery(plan):
+        print("headroom: automatic recovery could not start Claude; run one of:",
+              file=sys.stderr)
+        print(handoff.resume_command(
+            plan.target["home"], plan.source.session_id), file=sys.stderr)
+        source_argv = shlex.join(
+            ["claude", "--resume", plan.source.session_id])
+        print(f"CLAUDE_CONFIG_DIR={shlex.quote(plan.source.account['home'])} "
+              f"{source_argv}", file=sys.stderr)
 
     def _stop_and_commit(self, child, plan, proof):
         self._proof_current(child, proof)
@@ -905,7 +968,6 @@ class Supervisor:
         print(f"[headroom] cap confirmed; {plan.source.account['name']} -> "
               f"{plan.target['name']}", file=sys.stderr)
         saved = self._save_terminal()
-        ledger_error = None
         stop_error = None
         stop_sent_at = 0.0
         signal_sent = False
@@ -920,17 +982,14 @@ class Supervisor:
                         "source transcript changed before stop")
                 if reset <= self.now():
                     raise SupervisorError("cap reset elapsed before stop")
-                os.kill(child.process.pid, signal.SIGTERM)
-                signal_sent = True
                 stop_sent_at = self.now()
-            try:
                 handoff.append_action(
                     plan.handoff_id, "stop_sent", automatic=True,
                     source_slot=plan.source.account["name"],
                     old_session_id=plan.source.session_id,
                     child_generation=plan.child_generation)
-            except handoff.HandoffError as error:
-                ledger_error = error
+                os.kill(child.process.pid, signal.SIGTERM)
+                signal_sent = True
             returncode = self._wait_stopped(child, proof, stop_sent_at)
         except Exception as error:  # post-signal failures recover if Claude exited
             if not signal_sent:
@@ -949,8 +1008,6 @@ class Supervisor:
         try:
             if stop_error is not None:
                 raise stop_error
-            if ledger_error is not None:
-                raise SupervisorError("stop ledger failed: " + str(ledger_error))
             handoff.append_action(
                 plan.handoff_id, "stopped", automatic=True,
                 source_slot=plan.source.account["name"],
@@ -968,7 +1025,7 @@ class Supervisor:
                 print("[headroom] note: the interrupted tool call may re-run on "
                       "resume", file=sys.stderr)
             return Relaunch(plan.target, handoff.resume_argv(result)[1:],
-                            plan.cwd, True, plan.handoff_id)
+                            plan.cwd, True, plan.handoff_id, plan)
         except Exception as error:  # no post-stop failure may strand the user
             self._failure(plan, "post_stop_failed: " + str(error))
             print(f"[headroom] handoff failed after Claude exited ({error}); "
@@ -983,22 +1040,34 @@ class Supervisor:
                   file=sys.stderr)
             child.automation = False
             return None
+        _remember_binding(child)
         for record in records:
             if not _namespace_matches(record, child):
                 continue
             try:
                 source, cwd = _validated_event(record, child)
+                payload = record["payload"]
+                hook_name = payload["hook_event_name"]
+                epoch = _event_epoch(child, source)
+                session_key = ((source.session_id, epoch)
+                               if epoch is not None else None)
+                if hook_name == "StopFailure" \
+                        and session_key in child.dead_sessions:
+                    proof = None
+                    continue
+                _accept_event_order(child, record)
             except SupervisorError as error:
                 print(f"[headroom] malformed hook event ({error}); automatic "
                       "handoff disabled for this child", file=sys.stderr)
                 child.automation = False
                 return None
-            payload = record["payload"]
-            hook_name = payload["hook_event_name"]
             if hook_name == "SessionStart":
                 try:
                     child.binding = parse_session_start(record, child)
                     child.session_epoch = child.binding.epoch
+                    child.session_epochs[
+                        (child.binding.session_id,
+                         child.binding.transcript_path)] = child.binding.epoch
                     child.session_ended = False
                     child.session_end_received_at = 0.0
                     proof = None
@@ -1023,6 +1092,13 @@ class Supervisor:
                             and source.transcript_path == current.transcript_path)
             if hook_name == "SessionEnd":
                 proof = None
+                if epoch is None:
+                    child.automation = False
+                    print("[headroom] SessionEnd has no known session epoch; "
+                          "automatic handoff disabled for this child",
+                          file=sys.stderr)
+                    return None
+                child.dead_sessions.add(session_key)
                 if same_session:
                     child.session_ended = True
                     child.session_end_received_at = record["received_at"]
@@ -1047,6 +1123,12 @@ class Supervisor:
                 except SupervisorError as error:
                     print(f"[headroom] cap not corroborated ({error}); child "
                           "continues", file=sys.stderr)
+        if _binding_key(child.binding) in child.dead_sessions:
+            child.automation = False
+            print("[headroom] current session ended without a replacement "
+                  "SessionStart; automatic handoff disabled for this child",
+                  file=sys.stderr)
+            return None
         return proof
 
     def _monitor(self, child, pending_handoff_id=""):
@@ -1111,16 +1193,38 @@ class Supervisor:
         cwd = os.path.realpath(os.getcwd())
         automatic = True
         pending_handoff_id = ""
+        pending_plan = None
+        recovery_plan = None
         last_exit = 0
         clean_exit = False
         try:
             while True:
                 try:
-                    child = self._spawn(account, args, cwd, automatic)
-                except SupervisorError as error:
+                    child = self._spawn(
+                        account, args, cwd, automatic, pending_plan)
+                except Exception as error:  # every post-commit spawn must recover
+                    if pending_plan is not None:
+                        failed_plan = pending_plan
+                        self._failure(
+                            failed_plan, "target_relaunch_failed: " + str(error))
+                        print(f"[headroom] target relaunch failed ({error}); "
+                              "relaunching the source with automation off",
+                              file=sys.stderr)
+                        relaunch = self._source_relaunch(failed_plan)
+                        account, args, cwd = (relaunch.account, relaunch.argv,
+                                              relaunch.cwd)
+                        automatic = False
+                        pending_handoff_id = ""
+                        pending_plan = None
+                        recovery_plan = failed_plan
+                        continue
                     print(f"headroom: {error}", file=sys.stderr)
+                    if recovery_plan is not None:
+                        self._print_manual_recovery(recovery_plan)
                     clean_exit = True
                     return 127
+                pending_plan = None
+                recovery_plan = None
                 if pending_handoff_id:
                     try:
                         handoff.append_action(
@@ -1138,6 +1242,7 @@ class Supervisor:
                     account, args, cwd = outcome.account, outcome.argv, outcome.cwd
                     automatic = outcome.automatic
                     pending_handoff_id = outcome.handoff_id
+                    pending_plan = outcome.plan if outcome.automatic else None
                     continue
                 last_exit = int(outcome)
                 clean_exit = True
