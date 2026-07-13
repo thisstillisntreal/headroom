@@ -283,16 +283,99 @@ def mark(name, fam, epoch=None, account_wide=False, window="5h"):
     Locked read-modify-write so a concurrent mark can't drop this limit."""
     now = time.time()
     floor = now + (6 * 3600 if window == "7d" else 15 * 60)
-    epoch = (now + 5 * 3600) if epoch is None else max(float(epoch), floor)
+    default = now + (7 * 86400 if window == "7d" else 5 * 3600)
+    epoch = default if epoch is None else max(float(epoch), floor)
     key = f"{name}:{'*' if account_wide else fam}"
     with _cooldown_lock():
         cool = _read_cooldowns()
         if cool is None:
             raise RuntimeError(
                 "cooldown ledger unreadable — inspect/delete state/cooldowns.json")
-        cool[key] = epoch
+        previous = cool.get(key)
+        if previous is not None and not _number(previous):
+            raise RuntimeError(
+                "cooldown entry unreadable — inspect state/cooldowns.json")
+        cool[key] = max(epoch, previous) if previous is not None else epoch
         save_cooldowns(cool)
-    return epoch
+    return cool[key]
+
+
+def cap_scope(snapshot, name, fam, message=""):
+    """Return the unambiguous >=99% cap scope for one fresh account row.
+
+    The hook phrase narrows which provider window may corroborate the event.
+    Session wording only accepts 5h; weekly wording accepts the all-model 7d
+    or the requested model's scoped weekly window.  A generic usage-limit
+    phrase may use any single applicable scope.  Multiple account-wide caps
+    are one scope and retain their latest reset.
+    """
+    row = _snapshot_accounts(snapshot).get(name)
+    if not isinstance(row, dict):
+        return None
+    windows = row.get("windows")
+    if not isinstance(windows, dict):
+        return None
+    lower = message.lower() if isinstance(message, str) else ""
+    wants_weekly = "week" in lower
+    wants_session = "session" in lower or "5-hour" in lower \
+        or "5 hour" in lower or "five-hour" in lower
+    account_hits = []
+    scoped_hit = None
+    if not wants_weekly:
+        window = windows.get("5h")
+        if isinstance(window, dict) and _number(window.get("used_percent")) \
+                and window["used_percent"] >= 99:
+            account_hits.append(("5h", window))
+    if not wants_session:
+        window = windows.get("7d")
+        if isinstance(window, dict) and _number(window.get("used_percent")) \
+                and window["used_percent"] >= 99:
+            account_hits.append(("7d", window))
+        scoped = scoped_window_for(fam, windows) if fam in (
+            "opus", "sonnet", "haiku", "fable") else None
+        if isinstance(scoped, dict) and _number(scoped.get("used_percent")) \
+                and scoped["used_percent"] >= 99:
+            scoped_hit = scoped
+    if account_hits:
+        resets = [window.get("resets_at") for _, window in account_hits
+                  if _number(window.get("resets_at"))]
+        used = max(window["used_percent"] for _, window in account_hits)
+        return {
+            "key": f"{name}:*", "account_wide": True,
+            "family": fam, "window": "7d" if any(
+                key == "7d" for key, _ in account_hits) else "5h",
+            "used_percent": float(used),
+            "reset": max(resets) if resets else None,
+        }
+    if scoped_hit is not None:
+        return {
+            "key": f"{name}:{fam}", "account_wide": False,
+            "family": fam, "window": "scoped:" + fam,
+            "used_percent": float(scoped_hit["used_percent"]),
+            "reset": scoped_hit.get("resets_at")
+            if _number(scoped_hit.get("resets_at")) else None,
+        }
+    return None
+
+
+def earliest_reset(snapshot, fam=None, exclude=None):
+    """Earliest readable future reset, for a useful fail-closed hint."""
+    now = time.time()
+    values = []
+    for name, row in _snapshot_accounts(snapshot).items():
+        if name == exclude:
+            continue
+        windows = row.get("windows") if isinstance(row, dict) else None
+        if not isinstance(windows, dict):
+            continue
+        candidates_ = [windows.get("5h"), windows.get("7d")]
+        if fam:
+            candidates_.append(scoped_window_for(fam, windows))
+        for window in candidates_:
+            reset = window.get("resets_at") if isinstance(window, dict) else None
+            if _number(reset) and reset > now:
+                values.append(reset)
+    return min(values) if values else None
 
 
 def clear(key=None):

@@ -76,15 +76,25 @@ def _journal_session(payload, now=None):
             "model": model, "version": version,
             "config_dir": os.environ.get("CLAUDE_CONFIG_DIR") or "",
         }
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-        descriptor = os.open(os.path.join(state, "sessions.jsonl"), flags, 0o600)
+        journal_lock = open(os.path.join(state, "sessions.lock"), "a+")
         try:
-            os.fchmod(descriptor, 0o600)
-            encoded = (json.dumps(entry, separators=(",", ":")) + "\n").encode()
-            if os.write(descriptor, encoded) != len(encoded):
-                return False
+            os.chmod(journal_lock.name, 0o600)
+            fcntl.flock(journal_lock, fcntl.LOCK_EX)
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+            descriptor = os.open(os.path.join(state, "sessions.jsonl"),
+                                 flags, 0o600)
+            try:
+                os.fchmod(descriptor, 0o600)
+                encoded = (json.dumps(entry, separators=(",", ":"))
+                           + "\n").encode()
+                if os.write(descriptor, encoded) != len(encoded):
+                    return False
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
         finally:
-            os.close(descriptor)
+            fcntl.flock(journal_lock, fcntl.LOCK_UN)
+            journal_lock.close()
         os.utime(marker, (now, now))
         return True
     finally:
@@ -147,7 +157,11 @@ def main():
         parts.append(window_text(windows, "7d", "7d"))
         used = (windows.get("5h") or {}).get("used_percent")
         if used is not None and used >= 99:
-            parts.append(f"{DIM}capped -> /exit, then: headroom handoff{RESET}")
+            if os.environ.get("HEADROOM_SUPERVISOR_ID"):
+                parts.append(f"{DIM}capped · auto-handoff armed{RESET}")
+            else:
+                parts.append(
+                    f"{DIM}capped -> /exit, then: headroom handoff{RESET}")
         elif used is not None and used >= 75:
             from . import route
             candidate = next(

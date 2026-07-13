@@ -159,12 +159,28 @@ def reserve_percent(config=None):
         config = load() if config is None else config
     except RegistryError:
         return 0.0
-    routing = (config or {}).get("routing") or {}
+    routing = (config or {}).get("routing")
+    if not isinstance(routing, dict):
+        return 0.0
     try:
         value = float(routing.get("reserve_percent", 0))
     except (TypeError, ValueError):
         return 0.0
     return value if 0 <= value <= 99 else 0.0
+
+
+def auto_handoff(config=None):
+    """Whether the destructive supervisor path has explicit consent.
+
+    This setting is deliberately strict: absent, false, and every wrong-typed
+    value are off.  In particular, strings such as ``"true"`` never arm it.
+    """
+    try:
+        config = load() if config is None else config
+    except RegistryError:
+        return False
+    routing = (config or {}).get("routing")
+    return isinstance(routing, dict) and routing.get("auto_handoff") is True
 
 
 def save(config):

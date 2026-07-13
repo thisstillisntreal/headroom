@@ -1,10 +1,11 @@
-"""Carry Claude conversation history across account slots without guessing.
+"""Transactional Claude conversation handoff.
 
-A handoff is deliberately smaller than process migration: it copies one
-verified transcript, records the exact next command, and lets Claude create a
-fresh session id in the target home. The source remains immutable so every
-transfer is reversible and auditable even after the terminal context is gone.
+The service layer is deliberately split into a read-only plan and a locked
+commit.  The manual CLI adapter may exec Claude after commit; resident callers
+use :func:`resume_argv` and keep control of their own process lifecycle.
 """
+import contextlib
+import fcntl
 import glob
 import hashlib
 import json
@@ -12,6 +13,8 @@ import math
 import os
 import re
 import shlex
+import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -20,7 +23,7 @@ from dataclasses import dataclass
 
 from . import collect, paths, registry, route
 
-SCHEMA = "headroom_handoff@1"
+SCHEMA = "headroom_handoff@2"
 MAX_SCAN_AGE = 48 * 3600
 
 
@@ -37,12 +40,39 @@ class SourceSession:
     seen_at: int = 0
 
 
+@dataclass(frozen=True)
+class HandoffPlan:
+    handoff_id: str
+    source: SourceSession
+    family: str
+    target: dict
+    snapshot: dict
+    cap_proof: dict
+    cwd: str
+    inspected: dict
+    destination: str
+    automatic: bool = False
+    child_generation: int = 0
+    force: bool = False
+
+
+@dataclass(frozen=True)
+class HandoffResult:
+    plan: HandoffPlan
+    destination: str
+    record: dict
+
+
 def _journal_path():
     return os.path.join(paths.state_dir(), "sessions.jsonl")
 
 
 def _ledger_path():
     return os.path.join(paths.state_dir(), "handoffs.jsonl")
+
+
+def _lock_path():
+    return os.path.join(paths.state_dir(), "handoffs.lock")
 
 
 def _valid_uuid(value):
@@ -53,9 +83,17 @@ def _valid_uuid(value):
 
 
 def _claude_slug(path):
-    # Claude Code replaces every non-alphanumeric/non-hyphen character in
-    # the absolute cwd with "-" when naming projects/<slug>.
     return re.sub(r"[^A-Za-z0-9-]", "-", path)
+
+
+def _number(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+def _timestamp(row):
+    value = row.get("ts")
+    return float(value) if _number(value) else 0.0
 
 
 def _read_jsonl(path, label):
@@ -76,18 +114,48 @@ def _read_jsonl(path, label):
     return rows
 
 
-def _account_for_path(path, accounts, config_dir=""):
-    config_home = os.path.realpath(os.path.expanduser(config_dir)) \
-        if config_dir else ""
-    if config_home:
-        for account in accounts:
-            if os.path.realpath(account["home"]) == config_home:
-                return account
+def _contained_transcript(path, session_id, account):
+    """Return a canonical regular transcript owned by ``account``."""
     absolute = os.path.abspath(os.path.expanduser(path))
-    for account in accounts:
-        home = os.path.realpath(account["home"])
+    if os.path.basename(absolute) != session_id + ".jsonl":
+        raise HandoffError(
+            f"session {session_id} transcript basename does not match its id")
+    try:
+        metadata = os.lstat(absolute)
+    except OSError as error:
+        raise HandoffError(
+            f"session {session_id} transcript no longer exists") from error
+    if stat.S_ISLNK(metadata.st_mode):
+        raise HandoffError("source transcript is a symlink — refusing to copy")
+    canonical = os.path.realpath(absolute)
+    try:
+        if not stat.S_ISREG(os.stat(canonical).st_mode):
+            raise HandoffError("source transcript is not a regular file")
+    except OSError as error:
+        raise HandoffError("cannot stat source transcript") from error
+    projects_path = os.path.join(registry.expand(account["home"]), "projects")
+    if os.path.islink(projects_path):
+        raise HandoffError("source projects directory is a symlink")
+    projects = os.path.realpath(projects_path)
+    try:
+        inside = os.path.commonpath((canonical, projects)) == projects
+    except ValueError:
+        inside = False
+    if not inside or canonical == projects:
+        raise HandoffError(
+            f"session {session_id} is not inside the account's projects directory")
+    return canonical
+
+
+def _account_for_path(path, accounts, config_dir=""):
+    canonical = os.path.realpath(os.path.abspath(os.path.expanduser(path)))
+    config_home = registry.expand(config_dir) if config_dir else ""
+    ordered = sorted(accounts, key=lambda account:
+                     registry.expand(account["home"]) != config_home)
+    for account in ordered:
+        projects = os.path.realpath(os.path.join(account["home"], "projects"))
         try:
-            if os.path.commonpath((absolute, home)) == home:
+            if os.path.commonpath((canonical, projects)) == projects:
                 return account
         except ValueError:
             continue
@@ -95,16 +163,14 @@ def _account_for_path(path, accounts, config_dir=""):
 
 
 def _source(path, session_id, accounts, model="", seen_at=0, config_dir=""):
-    path = os.path.abspath(os.path.expanduser(path))
-    if not os.path.lexists(path):
-        raise HandoffError(f"session {session_id} transcript no longer exists")
     account = _account_for_path(path, accounts, config_dir)
     if account is None:
         raise HandoffError(
             f"session {session_id} is not inside a configured Claude home")
     if account.get("provider") != "claude":
         raise HandoffError("handoff only supports same-provider Claude sessions")
-    return SourceSession(session_id, path, account, model,
+    canonical = _contained_transcript(path, session_id, account)
+    return SourceSession(session_id, canonical, account, model,
                          int(_timestamp({"ts": seen_at})))
 
 
@@ -115,11 +181,6 @@ def _age_text(seconds):
     if seconds < 3600:
         return f"{seconds // 60}m"
     return f"{seconds // 3600}h"
-
-
-def _timestamp(row):
-    value = row.get("ts")
-    return float(value) if _number(value) else 0.0
 
 
 def _ambiguity(rows, now):
@@ -140,16 +201,16 @@ def _filesystem_matches(session_id, accounts):
         pattern = os.path.join(account["home"], "projects", "**",
                                session_id + ".jsonl")
         for path in glob.glob(pattern, recursive=True):
-            matches.append((path, account))
+            try:
+                matches.append((_contained_transcript(path, session_id, account),
+                                account))
+            except HandoffError:
+                continue
     return matches
 
 
 def resolve_source(session_id=None, accounts=None, cwd=None, now=None):
-    """Resolve a session from explicit intent, then journal, then a narrow scan.
-
-    Transcript recency alone never decides between two sessions; ambiguity is
-    surfaced because resuming the wrong conversation is worse than stopping.
-    """
+    """Resolve explicit intent, then the statusline journal, then a narrow scan."""
     accounts = registry.accounts() if accounts is None else accounts
     cwd = os.path.realpath(os.getcwd() if cwd is None else cwd)
     now = time.time() if now is None else now
@@ -162,35 +223,34 @@ def resolve_source(session_id=None, accounts=None, cwd=None, now=None):
             journal = _read_jsonl(_journal_path(), "session journal")
         except HandoffError as error:
             journal, journal_error = [], error
-        journal_hits = [row for row in journal
-                        if row.get("session_id", "").lower() == session_id.lower()
-                        and isinstance(row.get("transcript_path"), str)
-                        and os.path.exists(row["transcript_path"])]
-        if journal_hits:
-            row = max(journal_hits, key=_timestamp)
-            return _source(row["transcript_path"], session_id, accounts,
-                           row.get("model", ""), row.get("ts", 0),
-                           row.get("config_dir", ""))
+        hits = [row for row in journal
+                if str(row.get("session_id", "")).lower() == session_id.lower()
+                and isinstance(row.get("transcript_path"), str)]
+        for row in sorted(hits, key=_timestamp, reverse=True):
+            try:
+                return _source(row["transcript_path"], session_id, accounts,
+                               row.get("model", ""), row.get("ts", 0),
+                               row.get("config_dir", ""))
+            except HandoffError:
+                continue
         matches = _filesystem_matches(session_id, accounts)
         if len(matches) == 1:
-            return SourceSession(session_id, os.path.abspath(matches[0][0]),
-                                 matches[0][1])
+            return _source(matches[0][0], session_id, accounts)
         if len(matches) > 1:
             ledger_hits = [row for row in
                            _read_jsonl(_ledger_path(), "handoff ledger")
-                           if row.get("session_id") == session_id]
+                           if (row.get("old_session_id") or row.get("session_id"))
+                           == session_id]
             if ledger_hits:
                 source_slot = max(ledger_hits, key=_timestamp).get("source_slot")
                 for path, account in matches:
                     if account.get("name") == source_slot:
-                        return SourceSession(session_id, os.path.abspath(path),
-                                             account)
+                        return _source(path, session_id, accounts)
             raise HandoffError(
                 f"session {session_id} matched {len(matches)} configured transcripts")
         if journal_error is not None:
             raise journal_error
-        raise HandoffError(
-            f"session {session_id} matched none configured transcripts")
+        raise HandoffError(f"session {session_id} matched none configured transcripts")
 
     journal = _read_jsonl(_journal_path(), "session journal")
     rows = []
@@ -201,9 +261,8 @@ def resolve_source(session_id=None, accounts=None, cwd=None, now=None):
         session = row.get("session_id")
         if not isinstance(session, str) or not _valid_uuid(session):
             continue
-        if _timestamp(row) >= next(
-                (_timestamp(item) for item in rows
-                 if item.get("session_id") == session), -1):
+        if _timestamp(row) >= next((_timestamp(item) for item in rows
+                                    if item.get("session_id") == session), -1):
             rows = [item for item in rows if item.get("session_id") != session]
             rows.append(row)
     if len(rows) > 1:
@@ -221,31 +280,32 @@ def resolve_source(session_id=None, accounts=None, cwd=None, now=None):
             continue
         pattern = os.path.join(account["home"], "projects", slug, "*.jsonl")
         for path in glob.glob(pattern):
-            if not _valid_uuid(os.path.splitext(os.path.basename(path))[0]):
+            candidate = os.path.splitext(os.path.basename(path))[0]
+            if not _valid_uuid(candidate):
                 continue
             try:
-                age = now - os.stat(path).st_mtime
-            except OSError:
+                canonical = _contained_transcript(path, candidate, account)
+                age = now - os.stat(canonical).st_mtime
+            except (OSError, HandoffError):
                 continue
             if 0 <= age < MAX_SCAN_AGE:
-                scanned.append((path, account, age))
+                scanned.append((canonical, account, age))
     if len(scanned) != 1:
-        rows = [{"session_id": os.path.splitext(os.path.basename(path))[0],
-                 "ts": now - age, "model": "?"}
-                for path, _, age in scanned]
-        if rows:
-            raise HandoffError(_ambiguity(rows, now))
-        raise HandoffError(
-            "no recent session matches this cwd — pass --session UUID")
+        report = [{"session_id": os.path.splitext(os.path.basename(path))[0],
+                   "ts": now - age, "model": "?"}
+                  for path, _, age in scanned]
+        if report:
+            raise HandoffError(_ambiguity(report, now))
+        raise HandoffError("no recent session matches this cwd — pass --session UUID")
     path, account, _ = scanned[0]
     session_id = os.path.splitext(os.path.basename(path))[0]
     print(f"[headroom] found session {session_id} for the current cwd",
           file=sys.stderr)
-    return SourceSession(session_id, os.path.abspath(path), account)
+    return _source(path, session_id, [account])
 
 
 def guard_source_stable(path, now=None, sleep=None):
-    """Require a quiet transcript before copying; process hunting is brittle."""
+    """Require five quiet seconds and a stable follow-up stat."""
     try:
         first = os.stat(path)
     except OSError as error:
@@ -260,10 +320,8 @@ def guard_source_stable(path, now=None, sleep=None):
         second = os.stat(path)
     except OSError as error:
         raise HandoffError(f"cannot recheck source transcript: {error}") from error
-    # The copy-time SHA-256 check is the authoritative anti-race backstop.
-    if second.st_size > first.st_size or second.st_mtime != first.st_mtime:
-        raise HandoffError(
-            "source transcript is still changing — /exit the session first")
+    if second.st_size != first.st_size or second.st_mtime_ns != first.st_mtime_ns:
+        raise HandoffError("source transcript is still changing — /exit first")
 
 
 def _content_blocks(event):
@@ -272,29 +330,61 @@ def _content_blocks(event):
     return content if isinstance(content, list) else []
 
 
-def _guard_complete_turn(events):
-    last_tool_use = -1
-    last_user_or_result = -1
-    for index, event in enumerate(events):
-        if not isinstance(event, dict):
-            continue
-        blocks = _content_blocks(event)
-        if event.get("type") == "assistant" and any(
-                isinstance(block, dict) and block.get("type") == "tool_use"
-                for block in blocks):
-            last_tool_use = index
-        if event.get("type") == "user" or any(
-                isinstance(block, dict) and block.get("type") == "tool_result"
-                for block in blocks):
-            last_user_or_result = index
-    if last_tool_use > last_user_or_result:
+def unresolved_tool_ids(events):
+    """Return tool-use ids without their exact tool_result partner."""
+    uses = []
+    results = set()
+    for event in events:
+        for block in _content_blocks(event):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
+                uses.append(block["id"])
+            elif block.get("type") == "tool_result" \
+                    and isinstance(block.get("tool_use_id"), str):
+                results.add(block["tool_use_id"])
+    return tuple(dict.fromkeys(tool_id for tool_id in uses if tool_id not in results))
+
+
+def _validate_tool_ids(events):
+    uses = []
+    results = []
+    for event in events:
+        for block in _content_blocks(event):
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                tool_id = block.get("id")
+                if not isinstance(tool_id, str) or not tool_id:
+                    raise HandoffError("transcript has a tool_use without a valid id")
+                if tool_id in uses:
+                    raise HandoffError(f"transcript repeats tool_use id {tool_id}")
+                uses.append(tool_id)
+            elif block.get("type") == "tool_result":
+                tool_id = block.get("tool_use_id")
+                if not isinstance(tool_id, str) or not tool_id:
+                    raise HandoffError(
+                        "transcript has a tool_result without a valid tool_use_id")
+                results.append(tool_id)
+    unknown = [tool_id for tool_id in results if tool_id not in uses]
+    if unknown:
         raise HandoffError(
-            "session stopped mid-tool-call; resume it once on the source "
-            "account to finish the turn, then hand off")
+            "transcript has tool_result for unknown id: "
+            + ", ".join(dict.fromkeys(unknown)))
+    return tuple(tool_id for tool_id in uses if tool_id not in set(results))
 
 
-def inspect_transcript(path):
-    """Validate every JSONL record before deriving a content-addressed baton."""
+def _guard_complete_turn(events):
+    unresolved = unresolved_tool_ids(events)
+    if unresolved:
+        raise HandoffError(
+            "session stopped mid-tool-call (unresolved: %s); resume it once on "
+            "the source account, or use --force for a manual byte-for-byte fork"
+            % ", ".join(unresolved))
+
+
+def inspect_transcript(path, allow_dangling=False):
+    """Validate every JSONL record and derive a content-addressed baton."""
     if os.path.islink(path):
         raise HandoffError("source transcript is a symlink — refusing to copy")
     try:
@@ -302,28 +392,47 @@ def inspect_transcript(path):
             data = handle.read()
     except OSError as error:
         raise HandoffError(f"cannot read source transcript: {error}") from error
-    lines = data.splitlines()
     events = []
+    lines = data.splitlines()
+    if not lines:
+        raise HandoffError("transcript is empty — refusing to hand off")
     for index, raw in enumerate(lines):
         try:
-            event = json.loads(raw.decode("utf-8", errors="replace"))
+            event = json.loads(raw.decode("utf-8"))
+            if not isinstance(event, dict):
+                raise ValueError
             events.append(event)
-        except (ValueError, json.JSONDecodeError) as error:
+        except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as error:
             if index == len(lines) - 1:
                 raise HandoffError(
-                    "transcript has an incomplete final line — is the session "
-                    "still writing?") from error
+                    "transcript has an incomplete final line — is it still writing?") \
+                    from error
             raise HandoffError(
                 f"transcript contains invalid JSON at line {index + 1}") from error
-    _guard_complete_turn(events)
-    return {
-        "sha256": hashlib.sha256(data).hexdigest(),
-        "bytes": len(data), "events": events,
-    }
+    unresolved = _validate_tool_ids(events)
+    if unresolved and not allow_dangling:
+        _guard_complete_turn(events)
+    return {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data),
+            "events": events, "unresolved_tool_ids": unresolved}
 
 
-def select_target(source_slot, snapshot, requested=None):
-    ranked = route.candidates("claude", snapshot)
+def resolve_model_family(source, override=None):
+    """Resolve the actual Claude family; absent/unknown never falls back."""
+    value = override if override is not None else source.model
+    if not isinstance(value, str) or not value.strip():
+        raise HandoffError("source model is unknown — pass --model FAMILY")
+    try:
+        family = registry.family(value)
+    except registry.RegistryError as error:
+        raise HandoffError(str(error) + "; pass --model FAMILY") from error
+    if registry.family_provider(family) != "claude":
+        raise HandoffError("handoff requires a Claude model family")
+    return family
+
+
+def select_target(source_slot, snapshot, family="claude", requested=None):
+    """Select and recheck a target with headroom for the actual family."""
+    ranked = route.candidates(family, snapshot)
     if requested:
         match = next(((account, reason) for account, reason in ranked
                       if account.get("name") == requested), None)
@@ -333,14 +442,13 @@ def select_target(source_slot, snapshot, requested=None):
         if account["name"] == source_slot:
             raise HandoffError("source and target slots must be different")
         if reason is not None:
-            raise HandoffError(
-                f"target {requested} has no proven headroom: {reason}")
+            raise HandoffError(f"target {requested} has no proven headroom: {reason}")
         return account
     target = next((account for account, reason in ranked
                    if reason is None and account["name"] != source_slot), None)
     if target is None:
         raise HandoffError(
-            "no account has proven headroom to receive this session")
+            f"no account has proven headroom for the {family} family")
     return target
 
 
@@ -349,28 +457,121 @@ def destination_path(target_home, source_transcript, session_id):
     return os.path.join(target_home, "projects", slug, session_id + ".jsonl")
 
 
-def stage_transcript(source, destination, expected_sha256):
-    """Publish only a complete, fsynced, hash-matched private copy."""
+def _preflight_destination(target, source, session_id):
+    home = registry.expand(target["home"])
+    if not os.path.isdir(home):
+        raise HandoffError(f"target home is missing or not a directory: {home}")
+    projects = os.path.join(home, "projects")
+    if os.path.lexists(projects) and (os.path.islink(projects)
+                                      or not os.path.isdir(projects)):
+        raise HandoffError("target projects path is not a real directory")
+    if not os.access(projects if os.path.isdir(projects) else home,
+                     os.W_OK | os.X_OK):
+        raise HandoffError("target directory is not writable")
+    destination = destination_path(home, source, session_id)
+    directory = os.path.dirname(destination)
+    if os.path.lexists(directory) and (os.path.islink(directory)
+                                       or not os.path.isdir(directory)):
+        raise HandoffError("target session directory is not a real directory")
+    projects_real = os.path.realpath(projects)
+    directory_real = os.path.realpath(directory)
     try:
-        return _stage_transcript(source, destination, expected_sha256)
-    except HandoffError:
-        raise
-    except OSError as error:
-        raise HandoffError(f"could not stage transcript: {error}") from error
+        inside = os.path.commonpath((directory_real, projects_real)) \
+            == projects_real
+    except ValueError:
+        inside = False
+    if not inside:
+        raise HandoffError("target session directory escapes its account home")
+    if os.path.lexists(destination):
+        raise HandoffError(
+            "target already has this session id; --force does not overwrite "
+            "destination collisions — inspect the previous partial handoff")
+    return destination
+
+
+def _previous_handoff(session_id, digest):
+    for row in _read_jsonl(_ledger_path(), "handoff ledger"):
+        old_id = row.get("old_session_id") or row.get("session_id")
+        if old_id == session_id and row.get("transcript_sha256") == digest \
+                and row.get("action", "staged") == "staged":
+            return row
+    return None
+
+
+def guard_not_duplicate(session_id, digest, force=False):
+    previous = _previous_handoff(session_id, digest)
+    if previous and not force:
+        if not _number(previous.get("ts")) \
+                or not isinstance(previous.get("target_slot"), str):
+            raise HandoffError(f"handoff ledger is unreadable — inspect {_ledger_path()}")
+        when = time.strftime("%Y-%m-%d %H:%M:%S UTC",
+                             time.gmtime(previous.get("ts", 0)))
+        raise HandoffError(
+            f"already handed off to {previous.get('target_slot')} at {when} — "
+            "re-run with --force and a different --to to create a second fork")
+
+
+def plan_handoff(source, family, target, snapshot, cap_proof, cwd, *,
+                 automatic=False, child_generation=0, force=False,
+                 require_executable=True):
+    """Build a complete, non-mutating handoff plan."""
+    family = resolve_model_family(source, family)
+    if automatic and family == "claude":
+        raise HandoffError("automatic handoff requires the actual model family")
+    if target.get("provider") != "claude":
+        raise HandoffError("handoff target must be a Claude account")
+    source = _source(source.transcript_path, source.session_id, [source.account],
+                     source.model, source.seen_at, source.account["home"])
+    cwd = os.path.realpath(cwd)
+    if not os.path.isdir(cwd):
+        raise HandoffError("current resume directory no longer exists")
+    if require_executable and shutil.which("claude") is None:
+        raise HandoffError("`claude` not found on PATH")
+    destination = _preflight_destination(target, source.transcript_path,
+                                         source.session_id)
+    allow_dangling = automatic or bool(cap_proof) or force
+    inspected = inspect_transcript(source.transcript_path,
+                                   allow_dangling=allow_dangling)
+    guard_not_duplicate(source.session_id, inspected["sha256"], force)
+    return HandoffPlan(
+        handoff_id=str(uuid.uuid4()), source=source, family=family,
+        target=dict(target), snapshot=snapshot or {},
+        cap_proof=dict(cap_proof or {}), cwd=cwd, inspected=inspected,
+        destination=destination, automatic=bool(automatic),
+        child_generation=int(child_generation or 0), force=bool(force))
+
+
+@contextlib.contextmanager
+def _handoff_lock():
+    state = paths.ensure_private(paths.state_dir())
+    handle = open(os.path.join(state, "handoffs.lock"), "a+")
+    try:
+        os.chmod(handle.name, 0o600)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+        handle.close()
+
+
+def _fsync_directory(directory):
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(directory, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _stage_transcript(source, destination, expected_sha256):
     if os.path.islink(source):
         raise HandoffError("source transcript is a symlink — refusing to copy")
-    if os.path.exists(destination):
-        raise HandoffError(
-            "target already has this session id; --force does not overwrite "
-            "destination collisions — inspect the previous partial handoff")
     directory = os.path.dirname(destination)
     os.makedirs(directory, mode=0o700, exist_ok=True)
     os.chmod(directory, 0o700)
     descriptor, temporary = tempfile.mkstemp(prefix=".handoff-", suffix=".tmp",
                                               dir=directory)
+    published = False
     try:
         os.fchmod(descriptor, 0o600)
         digest = hashlib.sha256()
@@ -386,72 +587,79 @@ def _stage_transcript(source, destination, expected_sha256):
             os.fsync(outgoing.fileno())
         if digest.hexdigest() != expected_sha256:
             raise HandoffError("source changed during copy — handoff aborted")
-        with open(temporary, "rb") as handle:
-            copied = hashlib.sha256(handle.read()).hexdigest()
-        if copied != expected_sha256:
-            raise HandoffError("copied transcript failed SHA-256 verification")
-        if os.path.exists(destination):
+        try:
+            os.link(temporary, destination)
+        except FileExistsError as error:
             raise HandoffError(
                 "target already has this session id; --force does not overwrite "
-                "destination collisions — inspect the previous partial handoff")
-        os.rename(temporary, destination)
-        temporary = None
+                "destination collisions — inspect the previous partial handoff") \
+                from error
+        published = True
+        _fsync_directory(directory)
+    except Exception:
+        if published:
+            try:
+                os.unlink(destination)
+                _fsync_directory(directory)
+            except OSError:
+                pass
+        raise
     finally:
         if descriptor is not None:
             os.close(descriptor)
-        if temporary is not None:
-            try:
-                os.unlink(temporary)
-            except FileNotFoundError:
-                pass
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    if not published:
+        raise HandoffError("could not publish transcript")
 
 
-def _previous_handoff(session_id, digest):
-    for row in _read_jsonl(_ledger_path(), "handoff ledger"):
-        if row.get("session_id") == session_id \
-                and row.get("transcript_sha256") == digest:
-            return row
-    return None
+def stage_transcript(source, destination, expected_sha256):
+    try:
+        _stage_transcript(source, destination, expected_sha256)
+    except HandoffError:
+        raise
+    except OSError as error:
+        raise HandoffError(f"could not stage transcript: {error}") from error
 
 
-def guard_not_duplicate(session_id, digest, force=False):
-    previous = _previous_handoff(session_id, digest)
-    if previous and not force:
-        if not _number(previous.get("ts")) \
-                or not isinstance(previous.get("target_slot"), str):
-            raise HandoffError(
-                f"handoff ledger is unreadable — inspect {_ledger_path()}")
-        when = time.strftime("%Y-%m-%d %H:%M:%S UTC",
-                             time.gmtime(previous.get("ts", 0)))
-        raise HandoffError(
-            f"already handed off to {previous.get('target_slot')} at {when} — "
-            "re-run with --force and a different --to to create a second fork")
+def _append_ledger_unlocked(record):
+    state = paths.ensure_private(paths.state_dir())
+    ledger = os.path.join(state, "handoffs.jsonl")
+    descriptor = os.open(ledger, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.fchmod(descriptor, 0o600)
+        payload = (json.dumps(record, separators=(",", ":"),
+                              allow_nan=False) + "\n").encode("utf-8")
+        if os.write(descriptor, payload) != len(payload):
+            raise HandoffError("handoff ledger append was incomplete")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def append_ledger(record):
     try:
-        state = paths.ensure_private(paths.state_dir())
-        ledger = os.path.join(state, "handoffs.jsonl")
-        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
-        descriptor = os.open(ledger, flags, 0o600)
-        try:
-            os.fchmod(descriptor, 0o600)
-            payload = json.dumps(record, separators=(",", ":"), allow_nan=False) + "\n"
-            payload = payload.encode("utf-8")
-            if os.write(descriptor, payload) != len(payload):
-                raise HandoffError("handoff ledger append was incomplete")
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+        with _handoff_lock():
+            _append_ledger_unlocked(record)
     except HandoffError:
         raise
     except OSError as error:
         raise HandoffError(f"could not append handoff ledger: {error}") from error
 
 
-def resume_command(target_home, session_id):
-    return (f"CLAUDE_CONFIG_DIR={shlex.quote(target_home)} claude --resume "
-            f"{shlex.quote(session_id)} --fork-session")
+def append_action(handoff_id, action, *, automatic=False, **fields):
+    allowed = {"cap_confirmed", "stop_sent", "stopped", "staged",
+               "resume_spawned", "resume_bound", "failure"}
+    if action not in allowed:
+        raise HandoffError(f"invalid handoff ledger action: {action}")
+    record = {"schema": SCHEMA, "ts": time.time(),
+              "handoff_id": handoff_id, "action": action,
+              "automatic": bool(automatic)}
+    record.update(fields)
+    append_ledger(record)
+    return record
 
 
 def _snapshot_rows(snapshot):
@@ -459,119 +667,157 @@ def _snapshot_rows(snapshot):
             if isinstance(row, dict) and row.get("name")}
 
 
-def _number(value):
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value))
+def resume_command(target_home, session_id):
+    return (f"CLAUDE_CONFIG_DIR={shlex.quote(target_home)} claude --resume "
+            f"{shlex.quote(session_id)} --fork-session")
 
 
-def _email_domain(value):
-    return value.rpartition("@")[2].lower() if isinstance(value, str) else ""
+def resume_argv(result):
+    return ["claude", "--resume", result.plan.source.session_id,
+            "--fork-session"]
 
 
-def _print_baton(record):
+def commit_handoff(plan):
+    """Cool, no-clobber publish, and ledger one handoff under one lock."""
+    try:
+        with _handoff_lock():
+            guard_not_duplicate(plan.source.session_id,
+                                plan.inspected["sha256"], plan.force)
+            if os.path.lexists(plan.destination):
+                raise HandoffError(
+                    "target already has this session id; --force does not overwrite "
+                    "destination collisions — inspect the previous partial handoff")
+            scope = plan.cap_proof
+            if scope:
+                route.mark(
+                    plan.source.account["name"], plan.family, scope.get("reset"),
+                    account_wide=bool(scope.get("account_wide")),
+                    window="5h" if scope.get("window") == "5h" else "7d")
+            stage_transcript(plan.source.transcript_path, plan.destination,
+                             plan.inspected["sha256"])
+            rows = _snapshot_rows(plan.snapshot)
+            source_row = rows.get(plan.source.account["name"], {})
+            source_email = (source_row.get("email")
+                            or plan.source.account.get("expected_email") or "")
+            record = {
+                "schema": SCHEMA, "ts": time.time(),
+                "handoff_id": plan.handoff_id, "action": "staged",
+                "actions": ["staged"],
+                "old_session_id": plan.source.session_id,
+                "new_session_id": None,
+                "session_id": plan.source.session_id,
+                "source_slot": plan.source.account["name"],
+                "source_email_redacted": collect.redact_email(source_email),
+                "target_slot": plan.target["name"], "cwd": plan.cwd,
+                "actual_model_family": plan.family,
+                "cap_scope": scope.get("key") if scope else None,
+                "cap_used_percent": scope.get("used_percent") if scope else None,
+                "cap_reset": scope.get("reset") if scope else None,
+                "transcript_sha256": plan.inspected["sha256"],
+                "transcript_bytes": plan.inspected["bytes"],
+                "automatic": plan.automatic,
+                "child_generation": plan.child_generation,
+                "source_5h_used": ((source_row.get("windows") or {}).get("5h")
+                                   or {}).get("used_percent"),
+                "reason": "capped" if scope else "manual",
+                "resume_command": resume_command(plan.target["home"],
+                                                  plan.source.session_id),
+            }
+            try:
+                _append_ledger_unlocked(record)
+            except Exception:
+                os.unlink(plan.destination)
+                _fsync_directory(os.path.dirname(plan.destination))
+                raise
+            return HandoffResult(plan, plan.destination, record)
+    except HandoffError:
+        raise
+    except OSError as error:
+        raise HandoffError(f"could not commit handoff: {error}") from error
+
+
+def _print_baton(record, unresolved=()):
     print("BATON — conversation history staged")
-    print(f"session: {record['session_id']} ({record['transcript_bytes']} bytes)")
+    print(f"session: {record['old_session_id']} ({record['transcript_bytes']} bytes)")
     print(f"cwd: {record['cwd']}")
     print(f"from -> to: {record['source_slot']} -> {record['target_slot']}")
-    print("does not carry: background tasks / MCP connections / permission approvals")
+    print("does not carry: background tasks / MCP connections / permission "
+          "approvals / permission mode")
+    if unresolved:
+        print("note: the interrupted tool call may re-run on resume")
     print("NEXT COMMAND:")
     print(record["resume_command"])
 
 
 def _parse_args(args):
-    options = {"session": None, "to": None, "print": False, "force": False}
+    options = {"session": None, "to": None, "model": None,
+               "print": False, "force": False, "yes": False}
     index = 0
     while index < len(args):
         arg = args[index]
-        if arg in ("--print", "--force"):
+        if arg in ("--print", "--force", "--yes"):
             options[arg[2:]] = True
-        elif arg in ("--session", "--to") and index + 1 < len(args):
+        elif arg in ("--session", "--to", "--model") and index + 1 < len(args):
             index += 1
             options[arg[2:]] = args[index]
         else:
             raise HandoffError(
                 "usage: headroom handoff [--session UUID] [--to SLOT] "
-                "[--print] [--force]")
+                "[--model FAMILY] [--print | --yes] [--force]")
         index += 1
+    if options["yes"] and options["print"]:
+        raise HandoffError("--yes and --print are mutually exclusive")
     return options
 
 
 def cmd_handoff(args):
-    """Stage, record, cool, and either print or exec the verified next step."""
+    """Manual adapter: confirm first, then commit, then optionally exec."""
     try:
         options = _parse_args(args)
-        if not options["print"] and not sys.stdin.isatty():
+        if not options["print"] and not options["yes"] and not sys.stdin.isatty():
             raise HandoffError(
-                "non-interactive handoff requires --print; default mode needs "
-                "a terminal for confirmation")
-        try:
-            cwd = os.path.realpath(os.getcwd())
-        except OSError as error:
-            raise HandoffError("current working directory no longer exists") from error
+                "non-interactive handoff requires --yes or --print")
+        cwd = os.path.realpath(os.getcwd())
         if not os.path.isdir(cwd):
             raise HandoffError("current working directory no longer exists")
         accounts = registry.accounts()
         source = resolve_source(options["session"], accounts, cwd)
+        family = resolve_model_family(source, options["model"])
         snapshot = route.ensure_fresh_snapshot()
-        target = select_target(source.account["name"], snapshot, options["to"])
-        if os.path.islink(source.transcript_path):
-            raise HandoffError("source transcript is a symlink — refusing to copy")
+        if snapshot is None:
+            raise HandoffError("no fresh usage snapshot — handoff held")
+        target = select_target(source.account["name"], snapshot, family,
+                               options["to"])
         guard_source_stable(source.transcript_path)
-        inspected = inspect_transcript(source.transcript_path)
-        guard_not_duplicate(source.session_id, inspected["sha256"], options["force"])
-        destination = destination_path(target["home"], source.transcript_path,
-                                       source.session_id)
+        scope = route.cap_scope(snapshot, source.account["name"], family,
+                                "usage limit reached")
+        plan = plan_handoff(source, family, target, snapshot, scope, cwd,
+                            force=options["force"])
         rows = _snapshot_rows(snapshot)
-        source_row = rows.get(source.account["name"], {})
-        target_row = rows.get(target["name"], {})
-        source_email = source_row.get("email") or source.account.get("expected_email") or ""
-        target_email = target_row.get("email") or target.get("expected_email") or ""
-        if (_email_domain(source_email) and _email_domain(target_email)
-                and _email_domain(source_email) != _email_domain(target_email)):
+        source_email = (rows.get(source.account["name"], {}).get("email")
+                        or source.account.get("expected_email") or "")
+        target_email = (rows.get(target["name"], {}).get("email")
+                        or target.get("expected_email") or "")
+        if source_email and target_email \
+                and source_email.rpartition("@")[2].lower() \
+                != target_email.rpartition("@")[2].lower():
             print("warning: conversation content is moving to the other "
                   "account's data boundary")
-        used = ((source_row.get("windows") or {}).get("5h") or {}).get(
-            "used_percent")
-        used = float(used) if _number(used) else None
-        command = resume_command(target["home"], source.session_id)
-        record = {
-            "schema": SCHEMA, "ts": int(time.time()),
-            "session_id": source.session_id,
-            "source_slot": source.account["name"],
-            "source_email_redacted": collect.redact_email(source_email),
-            "target_slot": target["name"], "cwd": cwd,
-            "transcript_sha256": inspected["sha256"],
-            "transcript_bytes": inspected["bytes"],
-            "source_5h_used": used,
-            "reason": "capped" if used is not None and used >= 99 else "manual",
-            "resume_command": command,
-        }
-        stage_transcript(source.transcript_path, destination, inspected["sha256"])
-        try:
-            append_ledger(record)
-        except Exception:
-            os.unlink(destination)
-            raise
-        try:
-            reset = route.window_reset(snapshot, source.account["name"], "5h")
-            reset = reset if _number(reset) else None
-            route.mark(source.account["name"], "claude", reset,
-                       account_wide=True, window="5h")
-        except Exception as error:  # noqa: BLE001 — the verified copy remains valid
-            print(f"warning: could not cool source slot: {error}", file=sys.stderr)
-        _print_baton(record)
+        if not options["print"] and not options["yes"]:
+            answer = input(f"hand off {source.session_id} to {target['name']}? "
+                           "This copies its conversation. [y/N] ").strip().lower()
+            if answer not in ("y", "yes"):
+                print("handoff cancelled; nothing copied or cooled")
+                return 0
+        result = commit_handoff(plan)
+        _print_baton(result.record, plan.inspected["unresolved_tool_ids"])
         if options["print"]:
-            return 0
-        answer = input(f"hand off to {target['name']}? [y/N] ").strip().lower()
-        if answer not in ("y", "yes"):
-            print("handoff staged; resume command not run")
-            print(command)
             return 0
         environment = collect.scrubbed_env()
         environment["CLAUDE_CONFIG_DIR"] = target["home"]
         try:
-            os.execvpe("claude", ["claude", "--resume", source.session_id,
-                                   "--fork-session"], environment)
+            argv = resume_argv(result)
+            os.execvpe(argv[0], argv, environment)
         except OSError as error:
             print(f"headroom: cannot exec claude: {error}", file=sys.stderr)
             return 127
