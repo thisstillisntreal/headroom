@@ -5,8 +5,10 @@ Run:  python3 -m unittest discover -s tests   (from the repo root)
 Covers the load-bearing safety logic: config validation, the fail-closed
 router (`block_reason`), redaction, and the public-snapshot projection.
 """
+import json
 import os
 import sys
+import tempfile
 import time
 import unittest
 
@@ -238,6 +240,79 @@ class CodexWindowMapping(unittest.TestCase):
         w = collect.codex_windows({}, now=1000)
         self.assertEqual(w["5h"]["used_percent"], 0.0)
         self.assertEqual(w["7d"]["used_percent"], 0.0)
+
+
+class FakeCompleted:
+    def __init__(self, stdout="", returncode=0):
+        self.stdout = stdout
+        self.returncode = returncode
+
+
+class ClaudeKeychain(unittest.TestCase):
+    """macOS stores the Claude token in the login Keychain, not a file, and
+    CLAUDE_CONFIG_DIR does not relocate it — headroom must read it via
+    `security`. All tests force the darwin path so they run on any host."""
+
+    def setUp(self):
+        self._platform = collect.sys.platform
+        self._which = collect.shutil.which
+        collect.sys.platform = "darwin"
+        # the Linux test host has no `security` binary; pretend it resolves so
+        # the runner (which we inject) is what actually gets exercised
+        collect.shutil.which = lambda name: "/usr/bin/security"
+
+    def tearDown(self):
+        collect.sys.platform = self._platform
+        collect.shutil.which = self._which
+
+    def _runner(self, payload, returncode=0):
+        def run(cmd, **kwargs):
+            self.assertIn("find-generic-password", cmd)
+            return FakeCompleted(stdout=payload, returncode=returncode)
+        return run
+
+    def test_reads_wrapped_credential(self):
+        blob = json.dumps({"claudeAiOauth": {"accessToken": "tok-abc",
+                                             "subscriptionType": "max"}})
+        oauth = collect.claude_keychain_oauth(runner=self._runner(blob))
+        self.assertEqual(oauth["accessToken"], "tok-abc")
+
+    def test_tolerates_bare_credential(self):
+        blob = json.dumps({"accessToken": "tok-bare"})
+        oauth = collect.claude_keychain_oauth(runner=self._runner(blob))
+        self.assertEqual(oauth["accessToken"], "tok-bare")
+
+    def test_absent_item_returns_none(self):
+        oauth = collect.claude_keychain_oauth(
+            runner=self._runner("", returncode=44))
+        self.assertIsNone(oauth)
+
+    def test_garbage_returns_none(self):
+        oauth = collect.claude_keychain_oauth(runner=self._runner("not-json"))
+        self.assertIsNone(oauth)
+
+    def test_non_darwin_never_shells_out(self):
+        collect.sys.platform = "linux"
+
+        def explode(*a, **k):
+            raise AssertionError("security must not run off-macOS")
+        self.assertIsNone(collect.claude_keychain_oauth(runner=explode))
+
+    def test_oauth_prefers_file_over_keychain(self):
+        with tempfile.TemporaryDirectory() as home:
+            with open(os.path.join(home, ".credentials.json"), "w") as fh:
+                json.dump({"claudeAiOauth": {"accessToken": "from-file"}}, fh)
+
+            def explode(*a, **k):
+                raise AssertionError("keychain must not run when file present")
+            oauth = collect.claude_oauth(home, runner=explode)
+            self.assertEqual(oauth["accessToken"], "from-file")
+
+    def test_oauth_falls_back_to_keychain_when_no_file(self):
+        with tempfile.TemporaryDirectory() as home:
+            blob = json.dumps({"claudeAiOauth": {"accessToken": "from-keychain"}})
+            oauth = collect.claude_oauth(home, runner=self._runner(blob))
+            self.assertEqual(oauth["accessToken"], "from-keychain")
 
 
 if __name__ == "__main__":

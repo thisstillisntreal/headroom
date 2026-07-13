@@ -29,6 +29,7 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -165,6 +166,60 @@ def claude_local_identity(home):
     }
 
 
+# The macOS login Keychain item the Claude CLI stores its OAuth token in.
+# On recent macOS the token lives here, NOT in `.credentials.json`, and — unlike
+# Linux/Windows — setting CLAUDE_CONFIG_DIR does NOT relocate it to a file (the
+# item is single and shared across logins). Override the item name with
+# HEADROOM_CLAUDE_KEYCHAIN_SERVICE if a future CLI version changes it.
+CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def claude_keychain_oauth(service=None, runner=subprocess.run):
+    """Read the `claudeAiOauth` blob out of the macOS login Keychain, or None.
+
+    Only meaningful on macOS; returns None everywhere else (and on any error, a
+    missing `security` binary, a locked Keychain, or an absent item) so callers
+    degrade to the existing fail-closed 'held' behaviour."""
+    if sys.platform != "darwin":
+        return None
+    service = service or os.environ.get(
+        "HEADROOM_CLAUDE_KEYCHAIN_SERVICE", CLAUDE_KEYCHAIN_SERVICE)
+    security = shutil.which("security")
+    if not security:
+        return None
+    try:
+        completed = runner([security, "find-generic-password", "-s", service,
+                            "-w"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    raw = (getattr(completed, "stdout", "") or "").strip()
+    if getattr(completed, "returncode", 1) != 0 or not raw:
+        return None
+    try:
+        blob = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(blob, dict):
+        return None
+    # The item stores the same shape as the file (`{"claudeAiOauth": {...}}`);
+    # tolerate a bare credential object too.
+    oauth = blob.get("claudeAiOauth")
+    if isinstance(oauth, dict):
+        return oauth
+    return blob if blob.get("accessToken") else None
+
+
+def claude_oauth(home, runner=subprocess.run):
+    """The `claudeAiOauth` credential the Claude CLI will actually use for this
+    home — from `.credentials.json` when present (Linux/Windows, or an isolated
+    CLAUDE_CONFIG_DIR home), otherwise the macOS login Keychain."""
+    oauth = (paths.load_json(os.path.join(home, ".credentials.json"))
+             or {}).get("claudeAiOauth")
+    if isinstance(oauth, dict) and oauth.get("accessToken"):
+        return oauth
+    return claude_keychain_oauth(runner=runner) or (oauth if isinstance(oauth, dict) else {})
+
+
 def credential_digest(provider, home):
     """A digest of the ACTUAL token the provider CLI will use — the Claude
     `.credentials.json` accessToken or the Codex `auth.json` access_token.
@@ -173,9 +228,7 @@ def credential_digest(provider, home):
     identity metadata still names the old account."""
     try:
         if provider == "claude":
-            oauth = (paths.load_json(os.path.join(home, ".credentials.json"))
-                     or {}).get("claudeAiOauth") or {}
-            token = oauth.get("accessToken")
+            token = (claude_oauth(home) or {}).get("accessToken")
         else:
             token = ((paths.load_json(os.path.join(home, "auth.json")) or {})
                      .get("tokens") or {}).get("access_token")
@@ -203,8 +256,7 @@ def local_binding(provider, home):
 
 
 def claude_plan(home):
-    credentials = paths.load_json(os.path.join(home, ".credentials.json")) or {}
-    oauth = credentials.get("claudeAiOauth") or {}
+    oauth = claude_oauth(home) or {}
     tier = str(oauth.get("rateLimitTier") or "").lower()
     if "max_20x" in tier:
         return "Max 20x"
@@ -488,8 +540,7 @@ def limit_entry(limit, minutes):
 
 
 def claude_limits(home, expected_fingerprint, opener=open_authenticated):
-    credentials = paths.load_json(os.path.join(home, ".credentials.json")) or {}
-    oauth = credentials.get("claudeAiOauth") or {}
+    oauth = claude_oauth(home) or {}
     if not oauth.get("accessToken"):
         raise IdentityBindingError("claude_credentials_missing")
     request = urllib.request.Request(
@@ -816,13 +867,17 @@ def collect(accounts, backoff=None, persist_backoff=None):
             result["ok"] = False
             result["error_code"] = error.code
             if error.code == "claude_credentials_missing":
-                # verified identity but no file-based token — typically a
-                # Keychain-backed macOS default login headroom can't read
-                result["note"] = ("Claude login found but its token isn't "
-                                  "file-based (macOS Keychain?). headroom needs "
-                                  "a file-based login: `headroom connect "
-                                  f"{account['name']}-fresh` to log in to an "
-                                  "isolated home instead of adopting this one.")
+                # verified identity but the token couldn't be read. On macOS the
+                # token is in the login Keychain (headroom reads it via
+                # `security`) — this path means the Keychain was locked or the
+                # item name differs; elsewhere it means no file-based login yet.
+                result["note"] = ("Claude login found but its token could not "
+                                  "be read. On macOS unlock the login Keychain "
+                                  "and allow `security` access when prompted "
+                                  "(set HEADROOM_CLAUDE_KEYCHAIN_SERVICE if your "
+                                  "CLI uses a different item name); on "
+                                  "Linux/Windows run `headroom connect "
+                                  f"{account['name']}` to log in.")
             else:
                 result["note"] = ("identity could not be bound to this slot; "
                                   "account held — run `headroom connect` "

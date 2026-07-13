@@ -63,18 +63,28 @@ snapshot and on the dashboard). This keeps offline/air-gapped setups usable.
 If you want provider-verified-only routing, treat `verified_local` as held —
 open an issue if you want this as a config flag.
 
-## File-based credentials required (macOS Keychain caveat)
+## macOS Keychain (Claude) — read directly, with one caveat
 
-headroom reads usage tokens from files (`.credentials.json`, `auth.json`).
-Two cases where that isn't where the token lives:
+On recent Claude Code for **macOS**, the OAuth token is stored in the login
+**Keychain**, not in `~/.claude/.credentials.json`. Importantly, setting
+`CLAUDE_CONFIG_DIR` does **not** move it to a file on macOS the way it does on
+Linux/Windows — the credential stays in a single, system-wide Keychain item
+shared across logins.
 
-- **macOS default Claude login.** Recent Claude Code on macOS can store its
-  token in the system Keychain, so the default `~/.claude` has no readable
-  `.credentials.json`. headroom will detect the identity but hold the account
-  with a clear message. **Fix:** connect a *fresh* isolated login instead of
-  adopting the default — `headroom connect work-fresh` runs `claude auth login`
-  inside its own `CLAUDE_CONFIG_DIR`, which writes file-based credentials that
-  headroom can read. (Linux/Windows default logins are already file-based.)
+headroom reads that item directly (via the `security` CLI, item name
+`Claude Code-credentials`) whenever the file is absent, so a normal macOS
+Claude login is tracked with no extra steps. If your Keychain is locked, macOS
+will prompt to allow access the first time; approve it (choose *Always Allow*
+to avoid repeat prompts). Override the item name with the
+`HEADROOM_CLAUDE_KEYCHAIN_SERVICE` environment variable if a future CLI version
+changes it.
+
+- **The caveat: one Keychain item = one Claude account on macOS.** Because the
+  item is shared across all logins, you can't isolate *multiple* Claude
+  accounts on one Mac by config directory — a second `claude` login overwrites
+  the first. For multi-account rotation on macOS, run the extra accounts on a
+  Linux host/server (file-based, fully isolated) or keep them in Codex; a
+  single Mac Claude account tracks and routes fine.
 - **Codex `cli_auth_credentials_store = "keyring"`** and other non-file stores
   are likewise invisible; such slots show as not logged in.
 

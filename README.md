@@ -47,9 +47,10 @@ headroom fixes all three problems:
 ## Quickstart
 
 Requirements: Python 3.9+ (stdlib only — no pip installs), macOS or Linux,
-and the `claude` and/or `codex` CLIs you already use. (On macOS, connect
-Claude accounts with a fresh `headroom connect` login rather than adopting the
-Keychain-backed default — see [docs/KNOWN-LIMITS.md](docs/KNOWN-LIMITS.md).)
+and the `claude` and/or `codex` CLIs you already use. (On macOS the Claude
+token lives in the login Keychain; headroom reads it directly — approve the
+Keychain prompt on first run. One Keychain item means one Claude account per
+Mac — see [docs/KNOWN-LIMITS.md](docs/KNOWN-LIMITS.md).)
 
 ```bash
 git clone https://github.com/domanski-ai/headroom
