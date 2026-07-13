@@ -307,12 +307,16 @@ def local_binding(provider, home):
 
 def claude_plan(home):
     oauth = claude_oauth(home) or {}
+    subscription = str(oauth.get("subscriptionType") or "").lower()
+    if subscription == "team":
+        # before the tier checks: team seats carry unreliable per-user tiers
+        # (default_claude_max_5x / default_raven, cached at login)
+        return "Team"
     tier = str(oauth.get("rateLimitTier") or "").lower()
     if "max_20x" in tier:
         return "Max 20x"
     if "max_5x" in tier:
         return "Max 5x"
-    subscription = str(oauth.get("subscriptionType") or "").lower()
     return {"max": "Max", "pro": "Pro", "free": "Free"}.get(subscription)
 
 
