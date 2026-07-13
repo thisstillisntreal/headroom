@@ -481,11 +481,24 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertIn("function tone(left)", template)
 
     def test_compact_mode_retains_state_disclosure(self):
+        # Compact may hide decorative chrome, but every element that
+        # discloses state (snapshot age, per-account state, error/warning
+        # statusline) must never be display:none'd in compact mode.
         template = self.template_text()
         compact_css = template.split("/* Compact mode", 1)[1].split("</style>", 1)[0]
         self.assertIn("body.is-compact .acct-identity, body.is-compact .state",
                       compact_css)
-        self.assertNotIn("display: none", compact_css)
+        disclosure = (".snapshot", ".state", ".acct-identity", ".account",
+                      ".statusline.is-error", ".fleet-bars")
+        for rule in compact_css.split("}"):
+            if "display: none" not in rule:
+                continue
+            selectors = rule.split("{", 1)[0]
+            for selector in disclosure:
+                self.assertNotIn(selector + " ", selectors + " ")
+            # the non-error statusline may hide; the error form must not
+            self.assertNotIn(".statusline.is-error", selectors)
+            self.assertNotIn(".snapshot", selectors)
         self.assertIn('class="statusline" id="status"', template)
 
 
