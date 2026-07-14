@@ -1547,7 +1547,9 @@ class CmdExecCodexRefusal(unittest.TestCase):
 
     def test_enabled_but_no_headroom_refuses(self):
         errors = io.StringIO()
-        with mock.patch.object(route, "pick", return_value=None), \
+        environ = {k: v for k, v in os.environ.items() if k != "CODEX_HOME"}
+        with mock.patch.dict(os.environ, environ, clear=True), \
+                mock.patch.object(route, "pick", return_value=None), \
                 mock.patch.object(route.os, "execvp") as execute, \
                 redirect_stderr(errors):
             code = route.cmd_exec("codex", ["codex"])
@@ -1599,6 +1601,253 @@ class RegistryCodexSeats(unittest.TestCase):
         config = {"schema_version": 1, "accounts": [
             {"name": "personal", "provider": "claude", "home": "~/.claude"}]}
         self.assertEqual(registry.validate(config), config)
+
+
+class ReservedAccounts(unittest.TestCase):
+    """`reserved: true` = tracked but never auto-routed. The gate lives in
+    block_reason so EVERY selection path (pick, candidates, launch, rotation
+    and handoff targets) refuses it, while collect/dashboard still see it."""
+
+    def setUp(self):
+        self._orig_binding = collect.local_binding
+        collect.local_binding = lambda provider, home: ("AAAA", "BBBB")
+
+    def tearDown(self):
+        collect.local_binding = self._orig_binding
+
+    def test_reserved_must_be_bool(self):
+        config = {"schema_version": 1, "accounts": [
+            {"name": "a", "provider": "claude", "home": "/tmp/x",
+             "reserved": "yes"}]}
+        with self.assertRaises(registry.RegistryError):
+            registry.validate(config)
+
+    def test_reserved_true_and_false_validate(self):
+        config = {"schema_version": 1, "accounts": [
+            {"name": "a", "provider": "claude", "home": "/tmp/x",
+             "reserved": True},
+            {"name": "b", "provider": "claude", "home": "/tmp/y",
+             "reserved": False}]}
+        self.assertEqual(registry.validate(config), config)
+
+    def test_reserved_holds_even_when_healthy(self):
+        account = dict(_account("a"), reserved=True)
+        reason = route.block_reason(account, "sonnet", _claude_row("a"),
+                                    {}, time.time())
+        self.assertIsNotNone(reason)
+        self.assertIn("reserved", reason)
+
+    def test_reserved_false_routes_normally(self):
+        account = dict(_account("a"), reserved=False)
+        self.assertIsNone(route.block_reason(account, "sonnet",
+                                             _claude_row("a"), {}, time.time()))
+
+    def test_pick_skips_reserved_for_next_eligible(self):
+        reserved = dict(_account("a"), reserved=True)
+        open_account = _account("b")
+        snapshot = {"generated": time.time(),
+                    "accounts": [_claude_row("a"), _claude_row("b")]}
+        with mock.patch.object(route, "ensure_fresh_snapshot",
+                               return_value=snapshot), \
+                mock.patch.object(route.registry, "ordered_for",
+                                  return_value=[reserved, open_account]), \
+                mock.patch.object(route.registry, "reserve_percent",
+                                  return_value=0.0), \
+                mock.patch.object(route, "cooldowns", return_value={}):
+            chosen = route.pick("sonnet")
+        self.assertEqual(chosen["name"], "b")
+
+
+class EnvPinnedAccount(unittest.TestCase):
+    """An explicitly exported config home that names a registered account is
+    consumed as the initial slot instead of being re-routed."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.home_a = os.path.join(self.temp.name, "homes", "a")
+        self.home_b = os.path.join(self.temp.name, "homes", "b")
+        os.makedirs(self.home_a)
+        os.makedirs(self.home_b)
+        self.accounts = [
+            {"name": "a", "provider": "claude", "home": self.home_a},
+            {"name": "b", "provider": "claude", "home": self.home_b}]
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def pinned(self, fam="sonnet", **env):
+        environ = {k: v for k, v in os.environ.items()
+                   if k not in ("CLAUDE_CONFIG_DIR", "CODEX_HOME")}
+        environ.update(env)
+        with mock.patch.dict(os.environ, environ, clear=True), \
+                mock.patch.object(route.registry, "ordered_for",
+                                  return_value=self.accounts):
+            return route.env_pinned_account(fam)
+
+    def test_unset_env_is_no_pin(self):
+        self.assertIsNone(self.pinned())
+
+    def test_env_home_maps_to_registered_account(self):
+        chosen = self.pinned(CLAUDE_CONFIG_DIR=self.home_b)
+        self.assertEqual(chosen["name"], "b")
+
+    def test_unregistered_home_is_no_pin(self):
+        self.assertIsNone(self.pinned(CLAUDE_CONFIG_DIR=self.temp.name))
+
+    def test_registry_error_is_no_pin(self):
+        environ = dict(os.environ, CLAUDE_CONFIG_DIR=self.home_a)
+        with mock.patch.dict(os.environ, environ, clear=True), \
+                mock.patch.object(
+                    route.registry, "ordered_for",
+                    side_effect=registry.RegistryError("no config")):
+            self.assertIsNone(route.env_pinned_account("sonnet"))
+
+    def test_cmd_exec_consumes_pinned_account(self):
+        snapshot = {"generated": time.time(), "accounts": [
+            _claude_row("a"), _claude_row("b")]}
+        environ = {k: v for k, v in os.environ.items()
+                   if k != "HEADROOM_LAUNCH_MARKER"}
+        environ["CLAUDE_CONFIG_DIR"] = self.home_b
+        with mock.patch.dict(os.environ, environ, clear=True), \
+                mock.patch.object(route.registry, "ordered_for",
+                                  return_value=self.accounts), \
+                mock.patch.object(route, "ensure_fresh_snapshot",
+                                  return_value=snapshot), \
+                mock.patch.object(route, "block_reason", return_value=None), \
+                mock.patch.object(route, "cooldowns", return_value={}), \
+                mock.patch.object(route, "pick") as picked, \
+                mock.patch.object(route.os, "execvp") as execute, \
+                redirect_stderr(io.StringIO()):
+            route.cmd_exec("sonnet", ["claude"])
+            selected = os.environ.get("CLAUDE_CONFIG_DIR")
+        picked.assert_not_called()  # the exported home was consumed, not re-routed
+        execute.assert_called_once()
+        self.assertEqual(selected, self.home_b)
+
+    def test_cmd_exec_repicks_when_pinned_account_is_blocked(self):
+        snapshot = {"generated": time.time(), "accounts": [
+            _claude_row("a"), _claude_row("b", used5h=100)]}
+        open_account = self.accounts[0]
+        errors = io.StringIO()
+        environ = {k: v for k, v in os.environ.items()
+                   if k != "HEADROOM_LAUNCH_MARKER"}
+        environ["CLAUDE_CONFIG_DIR"] = self.home_b
+        with mock.patch.dict(os.environ, environ, clear=True), \
+                mock.patch.object(route.registry, "ordered_for",
+                                  return_value=self.accounts), \
+                mock.patch.object(route, "ensure_fresh_snapshot",
+                                  return_value=snapshot), \
+                mock.patch.object(route, "block_reason",
+                                  side_effect=["at limit", None]), \
+                mock.patch.object(route, "cooldowns", return_value={}), \
+                mock.patch.object(route, "pick",
+                                  return_value=open_account) as picked, \
+                mock.patch.object(route.os, "execvp") as execute, \
+                redirect_stderr(errors):
+            route.cmd_exec("sonnet", ["claude"])
+            selected = os.environ.get("CLAUDE_CONFIG_DIR")
+        picked.assert_called_once()
+        execute.assert_called_once()
+        self.assertIn("not routable", errors.getvalue())
+        self.assertEqual(selected, self.home_a)
+
+
+class LaunchMarker(unittest.TestCase):
+    """HEADROOM_LAUNCH_MARKER: the wrapper handshake is written before any
+    launch, and a requested-but-unwritable marker aborts instead of leaving
+    the wrapper's fallback logic racing a CLI headroom did start."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.old_headroom = os.environ.get("HEADROOM_DIR")
+        os.environ["HEADROOM_DIR"] = os.path.join(self.temp.name, "hr")
+        self.account = {"name": "a", "provider": "claude",
+                        "home": os.path.join(self.temp.name, "homes", "a")}
+
+    def tearDown(self):
+        self.temp.cleanup()
+        if self.old_headroom is None:
+            os.environ.pop("HEADROOM_DIR", None)
+        else:
+            os.environ["HEADROOM_DIR"] = self.old_headroom
+
+    def marker_env(self, value):
+        environ = {k: v for k, v in os.environ.items()
+                   if k != "HEADROOM_LAUNCH_MARKER"}
+        if value is not None:
+            environ["HEADROOM_LAUNCH_MARKER"] = value
+        return mock.patch.dict(os.environ, environ, clear=True)
+
+    def test_no_marker_requested_is_a_no_op_success(self):
+        with self.marker_env(None):
+            self.assertTrue(route.write_launch_marker("exec", self.account))
+
+    def test_marker_written_with_mode_account_and_note(self):
+        destination = os.path.join(self.temp.name, "marker.json")
+        with self.marker_env(destination):
+            self.assertTrue(route.write_launch_marker(
+                "supervised", self.account, note="why not"))
+        with open(destination, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.assertEqual(payload["mode"], "supervised")
+        self.assertEqual(payload["account"], "a")
+        self.assertEqual(payload["note"], "why not")
+
+    def test_relative_marker_path_refuses_launch(self):
+        with self.marker_env("relative/marker.json"), \
+                redirect_stderr(io.StringIO()):
+            self.assertFalse(route.write_launch_marker("exec", self.account))
+
+    def test_unwritable_marker_refuses_launch(self):
+        destination = os.path.join(self.temp.name, "missing-dir-parent")
+        # a FILE where the parent directory should be makes makedirs fail
+        with open(destination, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        with self.marker_env(os.path.join(destination, "marker.json")), \
+                redirect_stderr(io.StringIO()):
+            self.assertFalse(route.write_launch_marker("exec", self.account))
+
+    def test_cmd_exec_aborts_before_exec_when_marker_unwritable(self):
+        snapshot = {"generated": time.time(), "accounts": [_claude_row("a")]}
+        blocker = os.path.join(self.temp.name, "blocker")
+        with open(blocker, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        environ = {k: v for k, v in os.environ.items()
+                   if k not in ("CLAUDE_CONFIG_DIR", "CODEX_HOME")}
+        environ["HEADROOM_LAUNCH_MARKER"] = os.path.join(blocker, "m.json")
+        with mock.patch.dict(os.environ, environ, clear=True), \
+                mock.patch.object(route, "pick", return_value=self.account), \
+                mock.patch.object(route, "ensure_fresh_snapshot",
+                                  return_value=snapshot), \
+                mock.patch.object(route, "block_reason", return_value=None), \
+                mock.patch.object(route, "cooldowns", return_value={}), \
+                mock.patch.object(route.os, "execvp") as execute, \
+                redirect_stderr(io.StringIO()):
+            code = route.cmd_exec("sonnet", ["claude"])
+        self.assertEqual(code, 2)
+        execute.assert_not_called()
+
+    def test_cmd_exec_marker_records_exec_mode_and_note(self):
+        snapshot = {"generated": time.time(), "accounts": [_claude_row("a")]}
+        destination = os.path.join(self.temp.name, "marker.json")
+        environ = {k: v for k, v in os.environ.items()
+                   if k not in ("CLAUDE_CONFIG_DIR", "CODEX_HOME")}
+        environ["HEADROOM_LAUNCH_MARKER"] = destination
+        with mock.patch.dict(os.environ, environ, clear=True), \
+                mock.patch.object(route, "pick", return_value=self.account), \
+                mock.patch.object(route, "ensure_fresh_snapshot",
+                                  return_value=snapshot), \
+                mock.patch.object(route, "block_reason", return_value=None), \
+                mock.patch.object(route, "cooldowns", return_value={}), \
+                mock.patch.object(route.os, "execvp") as execute, \
+                redirect_stderr(io.StringIO()):
+            route.cmd_exec("sonnet", ["claude"],
+                           launch_note="auto-handoff disabled: --settings")
+        execute.assert_called_once()
+        with open(destination, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.assertEqual(payload["mode"], "exec")
+        self.assertEqual(payload["note"], "auto-handoff disabled: --settings")
 
 
 if __name__ == "__main__":

@@ -15,9 +15,15 @@ Config shape (schema_version 1)::
       "accounts": [
         {"name": "personal", "provider": "claude",
          "home": "~/.claude",  # or ~/.headroom/homes/personal
-         "expected_email": "me@example.com"}   # optional but recommended
+         "expected_email": "me@example.com",  # optional but recommended
+         "reserved": false}    # optional: true = tracked but never routed to
       ]
     }
+
+A ``reserved: true`` account is still collected and shown on the dashboard,
+but routing never selects it: not for `pick`/`env`, not as a launch account,
+and never as a rotation/handoff target. Use it for a slot that belongs to
+some other workflow and must not be consumed by automatic rotation.
 """
 import contextlib
 import fcntl
@@ -104,6 +110,10 @@ def validate(config):
                 and not isinstance(account["shared_desktop"], bool):
             raise RegistryError(
                 f"account {name}: shared_desktop must be true or false")
+        if "reserved" in account \
+                and not isinstance(account["reserved"], bool):
+            raise RegistryError(
+                f"account {name}: reserved must be true or false")
         if "handoff_group" in account:
             group = account["handoff_group"]
             if not isinstance(group, str) or not group.strip():

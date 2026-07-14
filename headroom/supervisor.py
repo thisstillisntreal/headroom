@@ -1352,11 +1352,23 @@ def _initial_account(family):
     snapshot = route.ensure_fresh_snapshot()
     if snapshot is None:
         return None
+    rows = route._snapshot_accounts(snapshot)
+    # an explicitly exported CLAUDE_CONFIG_DIR that names a registered account
+    # is the caller's routing decision — supervise THAT account instead of
+    # re-routing, as long as it still has proven headroom (rotation off it on
+    # a cap is unchanged)
+    pinned = route.env_pinned_account(family)
+    if pinned is not None:
+        reason = route.block_reason(pinned, family, rows.get(pinned["name"]),
+                                    route.cooldowns(), time.time())
+        if reason is None:
+            return pinned
+        print(f"[headroom] env-selected account {pinned['name']} is not "
+              f"routable ({reason}) — picking another", file=sys.stderr)
     account = next((candidate for candidate, reason in route.candidates(
         family, snapshot) if reason is None), None)
     if account is None:
         return None
-    rows = route._snapshot_accounts(snapshot)
     reason = route.block_reason(account, family, rows.get(account["name"]),
                                 route.cooldowns(), time.time())
     return account if reason is None else None
@@ -1370,4 +1382,10 @@ def cmd_claude(family, args):
         return 2
     print(f"[headroom] {family} -> {account['name']} ({account['home']})",
           file=sys.stderr)
+    # the wrapper handshake is written BEFORE the spawn: past this point any
+    # launch failure would equally afflict a bare `claude` (see
+    # route.write_launch_marker); a marker that cannot be written aborts here,
+    # while nothing has started yet
+    if not route.write_launch_marker("supervised", account):
+        return 2
     return Supervisor(family, args, account).run()

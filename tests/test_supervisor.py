@@ -860,7 +860,8 @@ class CliWiring(unittest.TestCase):
                 mock.patch("headroom.route.cmd_exec", return_value=17) as execute:
             result = __main__._dispatch(["claude", "--model", "sonnet"])
         self.assertEqual(result, 17)
-        execute.assert_called_once_with("sonnet", ["claude", "--model", "sonnet"])
+        execute.assert_called_once_with("sonnet", ["claude", "--model", "sonnet"],
+                                        launch_note="auto-handoff not enabled")
 
     def test_override_is_stripped_and_selects_supervisor(self):
         tty = mock.Mock()
@@ -881,7 +882,8 @@ class CliWiring(unittest.TestCase):
             result = __main__._dispatch(
                 ["claude", "--headroom-no-auto-handoff", "--model", "sonnet"])
         self.assertEqual(result, 19)
-        execute.assert_called_once_with("sonnet", ["claude", "--model", "sonnet"])
+        execute.assert_called_once_with("sonnet", ["claude", "--model", "sonnet"],
+                                        launch_note="auto-handoff not enabled")
 
     def test_equals_format_flags_are_incompatible_with_supervision(self):
         self.assertEqual(supervisor.incompatible_args(
@@ -920,6 +922,54 @@ class CliWiring(unittest.TestCase):
             "user-supplied --settings")
         self.assertEqual(supervisor.incompatible_args(
             ["--brief", "--", "--settings=prompt-text"]), "")
+
+    def test_initial_account_prefers_env_pinned_slot(self):
+        pinned = {"name": "pinned", "provider": "claude", "home": "/tmp/p"}
+        other = {"name": "other", "provider": "claude", "home": "/tmp/o"}
+        snapshot = {"generated": time.time(), "accounts": []}
+        with mock.patch.object(route, "ensure_fresh_snapshot",
+                               return_value=snapshot), \
+                mock.patch.object(route, "env_pinned_account",
+                                  return_value=pinned), \
+                mock.patch.object(route, "block_reason", return_value=None), \
+                mock.patch.object(route, "cooldowns", return_value={}), \
+                mock.patch.object(route, "candidates",
+                                  return_value=[(other, None)]) as ranked:
+            chosen = supervisor._initial_account("sonnet")
+        self.assertEqual(chosen["name"], "pinned")
+        ranked.assert_not_called()  # the caller's routing was consumed
+
+    def test_initial_account_repicks_when_pinned_slot_is_blocked(self):
+        pinned = {"name": "pinned", "provider": "claude", "home": "/tmp/p"}
+        other = {"name": "other", "provider": "claude", "home": "/tmp/o"}
+        snapshot = {"generated": time.time(), "accounts": []}
+        errors = io.StringIO()
+        with mock.patch.object(route, "ensure_fresh_snapshot",
+                               return_value=snapshot), \
+                mock.patch.object(route, "env_pinned_account",
+                                  return_value=pinned), \
+                mock.patch.object(route, "block_reason",
+                                  side_effect=["at limit", None]), \
+                mock.patch.object(route, "cooldowns", return_value={}), \
+                mock.patch.object(route, "candidates",
+                                  return_value=[(other, None)]), \
+                redirect_stderr(errors):
+            chosen = supervisor._initial_account("sonnet")
+        self.assertEqual(chosen["name"], "other")
+        self.assertIn("not routable", errors.getvalue())
+
+    def test_cmd_claude_aborts_before_spawn_when_marker_unwritable(self):
+        account = {"name": "a", "provider": "claude", "home": "/tmp/a"}
+        with mock.patch.object(supervisor, "_initial_account",
+                               return_value=account), \
+                mock.patch.object(route, "write_launch_marker",
+                                  return_value=False) as marker, \
+                mock.patch.object(supervisor, "Supervisor") as spawned, \
+                redirect_stderr(io.StringIO()):
+            code = supervisor.cmd_claude("sonnet", [])
+        self.assertEqual(code, 2)
+        marker.assert_called_once_with("supervised", account)
+        spawned.assert_not_called()  # nothing started before the refusal
 
     def test_statusline_distinguishes_armed_supervisor(self):
         snapshot = {"accounts": [{"name": "source", "provider": "claude",

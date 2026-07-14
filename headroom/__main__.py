@@ -129,6 +129,7 @@ def _dispatch(argv):
                   f"{registry.family_provider(fam)} model ({model}) — use "
                   f"`headroom {registry.family_provider(fam)}`", file=sys.stderr)
             return 2
+        launch_note = ""
         if command == "claude":
             if auto_flag and no_auto_flag:
                 print("headroom: auto-handoff overrides are mutually exclusive",
@@ -145,7 +146,10 @@ def _dispatch(argv):
                 why = incompatible or "stdin/stdout/stderr are not all TTYs"
                 print(f"[headroom] auto-handoff disabled for this run: {why}",
                       file=sys.stderr)
-        return route.cmd_exec(fam, [command] + args)
+                launch_note = f"auto-handoff disabled: {why}"
+            else:
+                launch_note = "auto-handoff not enabled"
+        return route.cmd_exec(fam, [command] + args, launch_note=launch_note)
     if command == "run":
         from . import route
         if not args or "--" not in args or args.index("--") == len(args) - 1:

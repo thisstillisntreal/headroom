@@ -282,6 +282,36 @@ Now any account with less than 10% headroom left on its 5-hour, weekly, or
 model-scoped window is skipped in favour of a fuller one (and `headroom status`
 shows exactly why). `0` (the default) keeps today's use-to-the-limit behaviour.
 
+## Reserving an account (tracked, never routed)
+
+Mark an account `"reserved": true` in `~/.headroom/config.json` to keep it on
+the dashboard and in `headroom collect` while excluding it from routing
+entirely: it is never returned by `pick`/`env`, never launched by
+`headroom claude`/`codex`, and never chosen as a rotation or handoff target.
+Use it for a login that belongs to some other workflow (a desktop app, a
+teammate, a pinned service) that automatic rotation must not consume.
+
+## Driving headroom from scripts
+
+Two affordances make headroom composable with launch wrappers:
+
+- **An exported config home is honoured.** If `CLAUDE_CONFIG_DIR` (or
+  `CODEX_HOME`) is already set and names a registered account, that account is
+  used as the *initial* slot instead of being re-routed — your wrapper's
+  routing decision is consumed, not overridden. Rotation off it when it caps
+  is unchanged, and if it has no proven headroom, headroom says so on stderr
+  and picks another.
+- **`HEADROOM_LAUNCH_MARKER=/abs/path.json`** makes `headroom claude`/`codex`
+  write a small JSON file at the moment routing commits to launching the CLI
+  (`{"mode": "supervised"|"exec", "account": ..., "note": ...}`; `note`
+  carries the auto-handoff downgrade reason when supervision was requested
+  but unavailable). The marker is written *before* the CLI starts, so a
+  wrapper that wants a bare-CLI fallback can treat "headroom exited with no
+  marker" as "the CLI never started" and launch directly — without ever
+  racing a CLI headroom did start. If a requested marker cannot be written,
+  headroom refuses to launch (exit 2) rather than leave the handshake
+  dangling.
+
 ## Running across multiple machines
 
 Usage is read **per account, from the provider's side** — so it's correct no

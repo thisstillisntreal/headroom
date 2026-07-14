@@ -226,6 +226,10 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     caller honours the setting."""
     if reserve is None:
         reserve = registry.reserve_percent()
+    if account.get("reserved") is True:
+        # tracked but never routed to (config: reserved) — this must gate every
+        # selection path, so it lives here rather than in the candidate listing
+        return "reserved (config): tracked but never auto-routed"
     if account.get("provider") == "codex" and not CODEX_ROUTING_ENABLED:
         return ("Codex routing disabled (HEADROOM_CODEX_ROUTING=0) — "
                 "headroom refuses to route Codex work")
@@ -437,6 +441,71 @@ def pick(fam):
 
 def env_key(account):
     return "CLAUDE_CONFIG_DIR" if account["provider"] == "claude" else "CODEX_HOME"
+
+
+def env_pinned_account(fam):
+    """The registered account an explicitly exported CLAUDE_CONFIG_DIR /
+    CODEX_HOME names, or None.
+
+    When a caller has already routed (exported the config home) before
+    invoking headroom, that choice is respected as the *initial* account
+    instead of being silently overridden by a second routing decision —
+    rotation off it still happens normally once it caps. Only an explicit
+    environment value counts; the provider default home is not a pin."""
+    try:
+        provider = registry.family_provider(fam)
+        value = os.environ.get(
+            "CLAUDE_CONFIG_DIR" if provider == "claude" else "CODEX_HOME", "")
+        value = value.strip()
+        if not value:
+            return None
+        home = os.path.realpath(os.path.expanduser(value))
+        for account in registry.ordered_for(fam):
+            if os.path.realpath(account["home"]) == home:
+                return account
+    except registry.RegistryError:
+        return None
+    return None
+
+
+def write_launch_marker(mode, account, note=""):
+    """Launch handshake for wrapper scripts: when HEADROOM_LAUNCH_MARKER names
+    an absolute path, write a small JSON there at the moment routing has
+    COMMITTED to launching the CLI (account selected, spawn imminent — any
+    failure past this point would equally afflict a bare launch).
+
+    A wrapper that wants a bare-CLI fallback can therefore treat "headroom
+    exited and no marker exists" as "the CLI was never started" and launch
+    it directly, without racing a CLI that headroom did start.
+
+    Returns True when no marker was requested or the write succeeded. When a
+    marker WAS requested and cannot be written, returns False — the caller
+    must abort the launch, because proceeding would leave the wrapper's
+    handshake dangling and a fallback CLI could race the real one."""
+    destination = os.environ.get("HEADROOM_LAUNCH_MARKER", "").strip()
+    if not destination:
+        return True
+    if not os.path.isabs(destination):
+        print("[headroom] HEADROOM_LAUNCH_MARKER must be an absolute path — "
+              "refusing to launch without the requested handshake",
+              file=sys.stderr)
+        return False
+    payload = {
+        "mode": mode,  # "supervised" | "exec"
+        "account": account["name"] if account else "",
+        "home": account["home"] if account else "",
+        "note": note,
+        "pid": os.getpid(),
+        "written_at": time.time(),
+    }
+    try:
+        paths.write_json_atomic(destination, payload, mode=0o600)
+    except OSError as error:
+        print(f"[headroom] cannot write HEADROOM_LAUNCH_MARKER "
+              f"({destination}): {error} — refusing to launch without the "
+              f"requested handshake", file=sys.stderr)
+        return False
+    return True
 
 
 def mark(name, fam, epoch=None, account_wide=False, window="5h"):
@@ -685,8 +754,12 @@ def _codex_run_failure(fam, account, snapshot, process):
     return process.returncode
 
 
-def cmd_exec(fam, command):
-    """Interactive launch: pick once, exec with the account's env, no capture."""
+def cmd_exec(fam, command, launch_note=""):
+    """Interactive launch: pick once, exec with the account's env, no capture.
+
+    `launch_note` is recorded in the launch marker (see write_launch_marker)
+    so a wrapper can see WHY this run is exec-only (e.g. an auto-handoff
+    downgrade reason); it changes nothing else."""
     if registry.family_provider(fam) == "codex" and not CODEX_ROUTING_ENABLED:
         # fail-closed: disabled routing means headroom REFUSES to launch a
         # Codex seat it cannot prove capacity for — never "just take the
@@ -696,30 +769,49 @@ def cmd_exec(fam, command):
               "run codex directly with CODEX_HOME=<home> to bypass headroom",
               file=sys.stderr)
         return 2
-    account = pick(fam)
+    # an explicitly exported config home that names a registered account is
+    # the caller's routing decision — consume it instead of re-routing, as
+    # long as it still has proven headroom
+    account = None
+    pinned = env_pinned_account(fam)
+    if pinned is not None:
+        snapshot = ensure_fresh_snapshot()
+        reason = block_reason(pinned, fam,
+                              _snapshot_accounts(snapshot).get(pinned["name"]),
+                              cooldowns(), time.time())
+        if reason is None:
+            account = pinned
+        else:
+            print(f"[headroom] env-selected account {pinned['name']} is not "
+                  f"routable ({reason}) — picking another", file=sys.stderr)
     if account is None:
-        print(f"[headroom] no account for '{fam}' has proven headroom; "
-              f"try `headroom status {fam}`", file=sys.stderr)
-        return 2
-    # final recheck against the latest cooldown ledger right before exec, in
-    # case another process cooled this account since pick(). NEVER fall back to
-    # a held account — re-pick, and refuse to launch if nothing is eligible.
-    # (For codex this recheck also re-derives the local binding + refresh
-    # lineage via block_reason's _codex_gate — the targeted pre-launch check.)
-    snapshot = ensure_fresh_snapshot()
-    row = _snapshot_accounts(snapshot).get(account["name"])
-    if block_reason(account, fam, row, cooldowns(), time.time()):
         account = pick(fam)
         if account is None:
-            print("[headroom] the chosen account was just held and no "
-                  "other has proven headroom — try again in a moment",
-                  file=sys.stderr)
+            print(f"[headroom] no account for '{fam}' has proven headroom; "
+                  f"try `headroom status {fam}`", file=sys.stderr)
             return 2
+        # final recheck against the latest cooldown ledger right before exec,
+        # in case another process cooled this account since pick(). NEVER fall
+        # back to a held account — re-pick, and refuse to launch if nothing is
+        # eligible. (For codex this recheck also re-derives the local binding
+        # + refresh lineage via block_reason's _codex_gate — the targeted
+        # pre-launch check.)
+        snapshot = ensure_fresh_snapshot()
+        row = _snapshot_accounts(snapshot).get(account["name"])
+        if block_reason(account, fam, row, cooldowns(), time.time()):
+            account = pick(fam)
+            if account is None:
+                print("[headroom] the chosen account was just held and no "
+                      "other has proven headroom — try again in a moment",
+                      file=sys.stderr)
+                return 2
     for var in collector.AUTH_OVERRIDE_VARS:
         os.environ.pop(var, None)
     os.environ[env_key(account)] = account["home"]
     print(f"[headroom] {fam} -> {account['name']} ({account['home']})",
           file=sys.stderr)
+    if not write_launch_marker("exec", account, note=launch_note):
+        return 2
     try:
         os.execvp(command[0], command)
     except FileNotFoundError:
