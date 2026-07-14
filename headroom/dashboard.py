@@ -46,6 +46,16 @@ class RefreshResult:
     reason: object = None
 
 
+def _within_freshness_window(snapshot, clock=time.time):
+    """True while the snapshot's age is inside the widget freshness window
+    (the same bound the projection itself demotes on)."""
+    generated = RefreshGate._generated(snapshot)
+    if generated is None:
+        return False
+    age = clock() - generated
+    return 0 <= age <= widget.SNAPSHOT_MAX_AGE
+
+
 class RefreshGate:
     """Single-flight collection with success TTL and bounded failure retry."""
 
@@ -299,12 +309,20 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                 content_type = "application/json"
             self._send_body(503, content_type, body)
             return
-        reason = result.reason if result.refresh_failed else None
+        # A failed refresh ATTEMPT must not invalidate a snapshot that is
+        # still inside the widget freshness window: age-based demotion
+        # (the projection's freshness state) already handles genuinely old
+        # data, and forcing noncurrent here flashed the whole fleet to
+        # "held, never promoted to live" whenever an inline refresh raced
+        # another collector holding the collect lock (2026-07-14).
+        stale_failed = result.refresh_failed \
+            and not _within_freshness_window(result.snapshot)
+        reason = result.reason if stale_failed else None
         try:
             if route == "/usage.json":
                 value = display_snapshot(
                     result.snapshot, force_noncurrent_reason=reason)
-                if result.refresh_failed:
+                if stale_failed:
                     value["refresh_failed"] = True
                 body = json.dumps(value, allow_nan=False,
                                   separators=(",", ":")).encode("utf-8")
