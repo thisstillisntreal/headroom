@@ -643,26 +643,306 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertIn("Open dashboard | href=http://127.0.0.1:%d/" % port,
                       body)
 
-    def test_compact_mode_retains_state_disclosure(self):
-        # Compact may hide decorative chrome, but every element that
-        # discloses state (snapshot age, per-account state, error/warning
-        # statusline) must never be display:none'd in compact mode.
+    def test_widget_mode_retains_state_disclosure(self):
+        # The widget view may hide the full dashboard, but every element
+        # that discloses state (snapshot freshness, per-account badge,
+        # banner, note) must be part of every popover render, and the
+        # small/medium layouts must keep the freshness dot + live line.
         template = self.template_text()
-        compact_css = template.split("/* Compact mode", 1)[1].split("</style>", 1)[0]
-        self.assertIn("body.is-compact .acct-identity, body.is-compact .state",
-                      compact_css)
-        disclosure = (".snapshot", ".state", ".acct-identity", ".account",
-                      ".statusline.is-error", ".fleet-bars")
-        for rule in compact_css.split("}"):
-            if "display: none" not in rule:
-                continue
-            selectors = rule.split("{", 1)[0]
-            for selector in disclosure:
-                self.assertNotIn(selector + " ", selectors + " ")
-            # the non-error statusline may hide; the error form must not
-            self.assertNotIn(".statusline.is-error", selectors)
-            self.assertNotIn(".snapshot", selectors)
-        self.assertIn('class="statusline" id="status"', template)
+        popup = template.split("function hrPopMarkup(v){", 1)[1].split(
+            "\n}", 1)[0]
+        account_row = template.split("function hrAcctMarkup(a){", 1)[1].split(
+            "\n}", 1)[0]
+        for disclosure in ("hr-fresh", "hr-banner", "hrDotMarkup(v)"):
+            self.assertIn(disclosure, popup)
+        for disclosure in ("hr-badge", "hr-note"):
+            self.assertIn(disclosure, account_row)
+        self.assertIn("hr-dot", template.split("function hrDotMarkup(v){",
+                                               1)[1].split("\n}", 1)[0])
+        for builder in ("hrSmallMarkup", "hrMediumMarkup"):
+            body = template.split("function " + builder + "(v){", 1)[1].split(
+                "\n}", 1)[0]
+            self.assertIn("hr-liveline", body)
+        self.assertIn("hrDotMarkup(v)", template.split(
+            "function hrSmallMarkup(v){", 1)[1].split("\n}", 1)[0])
+        # offline fetch failures must render, not blank the page
+        self.assertIn("function hrOfflineView(){", template)
+        self.assertIn("feed unreachable", template)
+
+
+class LiquidGlassWidgetTests(unittest.TestCase):
+    """The /widget liquid-glass surface: five glass themes, real-feed wiring,
+    size variants, and the fail-closed projection→class mapping."""
+
+    THEMES = ("minimal", "chrome", "paper", "terminal")
+    GLASS_TOKENS = ("--glass:", "--glass-2:", "--glass-line:", "--glass-hi:",
+                    "--sep:", "--row-hov:", "--shadow-pop:", "--wall:",
+                    "--pop-radius:", "--widget-radius:", "--cell-bg:",
+                    "--cell-glow:", "--unknown:")
+
+    @staticmethod
+    def template_text():
+        with open(dashboard.TEMPLATE) as handle:
+            return handle.read()
+
+    @classmethod
+    def widget_css(cls):
+        return cls.template_text().split(
+            "/* ==================================================== widget: liquid glass",
+            1)[1].split("</style>", 1)[0]
+
+    @classmethod
+    def widget_script(cls):
+        return cls.template_text().split(
+            "/* =================================================== liquid-glass widget */",
+            1)[1].split(
+            "/* --------------------------------------------------------------- theme */",
+            1)[0]
+
+    @classmethod
+    def js_function(cls, name):
+        return cls.widget_script().split("function " + name + "(", 1)[1].split(
+            "\n}", 1)[0]
+
+    @staticmethod
+    def fleet(mutate=None):
+        """A design-shaped fleet: five Claude accounts plus two Codex ones."""
+        accounts = [
+            usage_account("domanski-ai", used5=0, used7=4),
+            usage_account("system", used5=8, used7=26),
+            usage_account("ops", used5=22, used7=39),
+            usage_account("gmail", used5=36, used7=42),
+            usage_account("mzansiedge", used5=45, used7=51),
+            usage_account("codex-domanski-ai", used5=29, used7=15,
+                          provider="codex"),
+            usage_account("codex-gmail", used5=17, used7=23,
+                          provider="codex"),
+        ]
+        if mutate:
+            mutate(accounts)
+        return accounts
+
+    # ----------------------------------------------------------- theming
+    def test_widget_css_defines_all_five_glass_themes(self):
+        css = self.widget_css()
+        base = css.split(".hr {", 1)[1].split("}", 1)[0]
+        for token in self.GLASS_TOKENS:
+            self.assertIn(token, base)
+        for theme in self.THEMES:
+            with self.subTest(theme=theme):
+                block = css.split('.hr[data-theme="%s"] {' % theme,
+                                  1)[1].split("}", 1)[0]
+                self.assertIn("--glass:", block)
+                self.assertIn("--wall:", block)
+                self.assertIn("--glass-line:", block)
+
+    def test_widget_surfaces_use_liquid_glass_tokens(self):
+        css = self.widget_css()
+        glass = css.split(".hr-glass {", 1)[1].split("}", 1)[0]
+        self.assertIn("background: var(--glass)", glass)
+        self.assertIn("backdrop-filter: blur(38px) saturate(170%)", glass)
+        self.assertIn("-webkit-backdrop-filter: blur(38px) saturate(170%)",
+                      glass)
+        self.assertIn("border: 1px solid var(--glass-line)", glass)
+        self.assertIn("var(--shadow-pop), var(--glass-hi)", glass)
+        # popover and both desktop widgets all sit on the same glass class
+        script = self.widget_script()
+        for surface in ('"hr-pop hr-glass', '"hr-card small hr-glass',
+                        '"hr-card medium hr-glass'):
+            self.assertIn(surface, script)
+
+    # --------------------------------------------------- routing / sizes
+    def test_widget_mode_detection_and_size_variants(self):
+        template = self.template_text()
+        self.assertIn('==="/widget"', template)
+        self.assertIn('params.get("compact")==="1"', template)
+        self.assertIn('hrInit(params.get("size"))', template)
+        init = self.js_function("hrInit")
+        self.assertIn('size==="small"||size==="medium"', init)
+
+    def test_small_and_medium_layout_dimensions(self):
+        css = self.widget_css()
+        self.assertIn(".hr-card.small { width: 206px; height: 206px; }", css)
+        self.assertIn(".hr-card.medium { width: 438px; height: 206px;", css)
+        self.assertIn("grid-template-columns: 140px 1fr", css)
+        self.assertIn("grid-template-columns: 110px 1fr 36px", css)
+        # popover window meters keep the design geometry: 24px | cells | 46px
+        self.assertIn("grid-template-columns: 24px 1fr 46px", css)
+        self.assertIn(".hr-pop { width: 352px;", css)
+
+    # ------------------------------------------------------- data wiring
+    def test_widget_script_reads_only_widget_feed_and_no_emails(self):
+        script = self.widget_script()
+        self.assertIn('const HR_URL="widget.json";', script)
+        self.assertIn('data.schema!=="headroom_widget@1"', script)
+        self.assertNotIn(".email", script)
+        self.assertNotIn("usage.json", script)
+        # field-derived text is escaped on the way into the DOM
+        for escaped in ("esc(a.name)", "esc(a.provider)", "esc(a.note)",
+                        "esc(v.freshText)", "esc(v.banner.text)"):
+            self.assertIn(escaped, script)
+
+    def test_widget_script_consumes_projection_fields(self):
+        script = self.widget_script()
+        value = widget.project(usage_snapshot(*self.fleet()), NOW)
+        for field in ("freshness", "age_seconds", "fullest_5h_left_percent",
+                      "current_accounts", "total_accounts", "left_percent",
+                      "last_observed_left_percent", "resets_at",
+                      "observed_at"):
+            with self.subTest(field=field):
+                self.assertIn(field, script)
+                self.assertIn(field, json.dumps(value))
+
+    # -------------------------------------------------- fail-closed core
+    def test_widget_tone_ramp_matches_projection_thresholds(self):
+        body = self.js_function("hrTone")
+        self.assertIn('left==null?"unknown":left<=10?"red":left<=30?'
+                      '"orange":left<=50?"yellow":"green"', body)
+        # pinned to the Python projection's ramp, not a lookalike
+        samples = {5: "red", 10: "red", 11: "orange", 30: "orange",
+                   31: "yellow", 50: "yellow", 51: "green", 100: "green"}
+        for left, expected in samples.items():
+            self.assertEqual(widget._dashboard_tone(left), expected)
+        self.assertEqual(widget._dashboard_tone(None), "unknown")
+
+    def test_fail_closed_only_current_windows_get_live_tone(self):
+        body = self.js_function("hrWindow")
+        # exactly one branch may produce a live tone, and it requires a
+        # current state AND a finite live reading
+        self.assertEqual(body.count("hrTone("), 1)
+        self.assertIn('if(st==="current"&&live!=null)', body)
+        live_guard, rest = body.split('if(st==="current"&&live!=null)', 1)
+        self.assertNotIn("hrTone(", live_guard)
+        limited, stale = rest.split('if(st==="limited")', 1)[1].split(
+            'if(st==="stale"&&last!=null)', 1)
+        self.assertIn('tone:"red"', limited)
+        self.assertIn('tone:"unknown"', stale)
+        self.assertIn('value:"n/a"', stale)          # held fallback
+        # the noncurrent branches never call the live tone ramp
+        self.assertNotIn("hrTone(", limited)
+        self.assertNotIn("hrTone(", stale)
+
+    def test_demoted_and_offline_renders_are_grey_only(self):
+        script = self.widget_script()
+        demote = self.js_function("hrDemoteWindow")
+        self.assertNotIn("hrTone(", demote)
+        self.assertNotIn('"green"', demote)
+        self.assertEqual(demote.count('tone:"unknown"'), 2)
+        # a noncurrent feed demotes every account before rendering
+        account = self.js_function("hrAccount")
+        self.assertIn('if(demote&&st!=="held")st="stale";', account)
+        view = self.js_function("hrView")
+        self.assertIn('const demote=offline||fresh.state!=="current";', view)
+        # the client re-checks snapshot age between polls, failing closed
+        fresh = self.js_function("hrFreshness")
+        self.assertIn("age>SNAPSHOT_MAX_AGE", fresh)
+        self.assertIn('state="stale"', fresh)
+        self.assertIn("feed unreachable", script)
+
+    def test_badges_map_projection_states_to_design_labels(self):
+        account = self.js_function("hrAccount")
+        self.assertIn('{label:"CURRENT",tone:"green",dot:true}', account)
+        self.assertIn('{label:"AT LIMIT",tone:"red",dot:true}', account)
+        self.assertIn('{label:"STALE",tone:"dim",dot:false}', account)
+        self.assertIn('{label:"WAITING",tone:"dim",dot:false}', account)
+        # held accounts show no meters (WAITING has no windows to trust)
+        self.assertIn('hasW:st!=="held"', account)
+        css = self.widget_css()
+        for grey in (".hr-tone-unknown", ".hr-tone-dim"):
+            block = css.split(grey + " {", 1)[1].split("}", 1)[0]
+            self.assertIn("--wtone: var(--unknown)", block)
+            self.assertIn("color: var(--ink-3)", block)
+            self.assertNotIn("--green", block)
+
+    def test_banner_covers_limit_hit_and_stale_feed(self):
+        view = self.js_function("hrView")
+        self.assertIn("hit its 5h cap", view)
+        self.assertIn("never promoted to live", view)
+        self.assertIn('Math.floor(SNAPSHOT_MAX_AGE/60)+"m', view)
+        self.assertIn('cls:"is-red"', view)
+        self.assertIn('cls:"is-orange"', view)
+
+    def test_pulse_only_for_current_freshness(self):
+        template = self.template_text()
+        self.assertIn('v.fresh.state==="current"&&!v.offline?" is-live":""',
+                      template)
+        motion = template.split(".hr-dot.is-live::after { animation:", 1)
+        self.assertEqual(len(motion), 2)
+        media = template.rsplit("@media (prefers-reduced-motion: no-preference)",
+                                1)[1]
+        self.assertIn(".hr-dot.is-live::after { animation: hr-pulse", media)
+
+    def test_footer_keeps_refresh_dashboard_link_and_sentinel(self):
+        popup = self.js_function("hrPopMarkup")
+        self.assertIn("↻ Refresh", popup)
+        self.assertIn("Open Fleet Dashboard", popup)
+        self.assertIn('href="/" target="_blank" rel="noopener"', popup)
+        self.assertIn('"hr-schema">\'+esc(v.schema)', popup)
+        view = self.js_function("hrView")
+        self.assertIn('"headroom_widget@1"', view)
+
+    # ------------------------------------------------ self-containment
+    def test_widget_page_is_self_contained_no_external_hosts(self):
+        template = self.template_text()
+        self.assertNotIn("<script src", template)
+        self.assertNotIn("<link", template)
+        self.assertNotIn("@import", template)
+        self.assertNotIn("url(http", template)
+        allowed = "https://github.com/domanski-ai/headroom"
+        for url in re.findall(r"https?://[^\s\"'<>)]+", template):
+            self.assertEqual(url, allowed)
+
+    # --------------------------------- the three design scenarios, real data
+    def test_cruising_scenario_projects_live_meters(self):
+        value = widget.project(usage_snapshot(*self.fleet()), NOW)
+        self.assertEqual(value["freshness"]["state"], "current")
+        self.assertEqual(value["headline"], {
+            "current_accounts": 7, "total_accounts": 7,
+            "fullest_5h_left_percent": 100.0})
+        providers = {row["provider"] for row in value["accounts"]}
+        self.assertEqual(providers, {"claude", "codex"})
+        for row in value["accounts"]:
+            self.assertEqual(row["state"], "current")
+            for window in row["windows"].values():
+                self.assertEqual(window["state"], "current")
+                self.assertTrue(math.isfinite(window["left_percent"]))
+
+    def test_limit_hit_scenario_projects_red_cap_and_live_7d(self):
+        def cap_first(accounts):
+            accounts[0]["windows"]["5h"]["used_percent"] = 100
+        value = widget.project(usage_snapshot(*self.fleet(cap_first)), NOW)
+        capped = value["accounts"][0]
+        self.assertEqual(capped["state"], "limited")
+        self.assertEqual(capped["windows"]["5h"]["state"], "limited")
+        self.assertIsNone(capped["windows"]["5h"]["left_percent"])
+        self.assertEqual(capped["windows"]["5h"][
+            "last_observed_left_percent"], 0.0)
+        # the design keeps the 7d meter live on a 5h-capped account
+        self.assertEqual(capped["windows"]["7d"]["state"], "current")
+        self.assertTrue(math.isfinite(capped["windows"]["7d"]["left_percent"]))
+        # headline never counts the capped tank
+        self.assertEqual(value["headline"]["current_accounts"], 6)
+        self.assertEqual(value["headline"]["fullest_5h_left_percent"], 92.0)
+
+    def test_feed_stale_scenario_holds_all_readings_grey(self):
+        value = widget.project(usage_snapshot(
+            *self.fleet(), generated=NOW - widget.SNAPSHOT_MAX_AGE - 100),
+            NOW)
+        self.assertEqual(value["freshness"]["state"], "stale")
+        self.assertEqual(value["freshness"]["reason"], "snapshot_expired")
+        self.assertIsNone(value["headline"]["fullest_5h_left_percent"])
+        self.assertEqual(value["headline"]["current_accounts"], 0)
+        for row in value["accounts"]:
+            self.assertEqual(row["state"], "stale")
+            for window in row["windows"].values():
+                self.assertEqual(window["state"], "stale")
+                self.assertIsNone(window["left_percent"])
+                self.assertTrue(math.isfinite(
+                    window["last_observed_left_percent"]))
+        # every state the projection can emit has an explicit JS branch
+        script = self.widget_script()
+        for state in ("current", "limited", "stale", "held"):
+            self.assertIn('"%s"' % state, script)
 
 
 class SwiftBarPluginTests(unittest.TestCase):
