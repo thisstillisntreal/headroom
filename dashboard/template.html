@@ -378,9 +378,9 @@ function windowView(a,key){
   /* fork fix: a "limited" account can still have "current" windows with valid
      readings (e.g. 5h is fine but 7d hit the cap). Show left_percent for any
      current window, not only when the account-level state is also current. */
-  const current=state==="current"&&w&&Number.isFinite(w.left_percent);
-  const left=current?w.left_percent:(limited&&w&&Number.isFinite(w.last_observed_left_percent)?w.last_observed_left_percent:null);
-  const safeTone=current&&["green","yellow","orange","red"].includes(w.tone)?w.tone:(limited?"red":"unknown");
+  const currentWin=state==="current"&&w;
+  const left=currentWin&&Number.isFinite(w.left_percent)?w.left_percent:(limited&&w&&Number.isFinite(w.last_observed_left_percent)?w.last_observed_left_percent:null);
+  const safeTone=currentWin&&["green","yellow","orange","red"].includes(w.tone)?w.tone:(limited?"red":"unknown");
   return{state:state,left:left,tone:safeTone};
 }
 function isCurrent(a){return displayState(a)==="current";}
