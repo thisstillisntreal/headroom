@@ -207,12 +207,14 @@ class WidgetContractTests(unittest.TestCase):
                           "eligible", "reserve", "recommendation"):
             self.assertNotIn(forbidden, rendered)
 
-    def test_headline_uses_fullest_current_5h_tank(self):
+    def test_headline_carries_fullest_and_average_batteries(self):
         value = widget.project(usage_snapshot(
             usage_account("a", used5=55), usage_account("b", used5=8)), NOW)
         self.assertEqual(value["headline"], {
             "current_accounts": 2, "total_accounts": 2,
-            "fullest_5h_left_percent": 92.0})
+            "fullest_5h_left_percent": 92.0,
+            "avg_5h_left_percent": 68.5,   # (45 + 92) / 2
+            "avg_7d_left_percent": 60.0})
 
     def test_headline_excludes_noncurrent_candidates(self):
         value = widget.project(usage_snapshot(
@@ -222,6 +224,11 @@ class WidgetContractTests(unittest.TestCase):
             usage_account("held", used5=0, ok=False, trust_state="held")), NOW)
         self.assertEqual(value["headline"]["current_accounts"], 1)
         self.assertEqual(value["headline"]["fullest_5h_left_percent"], 40.0)
+        # the average counts LIVE windows only: current 40 left + limited 0;
+        # stale/held never move it. The limited account's 7d window is still
+        # current, so both 7d readings (60) count.
+        self.assertEqual(value["headline"]["avg_5h_left_percent"], 20.0)
+        self.assertEqual(value["headline"]["avg_7d_left_percent"], 60.0)
 
     def test_headline_without_candidate_is_gray_placeholder(self):
         value = usage_snapshot(usage_account(stale=True, used5=1))
@@ -261,10 +268,10 @@ class WidgetRendererTests(unittest.TestCase):
         self.assertRegex(rendered, r"(?m)^--5h: .* · resets ")
         self.assertRegex(rendered, r"(?m)^--7d: .* · resets ")
 
-    def test_swiftbar_renderer_labels_fullest_tank(self):
+    def test_swiftbar_renderer_labels_avg_battery(self):
         rendered = widget.render_swiftbar(
             usage_snapshot(usage_account()), NOW)
-        self.assertIn("Fullest tank: 80% (current 5h)", rendered)
+        self.assertIn("Avg battery: 5h 80% · 7d 60%", rendered)
 
     def test_swiftbar_renderer_emits_no_execution_directives(self):
         account = usage_account("safe")
@@ -924,7 +931,9 @@ class LiquidGlassWidgetTests(unittest.TestCase):
         self.assertEqual(value["freshness"]["state"], "current")
         self.assertEqual(value["headline"], {
             "current_accounts": 7, "total_accounts": 7,
-            "fullest_5h_left_percent": 100.0})
+            "fullest_5h_left_percent": 100.0,
+            "avg_5h_left_percent": 77.6,
+            "avg_7d_left_percent": 71.4})
         providers = {row["provider"] for row in value["accounts"]}
         self.assertEqual(providers, {"claude", "codex"})
         for row in value["accounts"]:
@@ -1249,7 +1258,8 @@ class UbersichtWidgetTests(unittest.TestCase):
                 has_small = self.battery(name)["has_small"]
                 cruising = views["cruising"]
                 self.assertEqual(cruising["fresh"], "current")
-                self.assertEqual(cruising["value"], "82%")
+                # headline = fleet average battery: (82 + 47) / 2 -> 65%
+                self.assertEqual(cruising["value"], "65%")
                 self.assertEqual(cruising["tone"], "green")
                 self.assertEqual(cruising["line"], "2/2 accounts live")
                 self.assertTrue(cruising["accepted"])
@@ -1257,8 +1267,9 @@ class UbersichtWidgetTests(unittest.TestCase):
                 if has_small:
                     self.assertTrue(cruising["dot_live"])
                 limit = views["limit_hit"]
-                self.assertEqual(limit["value"], "82%")
-                self.assertEqual(limit["tone"], "green")
+                # (82 + an honest 0 for the capped window) / 2 -> 41%
+                self.assertEqual(limit["value"], "41%")
+                self.assertEqual(limit["tone"], "yellow")
                 self.assertEqual(limit["line"], "1/2 live · 1 at limit")
                 # design intent: a really-capped window stays RED, not dimmed
                 self.assertTrue(limit["red_tone"])

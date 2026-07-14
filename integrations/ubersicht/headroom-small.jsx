@@ -123,19 +123,22 @@ function hrView(data) {
   const demote = fresh.state !== "current";
   const rawAccounts = Array.isArray(data.accounts) ? data.accounts : [];
   const accts = rawAccounts.map((a) => hrAccount(a, demote));
-  /* headline: never trust the feed's number — derive the fullest tank from an
-     account whose state AND 5h window are BOTH current with a finite reading;
-     if none qualifies the headline is the held "—", whatever the feed claims. */
+  /* headline: never trust the feed's numbers — derive the fleet's average 5h
+     battery from LIVE windows only: a current 5h window contributes its
+     left_percent, a limited one an honest 0; held/stale windows never move
+     the average, whatever the feed claims. */
   const total = accts.length;
   const cur = demote ? 0 : accts.filter((a) => a.state === "current").length;
-  let fullest = null;
+  const pool = [];
   if (!demote) rawAccounts.forEach((a) => {
-    const w = (a && a.windows && a.windows["5h"]) || {};
-    const l = a && a.state === "current" && w.state === "current" ? hrPct(w.left_percent) : null;
-    if (l != null && (fullest == null || l > fullest)) fullest = l;
+    if (!a || a.state === "held" || a.state === "stale") return;
+    const w = (a.windows && a.windows["5h"]) || {};
+    if (w.state === "current") { const l = hrPct(w.left_percent); if (l != null) pool.push(l); }
+    else if (w.state === "limited") pool.push(0);
   });
-  const hl = fullest != null
-    ? { value: Math.round(fullest) + "%", tone: hrTone(fullest) }
+  const avg = pool.length ? pool.reduce((s, x) => s + x, 0) / pool.length : null;
+  const hl = avg != null
+    ? { value: Math.round(avg) + "%", tone: hrTone(avg) }
     : { value: "—", tone: "dim" };
   const limited = accts.filter((a) => a.state === "limited");
   const liveLine = fresh.state === "stale" ? "0/" + total + " live · feed stale"
@@ -221,7 +224,7 @@ function hrSmallMarkup(v) {
   return '<div class="hr-card small hr-glass glowable">' +
     '<div class="hr-chead"><span class="hr-mark">hr</span><span class="hr-brand">headroom</span><span class="hr-sp"></span>' + hrDotMarkup(v) + '</div>' +
     '<div class="hr-cmid"><div class="hr-cval hr-tone-' + v.hl.tone + '">' + esc(v.hl.value) + '</div>' +
-      '<div class="hr-clabel">Fullest 5h tank</div></div>' +
+      '<div class="hr-clabel">Avg 5h battery</div></div>' +
     '<div><div class="hr-bars" role="img" aria-label="session headroom per account">' + hrBarsMarkup(v) + '</div>' +
       '<div class="hr-liveline">' + esc(v.liveLine) + "</div></div></div>";
 }

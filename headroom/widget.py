@@ -125,20 +125,40 @@ def _demote_windows(windows, state):
 
 
 def calculate_headline(accounts):
-    """Return the one glanceable metric: fullest current 5h tank."""
+    """The glanceable metrics: fullest current 5h tank (legacy) plus the
+    fleet's average battery per window.
+
+    An average includes every LIVE reading: a current window contributes its
+    left_percent and a limited window contributes 0 (an exhausted tank is an
+    honest 0%, not a missing reading). Held/stale windows never count —
+    unverified data must not move an average."""
     current = sum(1 for account in accounts
                   if account.get("state") == "current")
     candidates = []
+    averages = {"5h": [], "7d": []}
     for account in accounts:
-        window = (account.get("windows") or {}).get("5h") or {}
+        windows = account.get("windows") or {}
+        window = windows.get("5h") or {}
         value = window.get("left_percent")
         if (account.get("state") == "current"
                 and window.get("state") == "current" and _number(value)):
             candidates.append(float(value))
+        for key, pool in averages.items():
+            entry = windows.get(key) or {}
+            state = entry.get("state")
+            left = entry.get("left_percent")
+            if state == "current" and _number(left):
+                pool.append(float(left))
+            elif state == "limited":
+                pool.append(0.0)
+    def _avg(pool):
+        return round(sum(pool) / len(pool), 1) if pool else None
     return {
         "current_accounts": current,
         "total_accounts": len(accounts),
         "fullest_5h_left_percent": max(candidates) if candidates else None,
+        "avg_5h_left_percent": _avg(averages["5h"]),
+        "avg_7d_left_percent": _avg(averages["7d"]),
     }
 
 
@@ -312,16 +332,20 @@ def render_swiftbar(value, evaluated_at=None, force_noncurrent_reason=None,
         ])
     widget = project(value, evaluated_at, force_noncurrent_reason)
     summary = widget["headline"]
-    fullest = summary["fullest_5h_left_percent"]
-    shown = _display_percent(fullest)
+    avg5 = summary["avg_5h_left_percent"]
+    avg7 = summary["avg_7d_left_percent"]
+    shown = _display_percent(avg5)
     suffix = shown + "%" if shown != "--" else shown
+    shown7 = _display_percent(avg7)
+    suffix7 = shown7 + "%" if shown7 != "--" else shown7
     lines = [TEXT_SCHEMA,
              "hr {}/{} · {} | color={}".format(
                  summary["current_accounts"], summary["total_accounts"],
-                 suffix, _tone(fullest)),
+                 suffix, _tone(avg5)),
              "---",
-             "Fullest tank: {} (current 5h) | color=gray".format(
-                 suffix if shown != "--" else "unavailable")]
+             "Avg battery: 5h {} · 7d {} | color=gray".format(
+                 suffix if shown != "--" else "unavailable",
+                 suffix7 if shown7 != "--" else "unavailable")]
     for account in widget["accounts"]:
         name = sanitize(account.get("name"))
         provider = sanitize(account.get("provider"))

@@ -381,6 +381,9 @@ body.is-widget .shell { display: none; }
   repeating-linear-gradient(90deg, transparent 0, transparent calc(10% - 1px),
     var(--glass-line) calc(10% - 1px), var(--glass-line) 10%); }
 .hr-hlsub { margin-top: 7px; font: 500 9px var(--mono); color: var(--ink-2); }
+.hr-hlrow.is-7 { margin-top: 10px; }
+.hr-hlval-7 { font: 700 19px/1 var(--mono); letter-spacing: -.02em; }
+.hr-hlbar.is-7 { height: 6px; margin-top: 6px; }
 
 /* popover: banner (limit hit / stale feed) */
 .hr-banner { padding: 8px 15px; font: 600 9px/1.5 var(--mono);
@@ -904,25 +907,32 @@ function hrView(data,offline){
   const demote=offline||fresh.state!=="current";
   const rawAccounts=Array.isArray(data.accounts)?data.accounts:[];
   const accts=rawAccounts.map(a=>hrAccount(a,demote));
-  /* headline: never trust the feed's number — derive the fullest tank from an
-     account whose state AND 5h window are BOTH current with a finite reading;
-     if none qualifies the headline is the held "—", whatever the feed claims. */
+  /* headline: never trust the feed's numbers — derive the fleet's average
+     battery per window from LIVE readings only: a current window contributes
+     its left_percent, a limited window contributes an honest 0, held/stale
+     windows never move an average, whatever the feed claims. */
   const total=accts.length;
   const cur=demote?0:accts.filter(a=>a.state==="current").length;
-  let owner=null;
+  const pool5=[],pool7=[];
   if(!demote)rawAccounts.forEach(a=>{
-    const w=a&&a.windows&&a.windows["5h"]||{};
-    const l=a&&a.state==="current"&&w.state==="current"?hrPct(w.left_percent):null;
-    if(l!=null&&(owner==null||l>owner.left))owner={left:l,name:a.name,resets:w.resets_at};});
-  const fullest=owner?owner.left:null;
-  const hl=fullest!=null
-    ?{value:Math.round(fullest)+"%",tone:hrTone(fullest),fill:fullest,
-      sub:owner?esc(owner.name)+" · "+esc(untilReset(owner.resets)):"fullest current 5h window"}
+    if(!a||a.state==="held"||a.state==="stale")return;
+    [["5h",pool5],["7d",pool7]].forEach(pair=>{
+      const w=a.windows&&a.windows[pair[0]]||{};
+      if(w.state==="current"){const l=hrPct(w.left_percent);if(l!=null)pair[1].push(l);}
+      else if(w.state==="limited")pair[1].push(0);
+    });});
+  const hrAvg=pool=>pool.length?pool.reduce((s,x)=>s+x,0)/pool.length:null;
+  const avg5=hrAvg(pool5),avg7=hrAvg(pool7);
+  const hl=avg5!=null
+    ?{value:Math.round(avg5)+"%",tone:hrTone(avg5),fill:avg5,sub:""}
     :{value:"—",tone:"dim",fill:0,
-      sub:offline?"no current 5h reading — feed unreachable"
-        :fresh.state==="stale"?"no current 5h reading — snapshot expired"
-        :fresh.state==="held"?"no current 5h reading — snapshot held"
-        :"no current 5h reading"};
+      sub:offline?"no live readings — feed unreachable"
+        :fresh.state==="stale"?"no live readings — snapshot expired"
+        :fresh.state==="held"?"no live readings — snapshot held"
+        :"no live readings"};
+  const hl7=avg7!=null
+    ?{value:Math.round(avg7)+"%",tone:hrTone(avg7),fill:avg7}
+    :{value:"—",tone:"dim",fill:0};
   const limited=accts.filter(a=>a.state==="limited");
   let banner=null;
   if(offline)banner={cls:"is-orange",text:"usage feed unreachable — readings held, never promoted to live"};
@@ -940,13 +950,14 @@ function hrView(data,offline){
     :(fresh.age!=null?"snapshot "+hrAgeText(fresh.age):"snapshot age unknown")+(fresh.state==="stale"?" · stale":"");
   const dotc=(!offline&&fresh.state==="current")?"var(--green)"
     :(!offline&&fresh.state==="stale")?"var(--orange)":"var(--unknown)";
-  return{offline:offline,fresh:fresh,accts:accts,hl:hl,banner:banner,
+  return{offline:offline,fresh:fresh,accts:accts,hl:hl,hl7:hl7,banner:banner,
          liveLine:liveLine,freshText:freshText,dotc:dotc,
          schema:typeof data.schema==="string"?data.schema:"headroom_widget@1"};
 }
 function hrOfflineView(){
   return{offline:true,fresh:{state:"held",age:null},accts:[],
     hl:{value:"—",tone:"dim",fill:0,sub:"usage feed unavailable — nothing promoted to live"},
+    hl7:{value:"—",tone:"dim",fill:0},
     banner:{cls:"is-orange",text:"usage feed unavailable — no snapshot to show, nothing promoted to live"},
     liveLine:"feed unreachable",freshText:"feed unreachable",dotc:"var(--unknown)",
     schema:"headroom_widget@1"};
@@ -985,9 +996,12 @@ function hrPopMarkup(v){
     '<div class="hr-phead"><span class="hr-appname">headroom</span><span class="hr-sp"></span>'+
       hrDotMarkup(v)+'<span class="hr-fresh">'+esc(v.freshText)+"</span></div>"+
     '<div class="hr-hl"><div class="hr-hlrow"><span class="hr-hlval hr-tone-'+v.hl.tone+'">'+esc(v.hl.value)+'</span>'+
-      '<span class="hr-hllabel">Fullest 5h tank</span></div>'+
-      '<div class="hr-hlbar" role="img" aria-label="fullest 5h tank"><span class="hr-hlfill hr-tone-'+v.hl.tone+'" style="--fill:'+v.hl.fill+'%"></span><span class="hr-hlticks"></span></div>'+
-      '<div class="hr-hlsub">'+v.hl.sub+"</div></div>"+banner+
+      '<span class="hr-hllabel">Avg 5h battery</span></div>'+
+      '<div class="hr-hlbar" role="img" aria-label="average 5h battery"><span class="hr-hlfill hr-tone-'+v.hl.tone+'" style="--fill:'+v.hl.fill+'%"></span><span class="hr-hlticks"></span></div>'+
+      '<div class="hr-hlrow is-7"><span class="hr-hlval-7 hr-tone-'+v.hl7.tone+'">'+esc(v.hl7.value)+'</span>'+
+      '<span class="hr-hllabel">Avg 7d battery</span></div>'+
+      '<div class="hr-hlbar is-7" role="img" aria-label="average 7d battery"><span class="hr-hlfill hr-tone-'+v.hl7.tone+'" style="--fill:'+v.hl7.fill+'%"></span><span class="hr-hlticks"></span></div>'+
+      '<div class="hr-hlsub">'+(v.hl.sub||esc(v.liveLine))+"</div></div>"+banner+
     '<div class="hr-accts">'+accts+"</div>"+
     '<div class="hr-foot">'+
       '<button type="button" class="hr-btn" id="hr-refresh">↻ Refresh</button>'+
@@ -1007,7 +1021,7 @@ function hrSmallMarkup(v){
   return '<div class="hr-card small hr-glass glowable">'+
     '<div class="hr-chead"><span class="hr-mark">hr</span><span class="hr-brand">headroom</span><span class="hr-sp"></span>'+hrDotMarkup(v)+'</div>'+
     '<div class="hr-cmid"><div class="hr-cval hr-tone-'+v.hl.tone+'">'+esc(v.hl.value)+'</div>'+
-      '<div class="hr-clabel">Fullest 5h tank</div></div>'+
+      '<div class="hr-clabel">Avg 5h battery</div></div>'+
     '<div><div class="hr-bars" role="img" aria-label="session headroom per account">'+hrBarsMarkup(v)+'</div>'+
       '<div class="hr-liveline">'+esc(v.liveLine)+"</div></div></div>";
 }
@@ -1025,7 +1039,7 @@ function hrMediumMarkup(v){
   return '<div class="hr-card medium hr-glass glowable">'+
     '<div class="hr-mleft"><div class="hr-chead"><span class="hr-mark">hr</span><span class="hr-brand">headroom</span></div>'+
     '<div class="hr-cmid"><div class="hr-cval hr-tone-'+v.hl.tone+'">'+esc(v.hl.value)+'</div>'+
-      '<div class="hr-clabel">Fullest 5h tank</div></div>'+
+      '<div class="hr-clabel">Avg 5h battery</div></div>'+
     '<div class="hr-liveline">'+esc(v.liveLine)+'</div></div>'+
     '<div class="hr-mcol">'+rows+"</div></div>";
 }
