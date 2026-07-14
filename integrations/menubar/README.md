@@ -9,8 +9,9 @@ click-down panel — the thing a SwiftBar text menu can't do.
   Windows). Clicking anywhere else hides it, like a native popover.
 - **Right-click**: menu with **Refresh**, **Open in Browser**, **Quit**.
 - The tray icon is a little head that fills like a battery: the level is the
-  fleet's fullest *current* 5h tank, redrawn every minute from the server's
-  `/widget.json` (a dash means no current reading).
+  fleet's average 5h battery (current windows contribute their level, limited
+  ones an honest 0), redrawn every minute from the server's `/widget.json`
+  (a dash means no live reading).
 - No Dock icon / app-switcher entry on macOS (accessory activation policy +
   `LSUIElement`).
 - If the widget server can't be reached (tunnel down), the panel shows a

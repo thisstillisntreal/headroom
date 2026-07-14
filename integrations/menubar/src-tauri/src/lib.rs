@@ -67,6 +67,9 @@ struct AppState {
     last_probe_ok: AtomicBool,
     /// When the panel was last hidden because it lost focus.
     last_auto_hide: Mutex<Option<Instant>>,
+    /// The tray icon's screen rect from its most recent event, for anchoring
+    /// the panel like a native menu-bar popover (right edges aligned).
+    last_tray_rect: Mutex<Option<tauri::Rect>>,
 }
 
 /// Resolve the widget URL from the environment, falling back to the default
@@ -267,31 +270,40 @@ fn fetch_loopback(url: &Url, path: &str) -> Option<String> {
     Some(body.to_owned())
 }
 
-/// The fleet's fullest CURRENT 5h tank as a fraction, from `/widget.json`
-/// on the widget server. `None` when the server is unreachable, the feed is
-/// malformed, or no account has a current 5h reading.
-fn fetch_fullest_tank(widget: &Url) -> Option<f32> {
+/// The fleet's average 5h battery as a fraction, from `/widget.json` on the
+/// widget server: a current 5h window contributes its left_percent, a
+/// limited one contributes an honest 0, held/stale windows never count.
+/// `None` when the server is unreachable, the feed is malformed, or no
+/// window has a live reading.
+fn fetch_avg_battery(widget: &Url) -> Option<f32> {
     let body = fetch_loopback(widget, "/widget.json")?;
     let value: serde_json::Value = serde_json::from_str(&body).ok()?;
     let accounts = value.get("accounts")?.as_array()?;
-    let mut best: Option<f64> = None;
+    let mut sum = 0.0f64;
+    let mut count = 0u32;
     for account in accounts {
         let window = account.get("windows").and_then(|w| w.get("5h"));
         let state = window.and_then(|w| w.get("state")).and_then(|s| s.as_str());
-        if state != Some("current") {
-            continue;
-        }
-        let Some(left) = window
-            .and_then(|w| w.get("left_percent"))
-            .and_then(|v| v.as_f64())
-        else {
-            continue;
-        };
-        if (0.0..=100.0).contains(&left) && best.is_none_or(|b| left > b) {
-            best = Some(left);
+        match state {
+            Some("current") => {
+                let Some(left) = window
+                    .and_then(|w| w.get("left_percent"))
+                    .and_then(|v| v.as_f64())
+                else {
+                    continue;
+                };
+                if (0.0..=100.0).contains(&left) {
+                    sum += left;
+                    count += 1;
+                }
+            }
+            Some("limited") => {
+                count += 1; // an exhausted tank is an honest 0, not missing
+            }
+            _ => {}
         }
     }
-    best.map(|left| (left / 100.0) as f32)
+    (count > 0).then(|| (sum / f64::from(count) / 100.0) as f32)
 }
 
 /// Redraw the tray icon (and tooltip) from the latest feed reading.
@@ -299,13 +311,13 @@ fn update_tray_icon(app: &AppHandle) {
     let Some(tray) = app.tray_by_id("headroom-tray") else {
         return;
     };
-    let level = fetch_fullest_tank(&app.state::<AppState>().widget_url);
+    let level = fetch_avg_battery(&app.state::<AppState>().widget_url);
     let (rgba, width, height) = icon::tray_icon_rgba(level);
     let _ = tray.set_icon(Some(Image::new_owned(rgba, width, height)));
     let _ = tray.set_icon_as_template(true);
     let tooltip = match level {
-        Some(level) => format!("headroom — fullest 5h tank {}%", (level * 100.0).round()),
-        None => "headroom — no current reading".to_owned(),
+        Some(level) => format!("headroom — avg 5h battery {}%", (level * 100.0).round()),
+        None => "headroom — no live reading".to_owned(),
     };
     let _ = tray.set_tooltip(Some(tooltip));
 }
@@ -395,14 +407,58 @@ fn toggle_popover(app: &AppHandle) {
             return;
         }
     }
-    // Anchor at the tray icon, then show immediately; the probe + navigation
-    // happens in the background. `TrayCenter` is platform-aware inside the
-    // positioner (macOS: below the menu-bar icon; Windows: above the tray),
-    // and `_constrained` keeps the panel on-screen at monitor edges.
-    let _ = window.move_window_constrained(Position::TrayCenter);
+    // Anchor like a native menu-bar popover: the panel's RIGHT edge aligns
+    // with the icon's right edge, directly below the menu bar (macOS). The
+    // positioner presets can't express right-edge alignment, so the panel is
+    // placed from the tray rect captured off the click event; when no rect
+    // has been seen yet (or off macOS), fall back to the platform-aware
+    // constrained TrayCenter.
+    if !anchor_below_tray(&window, app) {
+        let _ = window.move_window_constrained(Position::TrayCenter);
+    }
     let _ = window.show();
     let _ = window.set_focus();
     sync_view_async(app, false);
+}
+
+/// Place the panel right-edge-aligned under the tray icon (macOS layout).
+/// Returns false when the placement can't be computed.
+fn anchor_below_tray(window: &WebviewWindow, app: &AppHandle) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    let rect = *app
+        .state::<AppState>()
+        .last_tray_rect
+        .lock()
+        .expect("last_tray_rect poisoned");
+    let Some(rect) = rect else {
+        return false;
+    };
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let to_logical_pos = |value: tauri::Position| match value {
+        tauri::Position::Physical(p) => (f64::from(p.x) / scale, f64::from(p.y) / scale),
+        tauri::Position::Logical(p) => (p.x, p.y),
+    };
+    let to_logical_size = |value: tauri::Size| match value {
+        tauri::Size::Physical(s) => (f64::from(s.width) / scale, f64::from(s.height) / scale),
+        tauri::Size::Logical(s) => (s.width, s.height),
+    };
+    let (tray_x, tray_y) = to_logical_pos(rect.position);
+    let (tray_w, tray_h) = to_logical_size(rect.size);
+    let mut x = tray_x + tray_w - WINDOW_WIDTH; // right edges aligned
+    let y = tray_y + tray_h + 5.0; // just below the menu bar
+    if let Ok(Some(monitor)) = window.current_monitor() {
+        let monitor_scale = monitor.scale_factor();
+        let position = monitor.position().to_logical::<f64>(monitor_scale);
+        let size = monitor.size().to_logical::<f64>(monitor_scale);
+        x = x
+            .max(position.x + 8.0)
+            .min(position.x + size.width - WINDOW_WIDTH - 8.0);
+    }
+    window
+        .set_position(tauri::LogicalPosition::new(x, y))
+        .is_ok()
 }
 
 /// Build the hidden popover webview window.
@@ -417,9 +473,15 @@ fn build_popover(app: &AppHandle, widget_url: &Url) -> tauri::Result<WebviewWind
     // real material, like a system popover. Elsewhere the page keeps its
     // bundled wall.
     let embed_css = if cfg!(target_os = "macos") {
+        // Full-bleed: the window IS the panel (native material + system
+        // rounded corners), so the card loses its own border, radius, and
+        // shadow and stretches edge to edge — no seam, no double chrome.
         "html,body{background:transparent !important}\
-         .hr{background:transparent !important;padding:10px}\
-         .hr-wall{display:none !important}"
+         .hr{background:transparent !important;padding:0 !important}\
+         .hr-wall{display:none !important}\
+         .hr-pop{width:100% !important;max-width:none !important;\
+                 min-height:100vh;border:0 !important;\
+                 border-radius:0 !important;box-shadow:none !important}"
     } else {
         ""
     };
@@ -528,6 +590,17 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .on_tray_icon_event(|tray, event| {
             // Feed the positioner so Position::Tray* knows where the icon is.
             tauri_plugin_positioner::on_tray_event(tray.app_handle(), &event);
+            // Remember the icon's rect for native-style right-edge anchoring.
+            if let TrayIconEvent::Click { rect, .. }
+            | TrayIconEvent::Enter { rect, .. }
+            | TrayIconEvent::Move { rect, .. } = &event
+            {
+                let app = tray.app_handle();
+                *app.state::<AppState>()
+                    .last_tray_rect
+                    .lock()
+                    .expect("last_tray_rect poisoned") = Some(*rect);
+            }
             if let TrayIconEvent::Click {
                 button: MouseButton::Left,
                 button_state: MouseButtonState::Up,
@@ -551,6 +624,7 @@ pub fn run() {
             widget_loaded: AtomicBool::new(false),
             last_probe_ok: AtomicBool::new(false),
             last_auto_hide: Mutex::new(None),
+            last_tray_rect: Mutex::new(None),
         })
         .setup(move |app| {
             // Menu-bar app: no Dock icon / app switcher entry on macOS.

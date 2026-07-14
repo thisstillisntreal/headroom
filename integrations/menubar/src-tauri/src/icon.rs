@@ -1,8 +1,8 @@
 //! Runtime-drawn tray icon: a little head that is also a battery.
 //!
 //! The head silhouette (a minifig-style head with a stud on top) doubles as
-//! the battery body; the fill level rising inside it is the fleet's fullest
-//! CURRENT 5h tank — literally "how much headroom is left". Drawn as a
+//! the battery body; the fill level rising inside it is the fleet's average
+//! 5h battery — literally "how much headroom is left". Drawn as a
 //! template image (black shapes + alpha; macOS recolors template icons for
 //! menu-bar appearance, Windows gets white shapes so the taskbar stays
 //! legible). `None` means "no current reading" and renders the empty head
