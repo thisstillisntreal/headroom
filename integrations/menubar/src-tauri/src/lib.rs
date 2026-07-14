@@ -54,6 +54,8 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(3);
 const REOPEN_SUPPRESS: Duration = Duration::from_millis(350);
 /// How often the tray icon's battery level re-reads the widget feed.
 const ICON_INTERVAL: Duration = Duration::from_secs(60);
+/// Corner radius of the popover panel (matches the system panels).
+const PANEL_RADIUS: f64 = 14.0;
 /// Reject a runaway feed body instead of buffering it (the real feed is a
 /// few KB).
 const FEED_MAX_BYTES: usize = 256 * 1024;
@@ -369,14 +371,16 @@ fn sync_view(app: &AppHandle, force: bool) {
         if force || !loaded {
             let _ = window.navigate(state.widget_url.clone());
         }
-    } else if loaded || force {
-        // Widget gone (tunnel down): swap to the bundled fallback.
-        state.widget_loaded.store(false, Ordering::SeqCst);
+    } else if !loaded {
+        // Nothing ever loaded (cold start with the tunnel down): the bundled
+        // fallback with its tunnel hint is the only useful view.
         let _ = window.navigate(fallback_page_url());
-    } else {
-        // Fallback already showing; just refresh its status line.
         push_fallback_status(&window, "down");
     }
+    // else: the widget page is already showing — KEEP IT. The page demotes
+    // itself (staleness banner, held tones) through its own failed feed
+    // fetches; a probe failure must never replace live content with an
+    // error page (the last known reading beats a dead-end screen).
 }
 
 /// Run `sync_view` on a worker thread so tray/menu handlers never block the
@@ -473,19 +477,19 @@ fn build_popover(app: &AppHandle, widget_url: &Url) -> tauri::Result<WebviewWind
     // real material, like a system popover. Elsewhere the page keeps its
     // bundled wall.
     let embed_css = if cfg!(target_os = "macos") {
-        // The panel IS the page: a near-opaque dark rounded card painted
-        // over a fully transparent window. macOS derives the real window
-        // shadow from the content's alpha shape, so the corners are clean
-        // (no native-material layer whose square corners can peek out) and
-        // there is no border chrome at all. backdrop-filter must stay off —
-        // it forces an opaque layer in WKWebView and blacks out the window.
+        // NO painted background at all: the system's own popover material
+        // (applied at the window layer, dark-themed, corner-masked via the
+        // contentView layer) IS the panel — the page only overlays bars and
+        // text, exactly like the built-in menu-bar dropdowns.
+        // backdrop-filter must stay off — it forces an opaque layer in
+        // WKWebView and blacks out window transparency.
         "html,body{background:transparent !important}\
          .hr{background:transparent !important;padding:0 !important}\
          .hr-wall{display:none !important}\
          .hr-pop{width:100% !important;max-width:none !important;\
                  min-height:100vh;border:0 !important;\
-                 border-radius:14px !important;overflow:hidden;\
-                 background:rgba(16,20,29,.96) !important;\
+                 border-radius:0 !important;\
+                 background:transparent !important;\
                  backdrop-filter:none !important;\
                  -webkit-backdrop-filter:none !important;\
                  box-shadow:none !important}"
@@ -522,6 +526,18 @@ fn build_popover(app: &AppHandle, widget_url: &Url) -> tauri::Result<WebviewWind
         .skip_taskbar(true)
         .visible_on_all_workspaces(true)
         .transparent(true);
+    // The system's adaptive popover material provides the standard dropdown
+    // background; the page paints nothing over it. Dark theme pinned so the
+    // widget's ink colors always sit on the dark material.
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .theme(Some(tauri::Theme::Dark))
+        .effects(tauri::utils::config::WindowEffectsConfig {
+            effects: vec![tauri::utils::WindowEffect::Popover],
+            state: Some(tauri::utils::WindowEffectState::Active),
+            radius: Some(PANEL_RADIUS),
+            color: None,
+        });
     builder
         .initialization_script(&init_script)
         .on_navigation(move |url| {
@@ -551,6 +567,38 @@ fn build_popover(app: &AppHandle, widget_url: &Url) -> tauri::Result<WebviewWind
             }
         })
         .build()
+}
+
+/// Round the window's contentView layer so EVERYTHING in the window — the
+/// native material AND the webview above it — is clipped to the popover
+/// radius. (The effect view's own radius cannot clip the webview, which is
+/// why CSS-only rounding left square material corners peeking out.) The
+/// window shadow is recomputed from the clipped shape.
+#[cfg(target_os = "macos")]
+fn round_window_corners(window: &WebviewWindow, radius: f64) {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyObject, Bool};
+    let Ok(ns_window) = window.ns_window() else {
+        return;
+    };
+    let ns_window = ns_window.cast::<AnyObject>();
+    if ns_window.is_null() {
+        return;
+    }
+    unsafe {
+        let content_view: *mut AnyObject = msg_send![ns_window, contentView];
+        if content_view.is_null() {
+            return;
+        }
+        let _: () = msg_send![content_view, setWantsLayer: Bool::YES];
+        let layer: *mut AnyObject = msg_send![content_view, layer];
+        if layer.is_null() {
+            return;
+        }
+        let _: () = msg_send![layer, setCornerRadius: radius];
+        let _: () = msg_send![layer, setMasksToBounds: Bool::YES];
+        let _: () = msg_send![ns_window, invalidateShadow];
+    }
 }
 
 /// Build the tray icon with its context menu.
@@ -631,6 +679,10 @@ pub fn run() {
 
             let handle = app.handle();
             build_popover(handle, &widget_url)?;
+            #[cfg(target_os = "macos")]
+            if let Some(window) = handle.get_webview_window(WINDOW_LABEL) {
+                round_window_corners(&window, PANEL_RADIUS);
+            }
             build_tray(handle)?;
 
             // Warm the view so the first click shows content instantly, then

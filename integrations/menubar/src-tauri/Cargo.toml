@@ -21,6 +21,9 @@ open = "=5.4.0"
 serde_json = "=1.0.145"
 tiny-skia = "=0.11.4"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "=0.6.4"
+
 [profile.release]
 codegen-units = 1
 lto = true
