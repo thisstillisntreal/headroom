@@ -354,6 +354,87 @@ def codex_bin():
     return shutil.which("codex")
 
 
+# App-server failure classification: an explicit auth rejection or protocol
+# error must NEVER degrade into routable local telemetry, so each outcome gets
+# a distinct hold code. Only genuine transport unavailability (older Codex CLI
+# without the app-server) may fall back — and that fallback is display-only.
+CODEX_AUTH_ERROR_MARKERS = (
+    "token_invalidated", "refresh token", "invalid_grant", "unauthorized",
+    "401", "login required", "not logged in", "re-login", "login again",
+)
+CODEX_THROTTLE_MARKERS = (
+    "429", "too many requests", "overload", "throttl",
+    "temporarily unavailable", "503", "retry later",
+)
+CODEX_DASHBOARD_FALLBACK_CODES = frozenset({
+    "codex_app_server_spawn_failed",
+    "codex_app_server_no_response",
+    "codex_app_server_io_failed",
+})
+CODEX_HOLD_NOTES = {
+    "codex_auth_rejected": (
+        "codex login rejected by the provider (token invalidated / re-login "
+        "required); run `headroom connect` to re-login"),
+    "codex_capacity_unavailable": (
+        "API-key Codex seat — no subscription capacity windows; excluded "
+        "from capacity routing"),
+    "codex_capacity_unrecognized": (
+        "codex app-server returned no recognized 5h/7d capacity window; "
+        "seat held"),
+    "codex_app_server_protocol_error": (
+        "codex app-server protocol/malformed response; seat held (no local "
+        "fallback after a protocol error)"),
+}
+
+
+def classify_codex_appserver_error(error):
+    """Map a JSON-RPC error object from the codex app-server to a distinct
+    hold code instead of collapsing everything into one generic error:
+    explicit auth rejection, overload/throttle, or protocol error."""
+    try:
+        text = json.dumps(error).lower()
+    except (TypeError, ValueError):
+        text = str(error).lower()
+    if any(marker in text for marker in CODEX_AUTH_ERROR_MARKERS):
+        return "codex_auth_rejected"
+    if any(marker in text for marker in CODEX_THROTTLE_MARKERS):
+        return "codex_app_server_throttled"
+    return "codex_app_server_protocol_error"
+
+
+def codex_auth_mode(auth):
+    """How this Codex home authenticates: "chatgpt" (subscription login with
+    usage windows), "apikey" (metered — no subscription capacity to route),
+    or "unknown"."""
+    explicit = str(auth.get("auth_mode")
+                   or auth.get("preferred_auth_method") or "").lower()
+    if explicit == "apikey":
+        return "apikey"
+    if (auth.get("tokens") or {}).get("id_token"):
+        return "chatgpt"
+    if auth.get("OPENAI_API_KEY"):
+        return "apikey"
+    return "unknown"
+
+
+def codex_lineage_digest(home):
+    """NON-SECRET digest of the refresh-token lineage bound in this slot.
+
+    The access token rotates on every normal refresh (credential_digest
+    changes), but the refresh token only changes on a fresh login — so a
+    lineage change distinguishes "same login, refreshed" from "someone
+    re-logged this account in somewhere" (e.g. Paul's Mac desktop re-login
+    invalidating a server seat). None when unreadable (callers hold)."""
+    try:
+        tokens = (paths.load_json(os.path.join(home, "auth.json"))
+                  or {}).get("tokens") or {}
+        refresh = tokens.get("refresh_token")
+        return hashlib.sha256(refresh.encode()).hexdigest()[:16] \
+            if refresh else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
 def codex_app_server_read(home, timeout=None):
     """Live Codex read via the codex app-server (`codex app-server`, JSON-RPC
     over stdio): real-time rate limits AND the network-verified logged-in
@@ -424,8 +505,11 @@ def codex_app_server_read(home, timeout=None):
     if 2 not in responses or 3 not in responses:
         raise IdentityBindingError("codex_app_server_no_response")
     for request_id in (2, 3):
-        if responses[request_id].get("error"):
-            raise IdentityBindingError("codex_app_server_error")
+        error = responses[request_id].get("error")
+        if error:
+            # classify: auth rejection / throttle / protocol — each holds
+            # distinctly and NONE may fall back to routable local telemetry
+            raise IdentityBindingError(classify_codex_appserver_error(error))
     account = (responses[3].get("result") or {}).get("account") or {}
     result = responses[2].get("result") or {}
     # Prefer the canonical per-limit bucket; fall back to the backward-compatible
@@ -465,8 +549,12 @@ def codex_windows(rate_limits, now):
 
     Windows are bucketed by their real ``windowDurationMins`` rather than their
     primary/secondary position. A standard window the server left out is treated
-    as fully available (0% used): a binding window is always reported, so an
-    absent one means that limit is not currently a constraint."""
+    as fully available (0% used) ONLY when at least one recognized 300-min or
+    10080-min bucket was reported: a binding window is always reported, so an
+    absent one next to a present one means that limit is not currently a
+    constraint. An EMPTY or unrecognized payload proves nothing — synthesizing
+    0%/0% from it would fabricate routable capacity, so it raises and the seat
+    is HELD."""
     buckets = {}
     for slot in ("primary", "secondary"):
         mapped = codex_window(rate_limits.get(slot), now)
@@ -475,6 +563,8 @@ def codex_windows(rate_limits, now):
         key = CODEX_STANDARD_WINDOWS.get(mapped.get("window_minutes"))
         if key and key not in buckets:
             buckets[key] = mapped
+    if not buckets:
+        raise IdentityBindingError("codex_capacity_unrecognized")
 
     def available(minutes):
         return {"used_percent": 0.0, "resets_at": None,
@@ -494,6 +584,9 @@ def codex_live(home, expected_email=None, now=None):
     auth = paths.load_json(os.path.join(home, "auth.json"))
     if not auth:
         raise IdentityBindingError("codex_auth_missing")
+    if codex_auth_mode(auth) == "apikey":
+        # metered API-key seat: no subscription windows exist to route on
+        raise IdentityBindingError("codex_capacity_unavailable")
     claims = decode_jwt_payload((auth.get("tokens") or {}).get("id_token"))
     provider_claims = claims.get("https://api.openai.com/auth") or {}
     account_id = provider_claims.get("chatgpt_account_id") or claims.get("sub")
@@ -513,6 +606,10 @@ def codex_live(home, expected_email=None, now=None):
         "method": "codex_app_server",
         "plan_type": plan_type,
         "credential_digest": credential_digest("codex", home),
+        # lineage distinguishes a normal access refresh from a fresh login
+        # (a fresh login elsewhere invalidates this seat — see route gate)
+        "lineage_digest": codex_lineage_digest(home),
+        "auth_mode": "chatgpt",
         "subscription": codex_subscription(provider_claims),
     }
     windows = codex_windows(rate_limits, now)
@@ -774,6 +871,20 @@ def empty_backoff():
     return {"schema_version": 1, "providers": {}}
 
 
+def persist_provider_backoff(provider, retry_at):
+    """Record a provider-wide backoff (e.g. codex app-server overload seen at
+    launch time) in the shared ledger honoured by later collect runs. Backoff
+    is a PROVIDER state, never an account cooldown. No secrets stored."""
+    document = paths.load_json(paths.backoff_path())
+    if not isinstance(document, dict):
+        document = empty_backoff()
+    document.setdefault("providers", {})[provider] = {
+        "retry_at": int(retry_at),
+        "observed_at": min(int(time.time()), int(retry_at) - 1),
+    }
+    paths.write_json_atomic(paths.backoff_path(), document)
+
+
 def active_backoff(document, provider, now):
     if not isinstance(document, dict):
         return 0
@@ -791,7 +902,11 @@ def apply_integrity(accounts):
     warnings = []
     for result in accounts:
         identity = result.get("identity") or {}
-        if not result.get("ok"):
+        if result.get("trust_state") == "dashboard_only":
+            # codex display-only telemetry: visible on the dashboard, never
+            # routable — keep the explicit state instead of a generic "held"
+            result["routable"] = False
+        elif not result.get("ok"):
             result["trust_state"] = "held"
         elif result.get("stale"):
             result["trust_state"] = "stale_observation"
@@ -861,6 +976,17 @@ def collect(accounts, backoff=None, persist_backoff=None):
                 result["ok"] = True
             else:
                 expected = account.get("expected_email")
+                codex_retry_at = active_backoff(backoff, "codex_app_server", now)
+                if codex_retry_at:
+                    # transient app-server overload holds the seat; it never
+                    # becomes "available", and we don't hammer the server
+                    result["ok"] = False
+                    result["error_code"] = "codex_provider_backoff"
+                    result["retry_at"] = codex_retry_at
+                    result["note"] = ("codex app-server in provider backoff; "
+                                      "seat held until the retry window")
+                    snapshot["accounts"].append(result)
+                    continue
                 try:
                     # PRIMARY: live, identity-bound read via the codex app-server
                     identity, plan_type, windows = codex_live(
@@ -881,13 +1007,34 @@ def collect(accounts, backoff=None, persist_backoff=None):
                     validate_required_windows(result["windows"])
                     result["ok"] = True
                 except IdentityBindingError as app_error:
-                    # FALLBACK for older Codex without the app-server: best-effort
-                    # session-log read (dashboard-only, may be stale/idle)
-                    if not str(app_error.code).startswith("codex_app_server"):
+                    code = str(app_error.code)
+                    if code == "codex_app_server_throttled":
+                        # overload/throttle: provider-wide backoff, seat held
+                        # as transient — NOT an auth or capacity signal
+                        retry_at = now + 300
+                        if persist_backoff is not None:
+                            persist_backoff(retry_at, "codex_app_server")
+                        result["ok"] = False
+                        result["error_code"] = code
+                        result["retry_at"] = retry_at
+                        result["note"] = (
+                            "codex app-server overloaded/throttled; seat "
+                            "held (transient — not a capacity signal)")
+                        snapshot["accounts"].append(result)
+                        continue
+                    if code not in CODEX_DASHBOARD_FALLBACK_CODES:
+                        # explicit auth rejection, protocol/malformed error,
+                        # apikey seat, unrecognized capacity: NEVER fall back
+                        # to local telemetry — hold with the distinct code
                         raise
+                    # DISPLAY-ONLY fallback for an unavailable app-server
+                    # (older Codex CLI): session-log telemetry can be stale
+                    # and proves nothing live, so it is never routable.
                     identity = codex_identity(account["home"])
                     identity["credential_digest"] = credential_digest(
                         "codex", account["home"])
+                    identity["lineage_digest"] = codex_lineage_digest(
+                        account["home"])
                     result["identity"] = identity
                     result["identity_verified"] = identity["verified"]
                     result["identity_method"] = identity["method"]
@@ -903,11 +1050,13 @@ def collect(accounts, backoff=None, persist_backoff=None):
                         "prolite": "ChatGPT Pro Lite", "free": "Free",
                     }.get(plan_type, plan_type or "Unknown")
                     result.update(telemetry)
-                    if "windows" in result:
-                        validate_required_windows(result["windows"])
-                        result["ok"] = True
-                    else:
-                        result["ok"] = False
+                    result["ok"] = False
+                    result["error_code"] = "codex_dashboard_only"
+                    result["routable"] = False
+                    result["trust_state"] = "dashboard_only"
+                    result["note"] = (
+                        "codex app-server unavailable — session-log telemetry "
+                        "is display-only; seat not capacity-routable")
         except ProviderThrottleError as error:
             claude_backoff_until = max(claude_backoff_until, error.retry_at)
             if error.provider_response and persist_backoff is not None:
@@ -920,7 +1069,9 @@ def collect(accounts, backoff=None, persist_backoff=None):
         except IdentityBindingError as error:
             result["ok"] = False
             result["error_code"] = error.code
-            if error.code == "claude_credentials_missing":
+            if error.code in CODEX_HOLD_NOTES:
+                result["note"] = CODEX_HOLD_NOTES[error.code]
+            elif error.code == "claude_credentials_missing":
                 # verified identity but the token couldn't be read. On macOS the
                 # token is in the login Keychain (headroom reads it via
                 # `security`) — this path means the Keychain was locked or the
@@ -995,8 +1146,8 @@ def run_collect(quiet=False):
             return paths.load_json(paths.private_snapshot_path())
         backoff = paths.load_json(paths.backoff_path()) or empty_backoff()
 
-        def persist(retry_at):
-            backoff.setdefault("providers", {})["anthropic_usage_api"] = {
+        def persist(retry_at, provider="anthropic_usage_api"):
+            backoff.setdefault("providers", {})[provider] = {
                 "retry_at": int(retry_at),
                 "observed_at": min(int(time.time()), int(retry_at) - 1),
             }

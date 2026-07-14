@@ -63,6 +63,10 @@ def backoff_path():
     return os.path.join(state_dir(), "provider-backoff.json")
 
 
+def quarantine_path():
+    return os.path.join(state_dir(), "quarantine.json")
+
+
 def collect_lock_path():
     return os.path.join(state_dir(), "collect.lock")
 

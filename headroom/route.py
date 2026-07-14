@@ -34,6 +34,40 @@ LIMIT_RE = re.compile(
     r"|429 Too Many|status 429|overloaded_error)", re.I)
 WEEKLY_RE = re.compile(r"week", re.I)
 
+# Codex failure classification (provider-gated; never used for Claude).
+# A stderr regex is a HINT — the classes drive different protective actions:
+# a subscription cap cools the account; an invalidated token quarantines it
+# WITHOUT a capacity cooldown; overload backs the provider off without
+# touching the account; network ambiguity just holds. Auth is checked first
+# so an auth error mentioning "limit" can never masquerade as a cap.
+CODEX_AUTH_FAIL_RE = re.compile(
+    r"(token_invalidated|refresh token|invalid_grant|unauthorized|\b401\b"
+    r"|login required|not logged in|please (?:run )?`?codex login|re-?login)",
+    re.I)
+CODEX_CAP_RE = re.compile(
+    r"(hit your [^.\n]*limit|usage[ _]limit|weekly limit|plan limit"
+    r"|quota exceeded)", re.I)
+CODEX_OVERLOAD_RE = re.compile(
+    r"(\b429\b|too many requests|overload|throttl|temporarily unavailable"
+    r"|\b503\b)", re.I)
+CODEX_NETWORK_RE = re.compile(
+    r"(network|connection (?:refused|reset|closed|error)|timed? ?out"
+    r"|dns|unreachable|no route to host)", re.I)
+
+
+def classify_codex_failure(stderr):
+    """One of subscription_cap / auth_invalid / overload / network / none."""
+    text = stderr or ""
+    if CODEX_AUTH_FAIL_RE.search(text):
+        return "auth_invalid"
+    if CODEX_CAP_RE.search(text):
+        return "subscription_cap"
+    if CODEX_OVERLOAD_RE.search(text):
+        return "overload"
+    if CODEX_NETWORK_RE.search(text):
+        return "network"
+    return "none"
+
 
 def _number(value):
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -97,6 +131,41 @@ def _cooldown_lock():
         handle.close()
 
 
+def _read_quarantine():
+    """{} when no ledger exists; None when a ledger exists but is unreadable —
+    corrupt protective state must HOLD routing, not silently clear it."""
+    path = paths.quarantine_path()
+    if not os.path.exists(path):
+        return {}
+    value = paths.load_json(path)
+    return value if isinstance(value, dict) else None
+
+
+def quarantines():
+    return _read_quarantine()
+
+
+def quarantine_mark(name, reason):
+    """Quarantine a seat after an explicit auth rejection: unroutable until
+    re-login. Auth is NOT capacity, so no cooldown is written — the seat
+    comes back via `headroom connect`, never via a timer. Locked
+    read-modify-write; no secrets stored."""
+    lock_path = paths.quarantine_path() + ".lock"
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    with open(lock_path, "w") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            ledger = _read_quarantine()
+            if ledger is None:
+                raise RuntimeError(
+                    "quarantine ledger unreadable — inspect state/quarantine.json")
+            ledger[name] = {"reason": str(reason), "ts": int(time.time())}
+            paths.write_json_atomic(paths.quarantine_path(), ledger)
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    return ledger[name]
+
+
 def _snapshot_fresh(snapshot, now, max_age):
     if not isinstance(snapshot, dict):
         return False
@@ -158,7 +227,8 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     if reserve is None:
         reserve = registry.reserve_percent()
     if account.get("provider") == "codex" and not CODEX_ROUTING_ENABLED:
-        return "Codex is dashboard-only in this release (best-effort tracking)"
+        return ("Codex routing disabled (HEADROOM_CODEX_ROUTING=0) — "
+                "headroom refuses to route Codex work")
     if cool is None:
         return "cooldown ledger unreadable — inspect/delete state/cooldowns.json"
     if snapshot_row is None:
@@ -195,6 +265,12 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     if current_digest != snap_digest:
         # the actual credential token the CLI will use has changed
         return "slot credential changed since snapshot — recollect"
+    if account.get("provider") == "codex":
+        # provider-gated: Codex needs stronger proof than Claude; nothing in
+        # this branch can ever run for (or change the behaviour of) Claude
+        codex_reason = _codex_gate(account, snapshot_row, identity)
+        if codex_reason:
+            return codex_reason
     if snapshot_row.get("stale"):
         return "reading stale"
     captured_at = snapshot_row.get("captured_at")
@@ -253,7 +329,70 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     return None
 
 
+def _codex_gate(account, snapshot_row, identity):
+    """Codex-only fail-closed eligibility (never touches the Claude path).
+
+    Eligible only when the reading came from the live app-server, the identity
+    is network-verified (verified_local is NOT routable for Codex — a local id
+    token names an identity but proves no live capacity), the login is a
+    ChatGPT subscription (API-key seats have no subscription windows), the
+    refresh-token lineage is still the one the reading was taken under, and
+    the seat is not quarantined. The pre-launch block_reason recheck re-derives
+    the local binding + lineage, which is the mandatory targeted TOCTOU check;
+    a full online (app-server) pre-launch recheck is a TODO hook — doing it on
+    every candidate pass would over-spawn app-servers and trip the provider's
+    transient throttle."""
+    if snapshot_row.get("source") != "codex_app_server":
+        return ("codex reading is not from the live app-server "
+                "(display-only telemetry) — not routable")
+    if snapshot_row.get("trust_state") != "verified":
+        return "codex requires a network-verified reading — recollect"
+    if identity.get("auth_mode") != "chatgpt":
+        return ("codex seat is not a ChatGPT-subscription login — API-key "
+                "seats have no subscription capacity to route")
+    lineage = identity.get("lineage_digest")
+    if not lineage:
+        return "snapshot has no refresh-lineage binding — recollect"
+    current_lineage = collector.codex_lineage_digest(account["home"])
+    if current_lineage is None:
+        return "cannot verify refresh-token lineage — recollect"
+    if current_lineage != lineage:
+        # a lineage change means a FRESH LOGIN happened somewhere (a normal
+        # access refresh keeps the lineage) — for a seat shared with Paul's
+        # Mac desktop that is the collision signature; either way, hold
+        if account.get("shared_desktop"):
+            return ("shared_desktop_identity — Mac re-login can invalidate "
+                    "this seat")
+        return "slot refresh-token lineage changed since snapshot — recollect"
+    quarantine = _read_quarantine()
+    if quarantine is None:
+        return "quarantine ledger unreadable — inspect state/quarantine.json"
+    entry = quarantine.get(account["name"])
+    if entry is not None:
+        detail = entry.get("reason") if isinstance(entry, dict) else None
+        return ("quarantined: %s — run `headroom connect %s` to re-login"
+                % (detail or "auth invalid", account["name"]))
+    return None
+
+
 _UNSET = object()
+
+
+def _headroom_score(row):
+    """min(100 - used_5h, 100 - used_7d): how much PROVEN room is left before
+    the tightest window caps. Only meaningful for rows that already passed
+    block_reason; anything unreadable scores worst (fail-closed ordering)."""
+    windows = row.get("windows") if isinstance(row, dict) else None
+    if not isinstance(windows, dict):
+        return -1.0
+    values = []
+    for key in ("5h", "7d"):
+        window = windows.get(key)
+        percent = window.get("used_percent") if isinstance(window, dict) else None
+        if not _number(percent):
+            return -1.0
+        values.append(100.0 - percent)
+    return min(values)
 
 
 def candidates(fam, snapshot=_UNSET):
@@ -266,15 +405,27 @@ def candidates(fam, snapshot=_UNSET):
     cool = cooldowns()
     now = time.time()
     reserve = registry.reserve_percent()
-    result = []
-    for account in registry.ordered_for(fam):
+    ranked = []
+    for index, account in enumerate(registry.ordered_for(fam)):
         if snapshot is None:
             reason = "no fresh usage snapshot — `headroom collect` failing?"
         else:
             reason = block_reason(account, fam, rows.get(account["name"]),
                                   cool, now, reserve=reserve)
-        result.append((account, reason))
-    return result
+        # Greatest-headroom ordering is scoped to Codex for now (Paul 2026-07-14):
+        # Claude keeps its established registry-order preference so daily Claude
+        # routing is unchanged; Codex picks the account with the most proven room.
+        greatest_headroom = registry.family_provider(fam) == "codex"
+        score = _headroom_score(rows.get(account["name"])) \
+            if (reason is None and greatest_headroom) else None
+        ranked.append((account, reason, index, score))
+    # Eligible before blocked; then (Codex only) greatest PROVEN headroom first
+    # (min of 5h/7d room); registry order as the final tie-break/Claude order.
+    # Ordering never overrides eligibility — block_reason already decided that.
+    ranked.sort(key=lambda entry: (entry[1] is not None,
+                                   -entry[3] if entry[3] is not None else 0.0,
+                                   entry[2]))
+    return [(account, reason) for account, reason, _, _ in ranked]
 
 
 def pick(fam):
@@ -461,6 +612,14 @@ def cmd_run(fam, command):
         except OSError as error:
             print(f"[headroom] cannot run {command[0]}: {error}", file=sys.stderr)
             return 127
+        if process.returncode != 0 and account["provider"] == "codex":
+            # Codex failures are classified, never blind-replayed: an
+            # arbitrary command may have side effects, and rollout-resume
+            # replay is a later phase. Cool/quarantine/back off as the class
+            # demands and report — the caller re-runs to use the next seat.
+            sys.stdout.write(process.stdout or "")
+            sys.stderr.write(process.stderr or "")
+            return _codex_run_failure(fam, account, snapshot, process)
         # Rotation replays the command on the next account, so it is only
         # safe for idempotent commands (documented) and only fires on a
         # FAILED run whose stderr shows a provider limit — matching stdout
@@ -485,18 +644,59 @@ def cmd_run(fam, command):
     return 2
 
 
+def _codex_run_failure(fam, account, snapshot, process):
+    """Classify a failed codex child and take the matching protective action.
+    Never replays the command; always returns the child's exit code."""
+    kind = classify_codex_failure(process.stderr or "")
+    name = account["name"]
+    if kind == "subscription_cap":
+        window_key = "7d" if WEEKLY_RE.search(process.stderr or "") else "5h"
+        reset = window_reset(snapshot, name, window_key) \
+            or time.time() + (7 * 86400 if window_key == "7d" else 5 * 3600)
+        reset = mark(name, fam, reset, account_wide=True, window=window_key)
+        successor = pick(fam)
+        follow_up = (f"next seat with proven headroom: {successor['name']} — "
+                     f"re-run to use it (codex commands are never auto-replayed)"
+                     if successor else
+                     "no other codex seat has proven headroom")
+        print(f"[headroom] {name} hit its {window_key} subscription cap -> "
+              f"cooled until {tfmt(reset)}; {follow_up}", file=sys.stderr)
+    elif kind == "auth_invalid":
+        # auth is not capacity: quarantine (re-login required), NO cooldown
+        quarantine_mark(name, "codex auth rejected "
+                              "(token invalidated / login required)")
+        print(f"[headroom] {name} auth was rejected -> quarantined (no "
+              f"capacity cooldown); run `headroom connect {name}` to re-login",
+              file=sys.stderr)
+    elif kind == "overload":
+        # provider-wide transient: back the provider off, cool NO account
+        collector.persist_provider_backoff("codex_app_server",
+                                           time.time() + 300)
+        print(f"[headroom] provider overload/429 -> codex backoff set; "
+              f"{name} NOT cooled, not rotating", file=sys.stderr)
+    elif kind == "network":
+        print(f"[headroom] network-ambiguous failure on {name} -> holding "
+              f"(no cooldown, no rotation)", file=sys.stderr)
+    else:
+        # regex/classifier found no provider signal: an ordinary failed
+        # command must never trigger rotation or protective state
+        print(f"[headroom] completed on {name} (exit {process.returncode})",
+              file=sys.stderr)
+    return process.returncode
+
+
 def cmd_exec(fam, command):
     """Interactive launch: pick once, exec with the account's env, no capture."""
+    if registry.family_provider(fam) == "codex" and not CODEX_ROUTING_ENABLED:
+        # fail-closed: disabled routing means headroom REFUSES to launch a
+        # Codex seat it cannot prove capacity for — never "just take the
+        # first account". Run `CODEX_HOME=<home> codex` directly to bypass.
+        print("[headroom] Codex routing is disabled (HEADROOM_CODEX_ROUTING=0)"
+              " — refusing to launch without proven headroom; unset it, or "
+              "run codex directly with CODEX_HOME=<home> to bypass headroom",
+              file=sys.stderr)
+        return 2
     account = pick(fam)
-    if account is None and registry.family_provider(fam) == "codex" \
-            and not CODEX_ROUTING_ENABLED:
-        # Codex isn't capacity-routed in this release; still launch on the
-        # first configured Codex account so `headroom codex` works.
-        ordered = registry.ordered_for(fam)
-        account = ordered[0] if ordered else None
-        if account:
-            print(f"[headroom] Codex is tracked best-effort (not capacity-"
-                  f"routed yet) — launching on {account['name']}", file=sys.stderr)
     if account is None:
         print(f"[headroom] no account for '{fam}' has proven headroom; "
               f"try `headroom status {fam}`", file=sys.stderr)
@@ -504,16 +704,17 @@ def cmd_exec(fam, command):
     # final recheck against the latest cooldown ledger right before exec, in
     # case another process cooled this account since pick(). NEVER fall back to
     # a held account — re-pick, and refuse to launch if nothing is eligible.
-    if registry.family_provider(fam) == "claude" or CODEX_ROUTING_ENABLED:
-        snapshot = ensure_fresh_snapshot()
-        row = _snapshot_accounts(snapshot).get(account["name"])
-        if block_reason(account, fam, row, cooldowns(), time.time()):
-            account = pick(fam)
-            if account is None:
-                print("[headroom] the chosen account was just held and no "
-                      "other has proven headroom — try again in a moment",
-                      file=sys.stderr)
-                return 2
+    # (For codex this recheck also re-derives the local binding + refresh
+    # lineage via block_reason's _codex_gate — the targeted pre-launch check.)
+    snapshot = ensure_fresh_snapshot()
+    row = _snapshot_accounts(snapshot).get(account["name"])
+    if block_reason(account, fam, row, cooldowns(), time.time()):
+        account = pick(fam)
+        if account is None:
+            print("[headroom] the chosen account was just held and no "
+                  "other has proven headroom — try again in a moment",
+                  file=sys.stderr)
+            return 2
     for var in collector.AUTH_OVERRIDE_VARS:
         os.environ.pop(var, None)
     os.environ[env_key(account)] = account["home"]

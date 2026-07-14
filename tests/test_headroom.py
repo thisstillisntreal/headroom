@@ -302,10 +302,17 @@ class CodexWindowMapping(unittest.TestCase):
         self.assertEqual(w["5h"]["used_percent"], 40.0)
         self.assertEqual(w["7d"]["used_percent"], 0.0)
 
-    def test_empty_payload_defaults_available(self):
-        w = collect.codex_windows({}, now=1000)
-        self.assertEqual(w["5h"]["used_percent"], 0.0)
-        self.assertEqual(w["7d"]["used_percent"], 0.0)
+    def test_empty_payload_holds(self):
+        # an empty rate-limit response proves NOTHING — it must hold the
+        # seat, never synthesize a routable 0%/0%
+        with self.assertRaises(collect.IdentityBindingError) as caught:
+            collect.codex_windows({}, now=1000)
+        self.assertEqual(caught.exception.code, "codex_capacity_unrecognized")
+
+    def test_unrecognized_durations_only_holds(self):
+        rl = {"primary": {"usedPercent": 10, "windowDurationMins": 60}}
+        with self.assertRaises(collect.IdentityBindingError):
+            collect.codex_windows(rl, now=1000)
 
 
 class FakeCompleted:
@@ -930,6 +937,567 @@ class ClaudePlan(unittest.TestCase):
             self._home_with(home, subscriptionType="max",
                             rateLimitTier="default_claude_max_20x")
             self.assertEqual(collect.claude_plan(home), "Max 20x")
+
+
+def _codex_row(name="cx", used5h=10.0, used7d=20.0, **over):
+    now = int(time.time())
+    row = {
+        "name": name, "provider": "codex", "plan": "ChatGPT Pro", "ok": True,
+        "stale": False, "routable": True, "identity_verified": True,
+        "identity": {"verified": True, "account_fingerprint": "AAAA",
+                     "credential_digest": "BBBB", "lineage_digest": "LLLL",
+                     "auth_mode": "chatgpt"},
+        "trust_state": "verified", "captured_at": now - 10,
+        "source": "codex_app_server",
+        "windows": {
+            "5h": {"used_percent": used5h, "resets_at": now + 3600,
+                   "window_minutes": 300},
+            "7d": {"used_percent": used7d, "resets_at": now + 8 * 86400,
+                   "window_minutes": 10080},
+        },
+    }
+    row.update(over)
+    return row
+
+
+def _codex_account(name="cx", **over):
+    account = {"name": name, "provider": "codex", "home": "/tmp/hr-t/" + name}
+    account.update(over)
+    return account
+
+
+class CodexBlockReasonFailClosed(unittest.TestCase):
+    """Codex eligibility is stricter than Claude's and fully provider-gated:
+    live app-server source, network-verified identity, ChatGPT subscription
+    auth, matching refresh-token lineage, and no quarantine."""
+
+    def setUp(self):
+        self.now = time.time()
+        self.temp = tempfile.TemporaryDirectory()
+        self.old_headroom = os.environ.get("HEADROOM_DIR")
+        os.environ["HEADROOM_DIR"] = self.temp.name
+        self.binding = mock.patch.object(
+            collect, "local_binding", return_value=("AAAA", "BBBB"))
+        self.binding.start()
+        self.lineage = mock.patch.object(
+            collect, "codex_lineage_digest", return_value="LLLL")
+        self.lineage.start()
+
+    def tearDown(self):
+        self.lineage.stop()
+        self.binding.stop()
+        if self.old_headroom is None:
+            os.environ.pop("HEADROOM_DIR", None)
+        else:
+            os.environ["HEADROOM_DIR"] = self.old_headroom
+        self.temp.cleanup()
+
+    def reason(self, row, account=None, fam="codex"):
+        account = _codex_account() if account is None else account
+        return route.block_reason(account, fam, row, {}, self.now)
+
+    def test_healthy_codex_routes(self):
+        self.assertIsNone(self.reason(_codex_row()))
+
+    def test_verified_local_not_routable_for_codex(self):
+        row = _codex_row(trust_state="verified_local")
+        row["identity"]["verified"] = False
+        reason = self.reason(row)
+        self.assertIsNotNone(reason)
+        self.assertIn("network-verified", reason)
+
+    def test_non_app_server_source_holds(self):
+        row = _codex_row(source="codex_session_telemetry")
+        reason = self.reason(row)
+        self.assertIsNotNone(reason)
+        self.assertIn("app-server", reason)
+
+    def test_apikey_auth_mode_holds(self):
+        row = _codex_row()
+        row["identity"]["auth_mode"] = "apikey"
+        reason = self.reason(row)
+        self.assertIsNotNone(reason)
+        self.assertIn("ChatGPT-subscription", reason)
+
+    def test_missing_lineage_holds(self):
+        row = _codex_row()
+        row["identity"].pop("lineage_digest")
+        self.assertIsNotNone(self.reason(row))
+
+    def test_lineage_mismatch_holds(self):
+        with mock.patch.object(collect, "codex_lineage_digest",
+                               return_value="FRESH-LOGIN"):
+            reason = self.reason(_codex_row())
+        self.assertIsNotNone(reason)
+        self.assertIn("lineage changed", reason)
+
+    def test_unreadable_lineage_holds(self):
+        with mock.patch.object(collect, "codex_lineage_digest",
+                               return_value=None):
+            self.assertIsNotNone(self.reason(_codex_row()))
+
+    def test_shared_desktop_stable_lineage_routes(self):
+        account = _codex_account(shared_desktop=True)
+        self.assertIsNone(self.reason(_codex_row(), account=account))
+
+    def test_shared_desktop_lineage_change_holds_with_mac_warning(self):
+        account = _codex_account(shared_desktop=True)
+        with mock.patch.object(collect, "codex_lineage_digest",
+                               return_value="MAC-RELOGIN"):
+            reason = self.reason(_codex_row(), account=account)
+        self.assertIsNotNone(reason)
+        self.assertIn("shared_desktop_identity", reason)
+        self.assertIn("Mac re-login", reason)
+
+    def test_quarantined_seat_holds(self):
+        route.quarantine_mark("cx", "codex auth rejected")
+        reason = self.reason(_codex_row())
+        self.assertIsNotNone(reason)
+        self.assertIn("quarantined", reason)
+
+    def test_corrupt_quarantine_ledger_holds(self):
+        os.makedirs(os.path.join(self.temp.name, "state"), exist_ok=True)
+        with open(os.path.join(self.temp.name, "state",
+                               "quarantine.json"), "w") as handle:
+            handle.write("not-json{")
+        reason = self.reason(_codex_row())
+        self.assertIsNotNone(reason)
+        self.assertIn("quarantine ledger unreadable", reason)
+
+    def test_routing_disabled_refuses_with_clear_reason(self):
+        with mock.patch.object(route, "CODEX_ROUTING_ENABLED", False):
+            reason = self.reason(_codex_row())
+        self.assertIsNotNone(reason)
+        self.assertIn("HEADROOM_CODEX_ROUTING", reason)
+
+    def test_codex_gate_never_touches_claude(self):
+        # a Claude row with none of the codex-only fields still routes, even
+        # when a quarantine entry exists under the same account name
+        route.quarantine_mark("a", "codex auth rejected")
+        reason = route.block_reason(_account(), "sonnet", _claude_row(),
+                                    {}, self.now)
+        self.assertIsNone(reason)
+
+
+class GreatestHeadroom(unittest.TestCase):
+    """Candidate order prefers the greatest PROVEN headroom —
+    min(100-used_5h, 100-used_7d) — with registry order as the tie-break."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.old_headroom = os.environ.get("HEADROOM_DIR")
+        os.environ["HEADROOM_DIR"] = self.temp.name
+        self.binding = mock.patch.object(
+            collect, "local_binding", return_value=("AAAA", "BBBB"))
+        self.binding.start()
+        self.lineage = mock.patch.object(
+            collect, "codex_lineage_digest", return_value="LLLL")
+        self.lineage.start()
+
+    def tearDown(self):
+        self.lineage.stop()
+        self.binding.stop()
+        if self.old_headroom is None:
+            os.environ.pop("HEADROOM_DIR", None)
+        else:
+            os.environ["HEADROOM_DIR"] = self.old_headroom
+        self.temp.cleanup()
+
+    def ranked(self, fam, accounts, rows):
+        snapshot = {"generated": time.time(), "accounts": rows}
+        with mock.patch.object(route.registry, "ordered_for",
+                               return_value=accounts), \
+                mock.patch.object(route.registry, "reserve_percent",
+                                  return_value=0.0):
+            return route.candidates(fam, snapshot)
+
+    def test_codex_picks_greatest_headroom(self):
+        accounts = [_codex_account("cx1"), _codex_account("cx2")]
+        rows = [_codex_row("cx1", used5h=60.0, used7d=30.0),
+                _codex_row("cx2", used5h=10.0, used7d=20.0)]
+        ranked = self.ranked("codex", accounts, rows)
+        self.assertEqual([a["name"] for a, r in ranked if r is None],
+                         ["cx2", "cx1"])
+
+    def test_score_is_min_of_both_windows(self):
+        # cx1: 5h says 90 free but 7d only 5 free -> score 5; cx2 -> score 40
+        accounts = [_codex_account("cx1"), _codex_account("cx2")]
+        rows = [_codex_row("cx1", used5h=10.0, used7d=95.0),
+                _codex_row("cx2", used5h=60.0, used7d=40.0)]
+        ranked = self.ranked("codex", accounts, rows)
+        self.assertEqual(ranked[0][0]["name"], "cx2")
+
+    def test_tie_breaks_on_registry_order(self):
+        accounts = [_codex_account("cx1"), _codex_account("cx2")]
+        rows = [_codex_row("cx1", used5h=50.0, used7d=50.0),
+                _codex_row("cx2", used5h=50.0, used7d=50.0)]
+        ranked = self.ranked("codex", accounts, rows)
+        self.assertEqual(ranked[0][0]["name"], "cx1")
+
+    def test_blocked_accounts_follow_eligible_ones(self):
+        accounts = [_codex_account("cx1"), _codex_account("cx2")]
+        rows = [_codex_row("cx1", used5h=100.0),
+                _codex_row("cx2", used5h=10.0)]
+        ranked = self.ranked("codex", accounts, rows)
+        self.assertEqual(ranked[0][0]["name"], "cx2")
+        self.assertIsNone(ranked[0][1])
+        self.assertIsNotNone(ranked[1][1])
+
+    def test_claude_keeps_registry_order(self):
+        # Greatest-headroom ordering is Codex-only (Paul 2026-07-14); Claude
+        # keeps its established registry-order preference even when a later
+        # account has more room, so daily Claude routing is unchanged.
+        accounts = [_account("a"), _account("b")]
+        rows = [_claude_row("a", used5h=80.0, used7d=10.0),
+                _claude_row("b", used5h=20.0, used7d=10.0)]
+        ranked = self.ranked("sonnet", accounts, rows)
+        self.assertEqual([r[0]["name"] for r in ranked], ["a", "b"])
+
+
+class CodexCollectClassification(unittest.TestCase):
+    """collect() must keep codex app-server outcomes distinct and NEVER fall
+    back to routable local telemetry after an explicit auth/protocol error."""
+
+    def account(self, home="/tmp/hr-t/none"):
+        return {"name": "cx", "provider": "codex", "home": home}
+
+    def collect_one(self, account=None, backoff=None, persist=None):
+        return collect.collect([self.account() if account is None
+                                else account], backoff, persist)
+
+    def test_auth_reject_never_falls_back_to_local_telemetry(self):
+        with mock.patch.object(
+                collect, "codex_live",
+                side_effect=collect.IdentityBindingError(
+                    "codex_auth_rejected")), \
+                mock.patch.object(collect, "codex_identity") as identity, \
+                mock.patch.object(collect, "codex_limits") as limits:
+            snapshot = self.collect_one()
+        row = snapshot["accounts"][0]
+        identity.assert_not_called()
+        limits.assert_not_called()
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["error_code"], "codex_auth_rejected")
+        self.assertEqual(row["trust_state"], "held")
+        self.assertFalse(row["routable"])
+        self.assertIn("re-login", row["note"])
+
+    def test_protocol_error_never_falls_back(self):
+        with mock.patch.object(
+                collect, "codex_live",
+                side_effect=collect.IdentityBindingError(
+                    "codex_app_server_protocol_error")), \
+                mock.patch.object(collect, "codex_limits") as limits:
+            snapshot = self.collect_one()
+        row = snapshot["accounts"][0]
+        limits.assert_not_called()
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["error_code"], "codex_app_server_protocol_error")
+        self.assertFalse(row["routable"])
+
+    def test_app_server_unavailable_falls_back_display_only(self):
+        identity = {"verified": False, "email": "cx@example.com",
+                    "account_fingerprint": "FP",
+                    "method": "openai_local_id_token", "plan_type": "pro",
+                    "subscription": {"status": "unknown"}}
+        telemetry = {"captured_at": int(time.time()) - 5,
+                     "source": "codex_session_telemetry", "stale": False,
+                     "windows": {"5h": {"used_percent": 1.0},
+                                 "7d": {"used_percent": 2.0}},
+                     "plan_type": "pro"}
+        with mock.patch.object(
+                collect, "codex_live",
+                side_effect=collect.IdentityBindingError(
+                    "codex_app_server_no_response")), \
+                mock.patch.object(collect, "codex_identity",
+                                  return_value=dict(identity)), \
+                mock.patch.object(collect, "codex_limits",
+                                  return_value=dict(telemetry)), \
+                mock.patch.object(collect, "credential_digest",
+                                  return_value="BBBB"), \
+                mock.patch.object(collect, "codex_lineage_digest",
+                                  return_value="LLLL"):
+            snapshot = self.collect_one()
+        row = snapshot["accounts"][0]
+        self.assertFalse(row["ok"])
+        self.assertFalse(row["routable"])
+        self.assertEqual(row["trust_state"], "dashboard_only")
+        self.assertEqual(row["error_code"], "codex_dashboard_only")
+        # telemetry is still there for display
+        self.assertEqual(row["windows"]["5h"]["used_percent"], 1.0)
+
+    def test_throttle_persists_provider_backoff_and_holds(self):
+        recorded = {}
+
+        def persist(retry_at, provider="anthropic_usage_api"):
+            recorded["retry_at"] = retry_at
+            recorded["provider"] = provider
+        with mock.patch.object(
+                collect, "codex_live",
+                side_effect=collect.IdentityBindingError(
+                    "codex_app_server_throttled")):
+            snapshot = self.collect_one(persist=persist)
+        row = snapshot["accounts"][0]
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["error_code"], "codex_app_server_throttled")
+        self.assertEqual(recorded["provider"], "codex_app_server")
+        self.assertGreater(recorded["retry_at"], time.time() - 5)
+
+    def test_active_codex_backoff_holds_without_spawning(self):
+        backoff = {"schema_version": 1, "providers": {"codex_app_server": {
+            "retry_at": int(time.time()) + 300}}}
+        with mock.patch.object(collect, "codex_live") as live:
+            snapshot = self.collect_one(backoff=backoff)
+        live.assert_not_called()
+        row = snapshot["accounts"][0]
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["error_code"], "codex_provider_backoff")
+
+    def test_apikey_seat_is_capacity_unavailable(self):
+        with tempfile.TemporaryDirectory() as home:
+            with open(os.path.join(home, "auth.json"), "w") as handle:
+                json.dump({"OPENAI_API_KEY": "sk-test-not-a-real-key"}, handle)
+            snapshot = self.collect_one(self.account(home))
+        row = snapshot["accounts"][0]
+        self.assertFalse(row["ok"])
+        self.assertEqual(row["error_code"], "codex_capacity_unavailable")
+        self.assertFalse(row["routable"])
+        self.assertIn("API-key", row["note"])
+
+    def test_auth_mode_detection(self):
+        self.assertEqual(collect.codex_auth_mode(
+            {"OPENAI_API_KEY": "sk-x"}), "apikey")
+        self.assertEqual(collect.codex_auth_mode(
+            {"auth_mode": "apikey", "tokens": {"id_token": "x"}}), "apikey")
+        self.assertEqual(collect.codex_auth_mode(
+            {"tokens": {"id_token": "x"}, "OPENAI_API_KEY": None}), "chatgpt")
+        self.assertEqual(collect.codex_auth_mode({}), "unknown")
+
+    def test_lineage_digest_is_nonsecret_and_stable(self):
+        with tempfile.TemporaryDirectory() as home:
+            with open(os.path.join(home, "auth.json"), "w") as handle:
+                json.dump({"tokens": {"refresh_token": "rt-secret"}}, handle)
+            digest = collect.codex_lineage_digest(home)
+            self.assertEqual(digest, collect.codex_lineage_digest(home))
+            self.assertEqual(len(digest), 16)
+            self.assertNotIn("rt-secret", digest)
+            self.assertEqual(
+                digest, hashlib.sha256(b"rt-secret").hexdigest()[:16])
+
+    def test_lineage_digest_missing_refresh_is_none(self):
+        with tempfile.TemporaryDirectory() as home:
+            with open(os.path.join(home, "auth.json"), "w") as handle:
+                json.dump({"tokens": {}}, handle)
+            self.assertIsNone(collect.codex_lineage_digest(home))
+
+    def test_appserver_error_classification(self):
+        classify = collect.classify_codex_appserver_error
+        self.assertEqual(classify({"code": 401, "message": "unauthorized"}),
+                         "codex_auth_rejected")
+        self.assertEqual(classify({"message": "token_invalidated"}),
+                         "codex_auth_rejected")
+        self.assertEqual(classify({"message": "refresh token already used"}),
+                         "codex_auth_rejected")
+        self.assertEqual(classify({"message": "429 too many requests"}),
+                         "codex_app_server_throttled")
+        self.assertEqual(classify({"message": "server overloaded"}),
+                         "codex_app_server_throttled")
+        self.assertEqual(classify({"message": "something else broke"}),
+                         "codex_app_server_protocol_error")
+
+
+class FakeProcess:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class CmdRunCodexClassification(unittest.TestCase):
+    """A failed codex child is classified — subscription cap cools + reports
+    the next seat, invalid auth quarantines WITHOUT a cooldown, overload backs
+    the provider off, network/unknown just hold. Never a blind replay."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.old_headroom = os.environ.get("HEADROOM_DIR")
+        os.environ["HEADROOM_DIR"] = self.temp.name
+        self.acct1 = _codex_account("cx1")
+        self.acct2 = _codex_account("cx2")
+
+    def tearDown(self):
+        if self.old_headroom is None:
+            os.environ.pop("HEADROOM_DIR", None)
+        else:
+            os.environ["HEADROOM_DIR"] = self.old_headroom
+        self.temp.cleanup()
+
+    def run_codex(self, stderr, successor=None):
+        snapshot = {"generated": time.time(),
+                    "accounts": [_codex_row("cx1"), _codex_row("cx2")]}
+        errors = io.StringIO()
+        with mock.patch.object(route, "ensure_fresh_snapshot",
+                               return_value=snapshot), \
+                mock.patch.object(route, "candidates",
+                                  return_value=[(self.acct1, None),
+                                                (self.acct2, None)]), \
+                mock.patch.object(route, "block_reason", return_value=None), \
+                mock.patch.object(route, "pick", return_value=successor), \
+                mock.patch.object(
+                    route.subprocess, "run",
+                    return_value=FakeProcess(returncode=1,
+                                             stderr=stderr)) as child, \
+                redirect_stdout(io.StringIO()), redirect_stderr(errors):
+            code = route.cmd_run("codex", ["codex", "exec", "task"])
+        return code, child, errors.getvalue()
+
+    def test_subscription_cap_cools_and_reports_without_replay(self):
+        code, child, err = self.run_codex(
+            "You've hit your usage limit. Try again later.",
+            successor=self.acct2)
+        self.assertEqual(code, 1)
+        self.assertEqual(child.call_count, 1)  # NO replay on the next seat
+        cool = route.cooldowns()
+        self.assertIn("cx1:*", cool)
+        self.assertIn("cx2", err)  # next healthy seat is reported
+        self.assertIn("never auto-replayed", err)
+        self.assertEqual(route.quarantines(), {})
+
+    def test_invalid_token_quarantines_without_cooldown(self):
+        code, child, err = self.run_codex(
+            "ERROR: token_invalidated — please run `codex login`")
+        self.assertEqual(code, 1)
+        self.assertEqual(child.call_count, 1)
+        self.assertEqual(route.cooldowns(), {})  # NO capacity cooldown
+        quarantine = route.quarantines()
+        self.assertIn("cx1", quarantine)
+        self.assertIn("headroom connect cx1", err)
+
+    def test_overload_sets_provider_backoff_only(self):
+        code, child, err = self.run_codex("HTTP 429 Too Many Requests")
+        self.assertEqual(code, 1)
+        self.assertEqual(child.call_count, 1)
+        self.assertEqual(route.cooldowns(), {})
+        self.assertEqual(route.quarantines(), {})
+        document = route.paths.load_json(route.paths.backoff_path())
+        self.assertIn("codex_app_server", document["providers"])
+
+    def test_network_failure_holds_everything(self):
+        code, child, err = self.run_codex("connection refused by proxy")
+        self.assertEqual(code, 1)
+        self.assertEqual(route.cooldowns(), {})
+        self.assertEqual(route.quarantines(), {})
+        self.assertIn("holding", err)
+
+    def test_unclassified_failure_takes_no_protective_action(self):
+        code, child, err = self.run_codex("SyntaxError: bad task file")
+        self.assertEqual(code, 1)
+        self.assertEqual(child.call_count, 1)
+        self.assertEqual(route.cooldowns(), {})
+        self.assertEqual(route.quarantines(), {})
+
+    def test_auth_error_mentioning_limit_is_auth_not_cap(self):
+        code, child, err = self.run_codex(
+            "401 unauthorized: usage limit check failed, please login again")
+        self.assertEqual(route.cooldowns(), {})  # not cooled as a cap
+        self.assertIn("cx1", route.quarantines())
+
+    def test_claude_limit_still_rotates_and_replays(self):
+        # regression: the Claude path keeps its documented rotate-and-replay
+        acct_a, acct_b = _account("a"), _account("b")
+        snapshot = {"generated": time.time(),
+                    "accounts": [_claude_row("a"), _claude_row("b")]}
+        with mock.patch.object(route, "ensure_fresh_snapshot",
+                               return_value=snapshot), \
+                mock.patch.object(route, "candidates",
+                                  return_value=[(acct_a, None),
+                                                (acct_b, None)]), \
+                mock.patch.object(route, "block_reason", return_value=None), \
+                mock.patch.object(route, "mark") as marked, \
+                mock.patch.object(
+                    route.subprocess, "run",
+                    side_effect=[FakeProcess(returncode=1,
+                                             stderr="usage limit reached"),
+                                 FakeProcess(returncode=0)]) as child, \
+                redirect_stdout(io.StringIO()), \
+                redirect_stderr(io.StringIO()):
+            code = route.cmd_run("sonnet", ["claude", "-p", "task"])
+        self.assertEqual(code, 0)
+        self.assertEqual(child.call_count, 2)  # rotated onto the next account
+        marked.assert_called_once()
+
+
+class CmdExecCodexRefusal(unittest.TestCase):
+    """HEADROOM_CODEX_ROUTING=0 means headroom REFUSES codex routing — the
+    old 'launch the first codex account anyway' fail-open path is gone."""
+
+    def test_disabled_refuses_and_never_launches(self):
+        errors = io.StringIO()
+        with mock.patch.object(route, "CODEX_ROUTING_ENABLED", False), \
+                mock.patch.object(route.registry, "ordered_for") as ordered, \
+                mock.patch.object(route.os, "execvp") as execute, \
+                redirect_stderr(errors):
+            code = route.cmd_exec("codex", ["codex"])
+        self.assertEqual(code, 2)
+        execute.assert_not_called()
+        ordered.assert_not_called()  # no first-account fallback consulted
+        self.assertIn("HEADROOM_CODEX_ROUTING=0", errors.getvalue())
+        self.assertIn("refusing", errors.getvalue())
+
+    def test_enabled_but_no_headroom_refuses(self):
+        errors = io.StringIO()
+        with mock.patch.object(route, "pick", return_value=None), \
+                mock.patch.object(route.os, "execvp") as execute, \
+                redirect_stderr(errors):
+            code = route.cmd_exec("codex", ["codex"])
+        self.assertEqual(code, 2)
+        execute.assert_not_called()
+        self.assertIn("proven headroom", errors.getvalue())
+
+
+class RegistryCodexSeats(unittest.TestCase):
+    """The locked two-seat codex topology validates, and the new optional
+    fields are type-checked without breaking existing configs."""
+
+    def fleet(self):
+        return {"schema_version": 1, "accounts": [
+            {"name": "domanski-ai", "provider": "claude",
+             "home": "~/ai-accounts/homes/claude-domanski-ai",
+             "expected_email": "paul@domanski.ai"},
+            {"name": "codex-domanski-ai", "provider": "codex",
+             "home": "~/ai-accounts/homes/codex-domanski-ai",
+             "expected_email": "paul@domanski.ai",
+             "handoff_group": "domanski-server"},
+            {"name": "codex-gmail", "provider": "codex",
+             "home": "~/ai-accounts/homes/codex-gmail",
+             "expected_email": "domanskip.paul@gmail.com",
+             "handoff_group": "domanski-server",
+             "shared_desktop": True},
+        ]}
+
+    def test_codex_seats_validate(self):
+        config = self.fleet()
+        self.assertEqual(registry.validate(config), config)
+
+    def test_shared_desktop_must_be_bool(self):
+        config = self.fleet()
+        config["accounts"][2]["shared_desktop"] = "yes"
+        with self.assertRaises(registry.RegistryError):
+            registry.validate(config)
+
+    def test_handoff_group_must_be_nonempty_string(self):
+        config = self.fleet()
+        config["accounts"][1]["handoff_group"] = ""
+        with self.assertRaises(registry.RegistryError):
+            registry.validate(config)
+        config["accounts"][1]["handoff_group"] = 7
+        with self.assertRaises(registry.RegistryError):
+            registry.validate(config)
+
+    def test_configs_without_new_fields_still_validate(self):
+        config = {"schema_version": 1, "accounts": [
+            {"name": "personal", "provider": "claude", "home": "~/.claude"}]}
+        self.assertEqual(registry.validate(config), config)
 
 
 if __name__ == "__main__":

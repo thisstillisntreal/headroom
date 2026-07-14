@@ -98,6 +98,17 @@ def validate(config):
             raise RegistryError(f"account {name}: provider must be one of {PROVIDERS}")
         if not isinstance(home, str) or not home:
             raise RegistryError(f"account {name}: home missing")
+        # optional fields: validate types when present, never require them —
+        # existing configs without these fields must keep loading unchanged
+        if "shared_desktop" in account \
+                and not isinstance(account["shared_desktop"], bool):
+            raise RegistryError(
+                f"account {name}: shared_desktop must be true or false")
+        if "handoff_group" in account:
+            group = account["handoff_group"]
+            if not isinstance(group, str) or not group.strip():
+                raise RegistryError(
+                    f"account {name}: handoff_group must be a non-empty string")
         resolved = expand(home)
         if resolved in homes:
             raise RegistryError(f"account {name}: home {resolved} already used by another account")
