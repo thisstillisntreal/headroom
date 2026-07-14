@@ -183,7 +183,17 @@ def project(snapshot, evaluated_at=None, force_noncurrent_reason=None):
                                     base_state, evaluated_at)
             for key in WINDOW_KEYS
         }
-        states = {window["state"] for window in windows.values()}
+        # model-scoped weekly windows (e.g. "scoped:Fable") ride along for
+        # display with the same projection/demotion rules — but they never
+        # drive the ACCOUNT state below: a scoped model cap does not block
+        # the account's other models
+        for key, raw_window in raw_windows.items():
+            if isinstance(key, str) and key.startswith("scoped:") \
+                    and key not in windows:
+                windows[key] = _window_projection(
+                    raw_window, captured_at, base_state, evaluated_at)
+        states = {window["state"] for key, window in windows.items()
+                  if key in WINDOW_KEYS}
         if base_state == "held" or "held" in states:
             state = "held"
         elif base_state == "stale" or "stale" in states:

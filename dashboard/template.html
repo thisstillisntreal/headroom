@@ -407,7 +407,7 @@ body.is-widget .shell { display: none; }
 .hr-badge { font: 700 8.5px var(--mono); letter-spacing: .09em; white-space: nowrap; }
 .hr-chev { font: 600 13px/1 var(--sans); color: var(--ink-3); margin-left: 2px; }
 .hr-wins { margin-top: 7px; display: flex; flex-direction: column; gap: 5px; }
-.hr-winrow { display: grid; grid-template-columns: 24px 1fr 46px; gap: 9px;
+.hr-winrow { display: grid; grid-template-columns: minmax(24px, max-content) 1fr 46px; gap: 9px;
              align-items: center; }
 .hr-wlabel { font: 700 8px var(--mono); letter-spacing: .1em; color: var(--ink-2); }
 .hr-cells { display: flex; gap: var(--cell-gap); }
@@ -888,6 +888,15 @@ function hrAccount(raw,demote){
   const w5=a.windows&&a.windows["5h"]||null,w7=a.windows&&a.windows["7d"]||null;
   const v5=demote?hrDemoteWindow(w5):hrWindow(w5);
   const v7=demote?hrDemoteWindow(w7):hrWindow(w7);
+  /* model-scoped weekly windows (e.g. "scoped:Fable") ride along for display;
+     hrWindow/hrDemoteWindow are null-safe so extras need no pre-validation */
+  const extras=[];
+  if(a.windows&&typeof a.windows==="object"&&!Array.isArray(a.windows))
+    Object.keys(a.windows).sort().forEach(k=>{
+      if(k==="5h"||k==="7d"||k.indexOf("scoped:")!==0)return;
+      const w=a.windows[k];
+      extras.push({label:k.slice(7),view:demote?hrDemoteWindow(w):hrWindow(w)});
+    });
   const badge=st==="current"?{label:"CURRENT",tone:"green",dot:true}
     :st==="limited"?{label:"AT LIMIT",tone:"red",dot:true}
     :st==="stale"?{label:"STALE",tone:"dim",dot:false}
@@ -899,8 +908,8 @@ function hrAccount(raw,demote){
   else if(st==="stale"){const seen=w5&&Number.isFinite(w5.observed_at)?w5.observed_at:null;
     note=seen?"last verified "+age(seen):"reading held — not verified";}
   else note="no verified reading — held, never promoted to live";
-  return{name:name,provider:provider,state:st,badge:badge,v5:v5,v7:v7,cool:cool,
-         note:note,hasW:st!=="held"};
+  return{name:name,provider:provider,state:st,badge:badge,v5:v5,v7:v7,
+         extras:extras,cool:cool,note:note,hasW:st!=="held"};
 }
 function hrView(data,offline){
   const fresh=hrFreshness(data,offline);
@@ -977,9 +986,11 @@ function hrDotMarkup(v){
 }
 function hrAcctMarkup(a){
   const dot=a.badge.dot?'<span class="hr-bdot hr-tone-'+a.badge.tone+'" aria-hidden="true"></span>':"";
+  const extraRows=(a.extras||[]).map(e=>
+    '<div class="hr-winrow"><span class="hr-wlabel">'+esc(e.label.toUpperCase())+'</span><span class="hr-cells h7 hr-tone-'+e.view.tone+'" role="img" aria-label="'+esc(e.label)+" "+esc(e.view.value)+'">'+hrCells(e.view.fill)+'</span><span class="hr-wval hr-tone-'+e.view.tone+'">'+esc(e.view.value)+"</span></div>").join("");
   const wins=a.hasW?'<div class="hr-wins">'+
     '<div class="hr-winrow"><span class="hr-wlabel">5H</span><span class="hr-cells h5 hr-tone-'+a.v5.tone+'" role="img" aria-label="5h '+esc(a.v5.value)+'">'+hrCells(a.v5.fill)+'</span><span class="hr-wval hr-tone-'+a.v5.tone+'">'+esc(a.v5.value)+"</span></div>"+
-    '<div class="hr-winrow"><span class="hr-wlabel">7D</span><span class="hr-cells h7 hr-tone-'+a.v7.tone+'" role="img" aria-label="7d '+esc(a.v7.value)+'">'+hrCells(a.v7.fill)+'</span><span class="hr-wval hr-tone-'+a.v7.tone+'">'+esc(a.v7.value)+"</span></div></div>":"";
+    '<div class="hr-winrow"><span class="hr-wlabel">7D</span><span class="hr-cells h7 hr-tone-'+a.v7.tone+'" role="img" aria-label="7d '+esc(a.v7.value)+'">'+hrCells(a.v7.fill)+'</span><span class="hr-wval hr-tone-'+a.v7.tone+'">'+esc(a.v7.value)+"</span></div>"+extraRows+"</div>":"";
   return '<div class="hr-acct"><div class="hr-arow">'+
     '<span class="hr-aname">'+esc(a.name)+'</span>'+
     '<span class="hr-pill">'+esc(a.provider)+'</span>'+

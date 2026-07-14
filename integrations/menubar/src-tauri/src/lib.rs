@@ -473,21 +473,22 @@ fn build_popover(app: &AppHandle, widget_url: &Url) -> tauri::Result<WebviewWind
     // real material, like a system popover. Elsewhere the page keeps its
     // bundled wall.
     let embed_css = if cfg!(target_os = "macos") {
-        // Full-bleed Apple-frost: the window provides the real popover
-        // material; the card drops its own wall/backdrop-filter (a
-        // backdrop-filter forces an opaque layer in WKWebView and blacks
-        // out window transparency) and keeps only a light tint, a system
-        // corner radius matching the material, and a native hairline ring.
+        // The panel IS the page: a near-opaque dark rounded card painted
+        // over a fully transparent window. macOS derives the real window
+        // shadow from the content's alpha shape, so the corners are clean
+        // (no native-material layer whose square corners can peek out) and
+        // there is no border chrome at all. backdrop-filter must stay off —
+        // it forces an opaque layer in WKWebView and blacks out the window.
         "html,body{background:transparent !important}\
          .hr{background:transparent !important;padding:0 !important}\
          .hr-wall{display:none !important}\
          .hr-pop{width:100% !important;max-width:none !important;\
                  min-height:100vh;border:0 !important;\
                  border-radius:14px !important;overflow:hidden;\
-                 background:rgba(15,18,28,.35) !important;\
+                 background:rgba(16,20,29,.96) !important;\
                  backdrop-filter:none !important;\
                  -webkit-backdrop-filter:none !important;\
-                 box-shadow:inset 0 0 0 1px rgba(255,255,255,.09) !important}"
+                 box-shadow:none !important}"
     } else {
         ""
     };
@@ -521,15 +522,6 @@ fn build_popover(app: &AppHandle, widget_url: &Url) -> tauri::Result<WebviewWind
         .skip_taskbar(true)
         .visible_on_all_workspaces(true)
         .transparent(true);
-    // Native panel material: the same adaptive frosted popover material the
-    // system menu-bar panels use, with matching rounded corners.
-    #[cfg(target_os = "macos")]
-    let builder = builder.effects(tauri::utils::config::WindowEffectsConfig {
-        effects: vec![tauri::utils::WindowEffect::Popover],
-        state: Some(tauri::utils::WindowEffectState::Active),
-        radius: Some(14.0),
-        color: None,
-    });
     builder
         .initialization_script(&init_script)
         .on_navigation(move |url| {

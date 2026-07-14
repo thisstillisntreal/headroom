@@ -118,6 +118,22 @@ class WidgetContractTests(unittest.TestCase):
         self.assertEqual(states, {"current": "current", "limited": "limited",
                                   "stale": "stale", "held": "held"})
 
+    def test_scoped_windows_ride_along_without_driving_account_state(self):
+        account = usage_account("fabled")
+        account["windows"]["scoped:Fable"] = {
+            "used_percent": 100.0, "resets_at": NOW + 5 * 86400,
+            "observed_at": NOW - 20, "window_minutes": 10080}
+        row = widget.project(usage_snapshot(account), NOW)["accounts"][0]
+        # the scoped weekly cap is VISIBLE (limited, 0 observed left)…
+        scoped = row["windows"]["scoped:Fable"]
+        self.assertEqual(scoped["state"], "limited")
+        self.assertEqual(scoped["last_observed_left_percent"], 0.0)
+        # …but a scoped model cap never blocks the account's other models
+        self.assertEqual(row["state"], "current")
+        # and it never moves the fleet averages (5h/7d only)
+        headline = widget.project(usage_snapshot(account), NOW)["headline"]
+        self.assertEqual(headline["avg_5h_left_percent"], 80.0)
+
     def test_verified_local_renders_current_not_held(self):
         # regression: the display layer must accept every trust state the
         # router routes on — verified_local slots rendered as "held, never
@@ -799,8 +815,11 @@ class LiquidGlassWidgetTests(unittest.TestCase):
         self.assertIn(".hr-card.medium { width: 438px; height: 206px;", css)
         self.assertIn("grid-template-columns: 140px 1fr", css)
         self.assertIn("grid-template-columns: 110px 1fr 36px", css)
-        # popover window meters keep the design geometry: 24px | cells | 46px
-        self.assertIn("grid-template-columns: 24px 1fr 46px", css)
+        # popover window meters keep the design geometry: a label column that
+        # starts at the 5H/7D width but can grow for scoped labels (FABLE),
+        # then cells, then the 46px value column
+        self.assertIn(
+            "grid-template-columns: minmax(24px, max-content) 1fr 46px", css)
         self.assertIn(".hr-pop { width: 352px;", css)
 
     # ------------------------------------------------------- data wiring
