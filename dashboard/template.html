@@ -375,13 +375,13 @@ function windowState(a,key){const state=displayState(a);return state==="held"||s
 function windowView(a,key){
   const d=projected(a),w=d&&d.windows&&d.windows[key],state=windowState(a,key),accountState=displayState(a);
   const limited=accountState==="limited"&&state==="limited";
-  /* fork fix: a "limited" account can still have "current" windows with valid
-     readings (e.g. 5h is fine but 7d hit the cap). Show left_percent for any
-     current window, not only when the account-level state is also current. */
+  /* A "limited" account can still have "current" windows with valid readings
+     (e.g. 5h is fine but 7d hit the cap).  Show left_percent for any current
+     window, not only when the account-level state is also current. */
   const currentWin=state==="current"&&w;
   const left=currentWin&&Number.isFinite(w.left_percent)?w.left_percent:(limited&&w&&Number.isFinite(w.last_observed_left_percent)?w.last_observed_left_percent:null);
   const projTone=currentWin&&["green","yellow","orange","red"].includes(w.tone)?w.tone:null;
-  const safeTone=projTone||(limited?"red":"unknown");
+  const safeTone=projTone||(left!=null?tone(left):"unknown");
   return{state:state,left:left,tone:safeTone};
 }
 function isCurrent(a){return displayState(a)==="current";}
@@ -481,7 +481,7 @@ function render(data,forceNoncurrent){
   sourceFailed=forceNoncurrent===true||data.refresh_failed===true;
   const accounts=data.accounts.map((a,i)=>Object.assign({},a,{__display:display.accounts[i]}));
   const current=accounts.filter(isCurrent);
-  /* fork fix: include current windows from limited accounts in summary metrics,
+  /* Include current windows from limited accounts in summary metrics,
      not just fully-current accounts — windowView already handles the mixed case. */
   const readings=[];
   accounts.forEach(a=>["5h","7d"].forEach(k=>{
