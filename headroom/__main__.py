@@ -11,7 +11,10 @@ usage:
   headroom env <model>              print the export line for the best account
   headroom claude [args...]         launch Claude; supervise opted-in auto-handoff
     --headroom-auto-handoff / --headroom-no-auto-handoff   one-run override
+    --headroom-launch-fallback      exec the bare CLI if the launch fails
+                                    before the CLI ever started (opt-in)
   headroom codex [args...]          launch Codex on the best account
+  headroom caps                     print scripting capability flags as JSON
   headroom run <model> -- <cmd...>  headless run with auto-rotation on limit-hit
   headroom rotate [model]           cool the current account down, pick the next
   headroom handoff [--session UUID] [--to SLOT] [--model FAMILY]
@@ -35,6 +38,7 @@ usage:
 
 Try it with no accounts:  headroom serve --demo   (bundled sample data)
 """
+import os
 import sys
 
 from . import __version__, registry
@@ -64,6 +68,18 @@ def main(argv=None):
         return 1
 
 
+def _strip_launch_fallback(args):
+    """Remove --headroom-launch-fallback from a codex option segment.
+
+    Codex value-taking flags aren't modelled here (they're the codex CLI's
+    business), so only exact pre-`--` matches are stripped — the flag is
+    headroom's own and never a legitimate codex flag value."""
+    separator = args.index("--") if "--" in args else len(args)
+    head = [arg for arg in args[:separator]
+            if arg != "--headroom-launch-fallback"]
+    return head + args[separator:], len(head) != separator
+
+
 def _dispatch(argv):
     if not argv or argv[0] in ("-h", "--help", "help"):
         print(__doc__)
@@ -76,6 +92,25 @@ def _dispatch(argv):
 
     if command in ("-V", "--version", "version"):
         print(f"headroom {__version__}")
+        return 0
+    if command == "caps":
+        # capability probe for launchers: derived from what this binary
+        # actually implements (introspection, not a hardcoded promise), so a
+        # wrapper can refuse/adapt to an old binary that lacks a feature
+        import json
+
+        from . import notify, route
+        capabilities = {
+            "schema": 1,
+            "launch_marker": callable(
+                getattr(route, "write_launch_marker", None)),
+            "launch_fallback": callable(
+                getattr(route, "bare_fallback_exec", None)),
+            "notify_cmd": callable(getattr(notify, "emit", None)),
+            "slot_lease": callable(
+                getattr(route, "acquire_slot_lease", None)),
+        }
+        print(json.dumps(capabilities, sort_keys=True))
         return 0
     if command == "setup":
         from . import wizard
@@ -109,11 +144,19 @@ def _dispatch(argv):
     if command in ("claude", "codex"):
         from . import route
         provider_cmd = "claude" if command == "claude" else "codex"
-        auto_flag = no_auto_flag = False
+        auto_flag = no_auto_flag = fallback_flag = False
         if command == "claude":
             from . import supervisor
-            args, auto_flag, no_auto_flag = \
-                supervisor.strip_headroom_overrides(args)
+            args, headroom_flags = supervisor.split_headroom_flags(args)
+            auto_flag = "--headroom-auto-handoff" in headroom_flags
+            no_auto_flag = "--headroom-no-auto-handoff" in headroom_flags
+            fallback_flag = "--headroom-launch-fallback" in headroom_flags
+        else:
+            args, fallback_flag = _strip_launch_fallback(args)
+        # opt-in in-process launch fallback: any failure strictly BEFORE the
+        # first CLI process is spawned execs the bare CLI instead of exiting
+        fallback = fallback_flag or \
+            os.environ.get("HEADROOM_LAUNCH_FALLBACK", "") == "1"
         # honour an explicit model flag (both `--model X` and `--model=X`) so a
         # scoped weekly cap (e.g. Opus) gates the routing decision
         model = None
@@ -142,6 +185,9 @@ def _dispatch(argv):
                 all_tty = (sys.stdin.isatty() and sys.stdout.isatty()
                            and sys.stderr.isatty())
                 if all_tty and not incompatible:
+                    if fallback:
+                        return supervisor.cmd_claude(
+                            fam, args, fallback_argv=["claude"] + args)
                     return supervisor.cmd_claude(fam, args)
                 why = incompatible or "stdin/stdout/stderr are not all TTYs"
                 print(f"[headroom] auto-handoff disabled for this run: {why}",
@@ -149,6 +195,9 @@ def _dispatch(argv):
                 launch_note = f"auto-handoff disabled: {why}"
             else:
                 launch_note = "auto-handoff not enabled"
+        if fallback:
+            return route.cmd_exec(fam, [command] + args,
+                                  launch_note=launch_note, fallback=True)
         return route.cmd_exec(fam, [command] + args, launch_note=launch_note)
     if command == "run":
         from . import route
