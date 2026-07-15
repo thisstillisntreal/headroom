@@ -524,7 +524,12 @@ def codex_app_server_read(home, timeout=None):
     # single-bucket view. Both carry primary/secondary RateLimitWindow objects.
     by_id = result.get("rateLimitsByLimitId") or {}
     rate_limits = by_id.get("codex") or result.get("rateLimits") or {}
-    return {"account": account, "rate_limits": rate_limits}
+    # Non-"codex" buckets are model-scoped limits (e.g. GPT-5.3-Codex-Spark);
+    # carry them so codex_windows can surface each as a scoped:<name> row.
+    scoped_limits = {lid: lim for lid, lim in by_id.items()
+                     if lid != "codex" and isinstance(lim, dict)}
+    return {"account": account, "rate_limits": rate_limits,
+            "scoped_limits": scoped_limits}
 
 
 def codex_window(window, now):
@@ -551,37 +556,67 @@ def codex_window(window, now):
 CODEX_STANDARD_WINDOWS = {300: "5h", 10080: "7d"}
 
 
-def codex_windows(rate_limits, now):
-    """Build headroom's 5h/7d windows from an app-server rate-limits payload,
+def codex_scoped_window(bucket, now):
+    """Map a model-scoped rate-limit bucket (e.g. GPT-5.3-Codex-Spark) to a
+    ``(display_name, weekly-window)`` pair, or None when it carries no usable
+    weekly reading. The bucket has the same shape as the codex bucket
+    (primary/secondary RateLimitWindow) plus a ``limitName``; display_name is
+    the limitName's trailing codename ("Spark"), not the full verbose string."""
+    if not isinstance(bucket, dict):
+        return None
+    name = bucket.get("limitName")
+    # limitName MUST be a non-empty string: a truthy non-str (e.g. the int 5)
+    # would pass a bare `if not name` and then blow up on "scoped:" + name,
+    # holding the WHOLE codex seat via collect()'s outer except. Guard the type.
+    if not isinstance(name, str) or not name:
+        return None
+    # OpenAI reports a verbose scoped limit name ("GPT-5.3-Codex-Spark"); show
+    # only the trailing model codename ("Spark") so the row reads like Claude's
+    # short scoped labels ("Fable"). Assumes a single-word codename: a
+    # hyphenated one keeps only its last segment, and two limits sharing a
+    # codename would collide on one scoped:<codename> key (same latent
+    # constraint Claude's already-short names carry).
+    label = name.rsplit("-", 1)[-1]
+    for slot in ("primary", "secondary"):
+        mapped = codex_window(bucket.get(slot), now)
+        if mapped and mapped.get("window_minutes") == 10080:
+            return label, mapped
+    return None
+
+
+def codex_windows(rate_limits, now, scoped_limits=None):
+    """Build headroom's usage windows from an app-server rate-limits payload,
     robust to the server reordering or omitting windows.
 
     Windows are bucketed by their real ``windowDurationMins`` rather than their
-    primary/secondary position. A standard window the server left out is treated
-    as fully available (0% used) ONLY when at least one recognized 300-min or
-    10080-min bucket was reported: a binding window is always reported, so an
-    absent one next to a present one means that limit is not currently a
-    constraint. An EMPTY or unrecognized payload proves nothing — synthesizing
-    0%/0% from it would fabricate routable capacity, so it raises and the seat
-    is HELD."""
-    buckets = {}
+    primary/secondary position, and ONLY the windows the server actually
+    reported are returned — an absent standard window is OMITTED, never
+    synthesized as 0%. (OpenAI lifted the 5-hour limit in 2026-07: the codex
+    bucket now reports the weekly window alone, and faking an absent 5h as 0%
+    would invent capacity for a limit that no longer exists. validate_required_
+    windows(require_5h=False) keeps the weekly mandatory for codex while
+    tolerating the missing 5h.) An EMPTY or unrecognized payload proves nothing,
+    so it raises and the seat is HELD.
+
+    ``scoped_limits`` maps model-scoped buckets to their RateLimitWindow
+    payloads; each usable one becomes a ``scoped:<name>`` weekly row, mirroring
+    Claude's weekly_scoped handling so the dashboard renders it for free."""
+    windows = {}
     for slot in ("primary", "secondary"):
         mapped = codex_window(rate_limits.get(slot), now)
         if mapped is None:
             continue
         key = CODEX_STANDARD_WINDOWS.get(mapped.get("window_minutes"))
-        if key and key not in buckets:
-            buckets[key] = mapped
-    if not buckets:
+        if key and key not in windows:
+            windows[key] = mapped
+    if not windows:
         raise IdentityBindingError("codex_capacity_unrecognized")
-
-    def available(minutes):
-        return {"used_percent": 0.0, "resets_at": None,
-                "window_minutes": minutes, "observed_at": now,
-                "freshness": "fresh"}
-    return {
-        "5h": buckets.get("5h") or available(300),
-        "7d": buckets.get("7d") or available(10080),
-    }
+    for bucket in (scoped_limits or {}).values():
+        entry = codex_scoped_window(bucket, now)
+        if entry:
+            name, window = entry
+            windows["scoped:" + name] = window
+    return windows
 
 
 def codex_live(home, expected_email=None, now=None):
@@ -620,7 +655,7 @@ def codex_live(home, expected_email=None, now=None):
         "auth_mode": "chatgpt",
         "subscription": codex_subscription(provider_claims),
     }
-    windows = codex_windows(rate_limits, now)
+    windows = codex_windows(rate_limits, now, read.get("scoped_limits"))
     return identity, plan_type, windows
 
 
@@ -877,8 +912,10 @@ def codex_limits(home, now=None):
 
 # ---------------------------------------------------------------- snapshot
 
-def validate_required_windows(windows):
-    for key in ("5h", "7d"):
+def validate_required_windows(windows, require_5h=True):
+    # codex passes require_5h=False: OpenAI lifted the 5h limit, so a codex
+    # seat legitimately reports only the weekly window (see codex_windows).
+    for key in (("5h", "7d") if require_5h else ("7d",)):
         window = windows.get(key)
         if not isinstance(window, dict):
             raise ValueError(f"missing required {key} usage window")
@@ -1069,7 +1106,8 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                         "pro": "ChatGPT Pro", "plus": "ChatGPT Plus",
                         "prolite": "ChatGPT Pro Lite", "free": "Free",
                     }.get(str(plan_type or ""), plan_type or "Unknown")
-                    validate_required_windows(result["windows"])
+                    validate_required_windows(result["windows"],
+                                              require_5h=False)
                     result["ok"] = True
                 except IdentityBindingError as app_error:
                     code = str(app_error.code)

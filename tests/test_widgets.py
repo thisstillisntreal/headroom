@@ -174,6 +174,44 @@ class WidgetContractTests(unittest.TestCase):
         self.assertEqual(projected["windows"]["7d"]["state"], "held")
         self.assertIsNone(projected["windows"]["7d"]["left_percent"])
 
+    def test_lifted_5h_is_omitted_not_held(self):
+        # OpenAI lifted Codex's 5h: a live seat reports only the weekly window.
+        # An absent 5h must be OMITTED, never projected as held — a held 5h
+        # would poison the account state and grey out a current seat. (The
+        # weekly stays mandatory; see test_missing_windows_are_explicitly_held.)
+        account = usage_account("codexmain", provider="codex")
+        del account["windows"]["5h"]
+        account["windows"]["scoped:Spark"] = {
+            "used_percent": 3.0, "resets_at": NOW + 600000,
+            "observed_at": NOW - 20}
+        projected = widget.project(usage_snapshot(account), NOW)["accounts"][0]
+        self.assertEqual(projected["state"], "current")
+        self.assertNotIn("5h", projected["windows"])
+        self.assertEqual(projected["windows"]["7d"]["state"], "current")
+        self.assertEqual(
+            projected["windows"]["scoped:Spark"]["state"],
+            "current")
+
+    def test_non_codex_missing_5h_projects_held(self):
+        # 5h is optional ONLY for codex. A claude seat missing its 5h is a
+        # failed read: it must project HELD (fail-closed), never be omitted the
+        # way a lifted codex 5h is.
+        account = usage_account("cl")  # provider defaults to "claude"
+        del account["windows"]["5h"]
+        projected = widget.project(usage_snapshot(account), NOW)["accounts"][0]
+        self.assertEqual(projected["state"], "held")
+        self.assertEqual(projected["windows"]["5h"]["state"], "held")
+
+    def test_present_but_malformed_5h_holds_codex(self):
+        # only a genuinely ABSENT 5h is lifted; a present-but-null 5h (corrupt
+        # snapshot) is NOT lifted — it must project held, never be omitted.
+        account = usage_account("cx", provider="codex")
+        account["windows"]["5h"] = None
+        projected = widget.project(usage_snapshot(account), NOW)["accounts"][0]
+        self.assertEqual(projected["state"], "held")
+        self.assertIn("5h", projected["windows"])
+        self.assertEqual(projected["windows"]["5h"]["state"], "held")
+
     def test_one_stale_window_demotes_every_child_window(self):
         account = usage_account()
         account["windows"]["7d"]["observed_at"] = (
@@ -252,6 +290,108 @@ class WidgetContractTests(unittest.TestCase):
         self.assertIn("hr 0/1 · -- | color=gray", rendered.splitlines()[1])
 
 
+# Drives the REAL dashboard template JS under node: exercise both consumer
+# paths — the main dashboard (displayState/windowMarkup) and the compact widget
+# (hrValidFeed/hrAccount/hrAcctMarkup/hrBarsMarkup) — with a lifted-5h codex
+# seat and a fail-closed non-codex seat, and print one JSON verdict object.
+_CODEX_5H_TAIL = r"""
+;(function () {
+  snapshotState = "current"; sourceFailed = false;
+  const nowS = Date.now() / 1e3;
+  const projWin = (state, left) => ({ state: state,
+    left_percent: state === "current" ? left : null,
+    last_observed_left_percent: state === "current" ? null : left,
+    resets_at: nowS + 3600, observed_at: nowS - 30 });
+  // main-dashboard account: RAW windows carry no 5h and the __display
+  // projection (server-side widget.project) also omits it — exactly what a
+  // lifted-5h codex seat looks like.
+  const mainAcct = (provider) => ({ name: "cx", provider: provider,
+    captured_at: nowS - 30,
+    windows: { "7d": { used_percent: 20, resets_at: nowS + 8 * 86400 } },
+    __display: { state: "current",
+                 windows: { "7d": projWin("current", 80) } } });
+  // compact-widget feed account (headroom_widget@1): 7d only, no 5h.
+  const feedWin = { state: "current", left_percent: 80,
+    last_observed_left_percent: null, resets_at: nowS + 3600,
+    observed_at: nowS - 30 };
+  const mkFeed = (provider) => ({ schema: "headroom_widget@1",
+    freshness: { state: "current", age_seconds: 30, reason: "ok",
+                 evaluated_at: nowS },
+    accounts: [{ name: "cx", provider: provider, state: "current",
+                 windows: { "7d": feedWin } }],
+    headline: { current_accounts: 1, total_accounts: 1,
+                fullest_5h_left_percent: null } });
+  const acct = hrAccount({ name: "cx", provider: "codex", state: "current",
+    windows: { "7d": feedWin } }, false);
+  const acctMarkup = hrAcctMarkup(acct);
+  const bars = hrBarsMarkup({ accts: [acct] });
+  console.log(JSON.stringify({
+    codex_displayState: displayState(mainAcct("codex")),
+    claude_displayState: displayState(mainAcct("claude")),
+    codex_5h_markup: windowMarkup(mainAcct("codex"), "5h"),
+    codex_feed_valid: hrValidFeed(mkFeed("codex")),
+    claude_feed_valid: hrValidFeed(mkFeed("claude")),
+    hr_state: acct.state,
+    hr_has5h: acct.has5h,
+    hr_tile_fill: acct.tile.fill,
+    hr_markup_has_5h_label: /class="hr-wlabel">5H</.test(acctMarkup),
+    hr_markup_has_7d_label: /class="hr-wlabel">7D</.test(acctMarkup),
+    hr_markup_has_na: acctMarkup.indexOf(">n/a<") !== -1,
+    hr_bar_unknown: bars.indexOf("hr-tone-unknown") !== -1,
+    hr_bar_green: bars.indexOf("hr-tone-green") !== -1
+  }));
+})();
+"""
+
+
+class CodexLiftedFiveHourDashboardJS(unittest.TestCase):
+    """Execution-level coverage for the dashboard's optional-5h handling
+    (dashboard/template.html). OpenAI lifted Codex's 5h, so a live codex seat
+    reports only the weekly window: both the main-dashboard state path and the
+    compact-widget path must keep it live (never grey/held), while a NON-codex
+    seat missing its 5h still fails closed."""
+
+    @staticmethod
+    def _harness():
+        with open(dashboard.TEMPLATE) as handle:
+            html = handle.read()
+        section = html.split(
+            "/* ------------------------------------------------------------- helpers */",
+            1)[1].split(
+            "/* --------------------------------------------------------------- theme */",
+            1)[0]
+        return ("const OBSERVATION_MAX_AGE=1800,SNAPSHOT_MAX_AGE=900;\n"
+                + section + _CODEX_5H_TAIL)
+
+    @unittest.skipUnless(NODE, "node runtime required to execute dashboard JS")
+    def test_lifted_5h_keeps_codex_live_but_holds_non_codex(self):
+        proc = subprocess.run([NODE, "-"], input=self._harness(),
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = json.loads(proc.stdout.strip().splitlines()[-1])
+        # F2: a live codex seat with a lifted 5h stays CURRENT on the main
+        # dashboard; a claude seat missing its 5h fails closed to HELD.
+        self.assertEqual(out["codex_displayState"], "current")
+        self.assertEqual(out["claude_displayState"], "held")
+        # F5: the codex 5h cell reads a neutral "no 5h limit", never "n/a".
+        self.assertIn("no 5h limit", out["codex_5h_markup"])
+        self.assertNotIn("n/a", out["codex_5h_markup"])
+        # F6: the compact-widget validator accepts a codex feed with no 5h but
+        # rejects a non-codex feed with no 5h (5h stays mandatory off codex).
+        self.assertTrue(out["codex_feed_valid"])
+        self.assertFalse(out["claude_feed_valid"])
+        # F4: the compact widget renders the codex seat CURRENT with the battery
+        # tile driven by 7d (filled/green), no phantom "5H" row or "n/a".
+        self.assertEqual(out["hr_state"], "current")
+        self.assertFalse(out["hr_has5h"])
+        self.assertEqual(out["hr_tile_fill"], 80)
+        self.assertFalse(out["hr_markup_has_5h_label"])
+        self.assertTrue(out["hr_markup_has_7d_label"])
+        self.assertFalse(out["hr_markup_has_na"])
+        self.assertFalse(out["hr_bar_unknown"])
+        self.assertTrue(out["hr_bar_green"])
+
+
 class WidgetRendererTests(unittest.TestCase):
     def test_sanitizer_removes_newlines_and_controls(self):
         cleaned = widget.sanitize("a\r\nb\x00c\x1fd\x7fe\u200bf")
@@ -288,6 +428,21 @@ class WidgetRendererTests(unittest.TestCase):
         rendered = widget.render_swiftbar(
             usage_snapshot(usage_account()), NOW)
         self.assertIn("Avg battery: 5h 80% · 7d 60%", rendered)
+
+    def test_swiftbar_omits_lifted_5h_row_on_current_codex_seat(self):
+        # OpenAI lifted Codex's 5h: project() drops the absent 5h on a live
+        # codex seat, so render_swiftbar must emit NO "--5h:" sub-row — never a
+        # phantom "--5h: -- (held)" — and the seat must stay CURRENT.
+        account = usage_account("cx", provider="codex")
+        del account["windows"]["5h"]
+        rendered = widget.render_swiftbar(usage_snapshot(account), NOW)
+        self.assertNotRegex(rendered, r"(?m)^--5h:")
+        self.assertRegex(rendered, r"(?m)^--7d: ")
+        self.assertRegex(rendered, r"(?m)^cx · codex · CURRENT")
+        # the account-row colour falls back to 7d (not the absent 5h), so a
+        # current codex seat reads coloured, never greyed by its lifted session
+        self.assertNotRegex(rendered,
+                            r"(?m)^cx · codex · CURRENT \| color=gray")
 
     def test_swiftbar_renderer_emits_no_execution_directives(self):
         account = usage_account("safe")
