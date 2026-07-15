@@ -18,6 +18,7 @@ import io
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -511,7 +512,7 @@ class SpawnAmbiguityFlag(TempDirCase):
         # simulate a signal/trace handler firing the instant Popen returns
         account = self.account()
 
-        def popen_then_raise(argv, env=None, cwd=None):
+        def popen_then_raise(argv, env=None, cwd=None, **kw):
             raise KeyboardInterrupt("signal landed after the child was live")
 
         runner = supervisor.Supervisor(
@@ -571,7 +572,7 @@ class NotifyWiring(TempDirCase):
         account = self.account()
         order = []
 
-        def popen(argv, env=None, cwd=None):
+        def popen(argv, env=None, cwd=None, **kw):
             order.append("popen")
             return mock.Mock()
 
@@ -618,7 +619,7 @@ class NotifyWiring(TempDirCase):
         clock = {"t": 1000.0}
         runner = supervisor.Supervisor(
             "sonnet", [], account,
-            popen=lambda argv, env=None, cwd=None: FakeProcess(),
+            popen=lambda argv, env=None, cwd=None, **kw: FakeProcess(),
             now=lambda: clock["t"], sleep=lambda seconds: None)
         with mock.patch.object(notify, "emit") as emit, \
                 redirect_stderr(io.StringIO()):
@@ -1367,7 +1368,8 @@ class R3ShutdownSignalNotifiesLoss(TempDirCase):
         child.process.poll.side_effect = lambda: next(poll_seq)
 
         class FakeGuard:
-            shutdown_signal = 15          # SIGTERM already latched + forwarded
+            shutdown_signal = 15          # SIGTERM already latched
+            forwarded = True              # ...and already forwarded to child
 
             def install(self):
                 pass
@@ -1436,6 +1438,206 @@ class R3CrudeBareArgvValueAware(TempDirCase):
         self.assertEqual(execute.call_args.args[1],
                          ["claude", "--system-prompt",
                           "--headroom-auto-handoff"])
+
+
+# ==========================================================================
+# Round-4 red-team fixes
+# ==========================================================================
+class R4SpawnSignalMask(TempDirCase):
+    """P0(r4): signals are BLOCKED across only the Popen call, so a signal
+    that fires during the fork window cannot run an async handler there — the
+    window stays ambiguous and no source recovery / second spawn happens. The
+    child unblocks the mask via preexec_fn."""
+
+    def test_guard_signals_are_blocked_during_popen_and_restored_after(self):
+        # deterministic proof of the masking: inside the Popen call the guard's
+        # signals are blocked (so no async handler can run there); after
+        # _spawn the prior mask is restored.
+        account = self.account("acct-a")
+        seen = {}
+
+        def popen(argv, env=None, cwd=None, **kw):
+            blocked = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+            seen["during"] = {s for s in supervisor._SPAWN_MASK_SIGNALS
+                              if s in blocked}
+            return mock.Mock()
+
+        before = {s for s in supervisor._SPAWN_MASK_SIGNALS
+                  if s in signal.pthread_sigmask(signal.SIG_BLOCK, [])}
+        runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
+        with mock.patch.object(runner, "_settings_file", return_value=""), \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            runner._spawn(account, [], self.temp.name, False)
+        after = {s for s in supervisor._SPAWN_MASK_SIGNALS
+                 if s in signal.pthread_sigmask(signal.SIG_BLOCK, [])}
+        self.assertEqual(seen["during"], set(supervisor._SPAWN_MASK_SIGNALS))
+        self.assertEqual(after, before)  # mask restored, nothing left blocked
+
+    def test_signal_delivered_during_popen_does_not_clear_ambiguity(self):
+        # a signal that arrives during the masked Popen window is QUEUED, not
+        # run there; Popen succeeds, so spawn_ambiguous is never cleared and
+        # the queued signal is delivered (to a benign handler) after the mask
+        # is restored.
+        account = self.account("acct-a")
+        ran = {"delivered": False, "in_popen": False}
+        in_popen = {"v": False}
+
+        def handler(signum, frame):
+            ran["delivered"] = True
+            if in_popen["v"]:
+                ran["in_popen"] = True
+
+        def popen(argv, env=None, cwd=None, **kw):
+            in_popen["v"] = True
+            os.kill(os.getpid(), signal.SIGTERM)  # blocked -> queued
+            in_popen["v"] = False
+            return mock.Mock()
+
+        previous = signal.signal(signal.SIGTERM, handler)
+        try:
+            runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
+            with mock.patch.object(runner, "_settings_file",
+                                   return_value=""), \
+                    mock.patch.object(notify, "emit"), \
+                    redirect_stderr(io.StringIO()):
+                runner._spawn(account, [], self.temp.name, False)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+        self.assertTrue(ran["delivered"])       # queued signal WAS delivered
+        self.assertFalse(ran["in_popen"])        # ...but NOT inside the window
+        self.assertTrue(runner.spawn_ambiguous)  # a live child -> stays open
+        self.assertFalse(runner.spawned_any)
+
+    def test_spawn_passes_preexec_fn_that_unblocks_the_child(self):
+        account = self.account("acct-a")
+        popen = mock.Mock(return_value=mock.Mock())
+        runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
+        with mock.patch.object(runner, "_settings_file", return_value=""), \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            runner._spawn(account, [], self.temp.name, False)
+        self.assertIs(popen.call_args.kwargs.get("preexec_fn"),
+                      supervisor._unblock_spawn_mask)
+
+    def test_real_child_has_a_clean_signal_mask(self):
+        # end-to-end: the preexec_fn genuinely clears the inherited block, so a
+        # real child does NOT start with SIGTERM/SIGHUP/SIGINT blocked
+        account = self.account("acct-a")
+        reader = os.path.join(self.temp.name, "childmask.py")
+        out = os.path.join(self.temp.name, "mask.out")
+        with open(reader, "w", encoding="utf-8") as handle:
+            handle.write(
+                "import signal, sys\n"
+                "m = signal.pthread_sigmask(signal.SIG_BLOCK, [])\n"
+                "blocked = [s for s in (signal.SIGTERM, signal.SIGHUP,"
+                " signal.SIGINT) if s in m]\n"
+                f"open({out!r}, 'w').write(repr(blocked))\n")
+
+        def popen(argv, env=None, cwd=None, **kw):
+            # run the reader as a real child with the preexec_fn from _spawn
+            return subprocess.Popen(
+                [sys.executable, reader], preexec_fn=kw.get("preexec_fn"))
+
+        runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
+        with mock.patch.object(runner, "_settings_file", return_value=""), \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            child = runner._spawn(account, [], self.temp.name, False)
+        child.process.wait()
+        with open(out, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "[]")  # nothing blocked
+
+
+class R4ShutdownNotifyDeferredUntilForwarded(TempDirCase):
+    """P1(r4): the supervision_lost NOTIFY is deferred until the signal has
+    been forwarded, so a slow notifier can't delay SIGTERM/SIGHUP forwarding."""
+
+    def test_notify_only_after_forwarding_and_disarms_immediately(self):
+        account = self.account()
+        runner = supervisor.Supervisor(
+            "sonnet", [], account, now=lambda: 1000.0,
+            sleep=lambda seconds: None)
+        child = mock.Mock()
+        child.account = account
+        child.automation = True
+        child.binding = object()
+        child.launched_at = 0.0
+        child.supervision_loss_notified = False
+        order = []
+        counter = {"n": 0}
+
+        def child_poll():
+            counter["n"] += 1
+            return None if counter["n"] < 6 else 0
+
+        child.process.poll.side_effect = child_poll
+
+        # a fake guard that mirrors _SignalGuard's two-poll forwarding
+        class Guard:
+            shutdown_signal = signal.SIGTERM
+            polls = 0
+            forwarded = False
+
+            def install(self):
+                pass
+
+            def restore(self):
+                pass
+
+            def poll(self, process):
+                if self.shutdown_signal is None or process.poll() is not None:
+                    return
+                self.polls += 1
+                if self.polls >= 2 and not self.forwarded:
+                    order.append("forward")
+                    self.forwarded = True
+
+        def record_emit(event):
+            # the ACTUAL notification (emit), which _lose_supervision fires
+            # once past its guard, is what must land after forwarding
+            if event.get("event") == "supervision_lost":
+                order.append("notify")
+            return True
+
+        with mock.patch.object(supervisor, "_SignalGuard", Guard), \
+                mock.patch.object(runner, "_handle_events", return_value=None), \
+                mock.patch.object(notify, "emit", side_effect=record_emit), \
+                redirect_stderr(io.StringIO()):
+            returncode = runner._monitor(child)
+        self.assertEqual(returncode, 0)
+        # automation is disarmed on the FIRST poll (before forwarding); the
+        # notify is deferred until AFTER the forward
+        self.assertFalse(child.automation)
+        self.assertIn("forward", order)
+        self.assertIn("notify", order)
+        self.assertLess(order.index("forward"), order.index("notify"))
+        # and the notification fires exactly once
+        self.assertEqual(order.count("notify"), 1)
+
+
+class R4AmbiguousStopEmitsSupervisionLost(TempDirCase):
+    """P2(r4): the ambiguous-stop path emits supervision_lost directly (no
+    Child handle), so observers learn the orphaned child is unmonitored."""
+
+    def test_initial_ambiguous_stop_emits_supervision_lost(self):
+        account = self.account("acct-a")
+        runner = supervisor.Supervisor("sonnet", [], account)
+
+        def fake_spawn(acct, args, cwd, automatic, plan=None):
+            runner.spawn_ambiguous = True
+            raise RuntimeError("post-popen boom")
+
+        with mock.patch.object(runner, "_spawn", side_effect=fake_spawn), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            code = runner.run()
+        self.assertEqual(code, 127)
+        lost = [call.args[0] for call in emit.call_args_list
+                if call.args[0]["event"] == "supervision_lost"]
+        self.assertEqual(len(lost), 1)
+        self.assertEqual(lost[0]["account"], "acct-a")
+        self.assertIn("unmonitored", lost[0]["reason"])
 
 
 if __name__ == "__main__":

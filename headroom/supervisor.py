@@ -32,6 +32,24 @@ LOOP_WINDOW = 10 * 60
 LOOP_MAX = 3
 MAX_HOOK_BYTES = 1024 * 1024
 
+# The signals _SignalGuard installs. They are BLOCKED across only the Popen
+# call in _spawn (the fork window) so no async handler can execute there — the
+# root fix that lets an OSError from Popen be treated as provably synchronous
+# (genuine no-child). See _spawn.
+_SPAWN_MASK_SIGNALS = frozenset({signal.SIGINT, signal.SIGHUP, signal.SIGTERM})
+
+
+def _unblock_spawn_mask():
+    """Child-side (Popen preexec_fn): clear the inherited signal block before
+    exec, so the launched CLI has a normal mask. A CLI that inherited a blocked
+    SIGTERM would be un-terminable and break the handoff. Only calls
+    pthread_sigmask (async-signal-safe); the supervisor is single-threaded, so
+    this preexec_fn is safe."""
+    try:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, _SPAWN_MASK_SIGNALS)
+    except (ValueError, OSError):
+        pass
+
 CAP_RE = re.compile(
     r"\b(?:(?:you(?:'|’)ve\s+)?hit your "
     r"(?:session|weekly|usage) limit|usage limit reached)\b", re.I)
@@ -769,27 +787,44 @@ class Supervisor:
                 handoff.verify_target_binding(plan)
         except handoff.HandoffError as error:
             raise SupervisorError(str(error)) from error
-        # From just before Popen until the outcome is known the spawn is
-        # AMBIGUOUS: an async failure (signal/trace handler raising) in this
-        # window may leave a LIVE child while spawned_any is still False, so
-        # the fallback MUST be suppressed. spawn_ambiguous stays True through
-        # any such escape; it is cleared to "definitely no child" only on a
-        # positively-identified pre-spawn OSError from Popen. (P0-3)
         # hand the account's lease fd to the child so the flock rides on the
         # child (survives an ambiguous spawn / a supervisor exit); no-op unless
         # HEADROOM_SLOT_LEASE=1 (then held_lease_fd is None and no pass_fds
-        # kwarg is added, so legacy-off Popen calls are byte-identical) (P0-1)
-        popen_kwargs = {}
+        # kwarg is added, so legacy-off Popen calls are byte-identical) (P0-1).
+        # preexec_fn clears the child's inherited signal block (see below).
+        popen_kwargs = {"preexec_fn": _unblock_spawn_mask}
         lease_fd = route.held_lease_fd(account.get("name"))
         if lease_fd is not None:
             popen_kwargs["pass_fds"] = (lease_fd,)
+        # ROOT FIX (P0, r4): the ONLY statement inside the ambiguous window is
+        # the Popen call, and the guard's signals are BLOCKED across it. With
+        # delivery blocked, no async signal handler can run in the fork window,
+        # so the sole exception that can escape Popen is a SYNCHRONOUS OSError
+        # raised by Popen itself = genuine no-child — making it correct to
+        # clear spawn_ambiguous there. A signal that arrives while blocked is
+        # queued and delivered right after we restore the mask, once the
+        # child's existence is known. The child unblocks these signals via
+        # preexec_fn before exec (an inherited blocked SIGTERM would make the
+        # CLI un-terminable and break the handoff). On success spawn_ambiguous
+        # stays True for run() to clear once it owns the Child. (P0-3/P0-1)
         self.spawn_ambiguous = True
+        try:
+            previous_mask = signal.pthread_sigmask(
+                signal.SIG_BLOCK, _SPAWN_MASK_SIGNALS)
+        except (ValueError, OSError):
+            previous_mask = None
         try:
             process = self.popen(argv, env=environment, cwd=cwd,
                                  **popen_kwargs)
         except OSError as error:
-            self.spawn_ambiguous = False  # Popen raised — no child exists
+            self.spawn_ambiguous = False  # provably synchronous — no child
             raise SupervisorError(f"cannot start Claude: {error}") from error
+        finally:
+            if previous_mask is not None:
+                try:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                except (ValueError, OSError):
+                    pass
         # Popen succeeded: a child IS live. Do NOT clear spawn_ambiguous or set
         # spawned_any here — leave the window OPEN across the ENTIRE successful
         # return (the notify below AND the Child construction). run() closes
@@ -1333,13 +1368,16 @@ class Supervisor:
             while True:
                 signals.poll(child.process)
                 if signals.shutdown_signal is not None:
-                    # a shutdown signal disarms auto-handoff; if the child
-                    # ignores/survives the forwarded signal it must not stay
-                    # live with supervision silently off — route through
-                    # _lose_supervision so supervision_lost fires once (P1-2).
-                    # signals.poll already forwarded the signal; this only
-                    # records the loss, it does not delay forwarding.
-                    _lose_supervision(child, "shutdown signal received")
+                    # a shutdown signal disarms auto-handoff immediately, but
+                    # the supervision_lost NOTIFY is deferred until the signal
+                    # has actually been forwarded to the child (P1, r4):
+                    # _lose_supervision runs the notifier synchronously, and a
+                    # slow HEADROOM_NOTIFY_CMD must never delay forwarding
+                    # (which happens on _SignalGuard's second poll). Disarm now;
+                    # notify once, after forwarding.
+                    child.automation = False
+                    if signals.forwarded:
+                        _lose_supervision(child, "shutdown signal received")
                 proof = self._handle_events(
                     child, pending_handoff_id, proof)
                 returncode = child.process.poll()
@@ -1432,6 +1470,15 @@ class Supervisor:
                               f"is ambiguous ({error}); a child may be running "
                               f"— not starting another process. If no claude "
                               f"is running, retry.", file=sys.stderr)
+                        # the possibly-live child is unmonitored — notify the
+                        # loss directly with the known account name (no Child
+                        # handle exists on this path) so observers get more than
+                        # stderr+exit127 (P2, r4)
+                        notify.emit({
+                            "event": "supervision_lost",
+                            "account": account["name"],
+                            "reason": f"spawn outcome ambiguous ({error}); a "
+                            "child may be live but is unmonitored"})
                         return 127
                     if pending_plan is not None:
                         # positively no child (OSError cleared spawn_ambiguous):
