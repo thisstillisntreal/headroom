@@ -713,7 +713,15 @@ class _SignalGuard:
 
     def restore(self):
         for signum, handler in self.original.items():
-            signal.signal(signum, handler)
+            try:
+                signal.signal(signum, handler)
+            except OSError:
+                # CPython raises "signal ignored due to race condition" if a
+                # signal is delivered during this handler swap. Restoring the
+                # remaining signals must still proceed, and _spawn samples our
+                # latch AFTER restore() returns — so this best-effort restore
+                # can never skip the requested-kill replay (r9/r10).
+                pass
 
 
 class Supervisor:
