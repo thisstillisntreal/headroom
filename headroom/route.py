@@ -285,9 +285,19 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     windows = snapshot_row.get("windows")
     if not isinstance(windows, dict):
         return "windows invalid"
+    # OpenAI lifted Codex's 5h (2026-07): a live codex seat reports only the
+    # weekly window, so an absent 5h is a lifted limit, not a missing reading.
+    # Skip it for codex; the weekly (7d) stays mandatory for every provider,
+    # and a non-codex seat missing any standard window still holds (fail-closed).
+    codex = account.get("provider") == "codex"
     for key in ("5h", "7d"):
         window = windows.get(key)
         if not isinstance(window, dict):
+            # Only a genuinely ABSENT 5h is the lifted limit. A PRESENT but
+            # malformed 5h ("5h": null / a string, i.e. a corrupt or partially
+            # written snapshot) is not lifted — fail closed and hold.
+            if key == "5h" and codex and key not in windows:
+                continue
             return f"{key} window missing"
         percent = window.get("used_percent")
         if window.get("freshness") == "expired_observation":
@@ -389,14 +399,23 @@ def _headroom_score(row):
     windows = row.get("windows") if isinstance(row, dict) else None
     if not isinstance(windows, dict):
         return -1.0
+    # 5h is optional for codex (OpenAI lifted it): score on whatever standard
+    # windows are present. Reachable for codex now that block_reason no longer
+    # blocks an absent 5h. 7d stays required — its absence, or any unreadable
+    # percent, scores worst (fail-closed ordering).
+    codex = row.get("provider") == "codex"
     values = []
     for key in ("5h", "7d"):
         window = windows.get(key)
-        percent = window.get("used_percent") if isinstance(window, dict) else None
+        if not isinstance(window, dict):
+            if key == "5h" and codex:
+                continue
+            return -1.0
+        percent = window.get("used_percent")
         if not _number(percent):
             return -1.0
         values.append(100.0 - percent)
-    return min(values)
+    return min(values) if values else -1.0
 
 
 def candidates(fam, snapshot=_UNSET):

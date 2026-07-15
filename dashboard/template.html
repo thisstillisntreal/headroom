@@ -593,7 +593,12 @@ function displayState(a){
   if(d.state==="stale")return"stale";
   const captured=epochState(a&&a.captured_at,OBSERVATION_MAX_AGE);
   if(captured!=="current")return captured;
-  const states=["5h","7d"].map(k=>intrinsicWindowState(a,k));
+  /* 5h is optional only for a live codex seat (OpenAI lifted it): skip an
+     absent 5h so it can't force "held". 7d is always counted (mandatory), and
+     a non-codex seat always counts 5h too, so a missing 5h there still holds
+     (fail-closed). */
+  const win=(d&&d.windows)||{};
+  const states=["5h","7d"].filter(k=>k==="7d"||a.provider!=="codex"||win[k]!==undefined).map(k=>intrinsicWindowState(a,k));
   if(states.includes("held"))return"held";
   if(states.includes("stale"))return"stale";
   return states.includes("limited")?"limited":"current";
@@ -639,8 +644,14 @@ function windowMarkup(account,key){
   const w=(account.windows||{})[key]||null;
   const view=windowView(account,key),left=view.left;
   const unknown=left==null;
-  const value=unknown?"n/a":Math.round(left)+"% left";
-  const note=unknown?(w?"reading unavailable":(key.startsWith("scoped:")?"no scoped cap":"no reading yet")):untilReset(w.resets_at);
+  /* A standard window absent from a live CODEX account is a lifted limit
+     (OpenAI removed Codex's 5h), not a failed read: render it neutrally, never
+     as a fake 0% or an n/a error. Gate on codex + not-held (not isCurrent) so a
+     LIMITED codex seat — 7d capped, 5h lifted — still reads "no 5h limit", and
+     a non-codex absent window still fails closed to "n/a". */
+  const absentLimit=!w&&!key.startsWith("scoped:")&&account.provider==="codex"&&displayState(account)!=="held";
+  const value=unknown?(absentLimit?"—":"n/a"):Math.round(left)+"% left";
+  const note=unknown?(absentLimit?"no "+key+" limit":(w?"reading unavailable":(key.startsWith("scoped:")?"no scoped cap":"no reading yet"))):untilReset(w.resets_at);
   return '<div class="win"><span class="win-name">'+esc(windowLabel(key))+
     '</span><span class="win-value tone-'+view.tone+'">'+esc(value)+"</span>"+
     meterMarkup(left,view.tone)+'<p class="win-note">'+esc(note)+"</p></div>";
@@ -860,7 +871,12 @@ function hrValidFeed(data){
     &&typeof a.name==="string"&&typeof a.provider==="string"
     &&["current","limited","stale","held"].includes(a.state)
     &&a.windows&&typeof a.windows==="object"&&!Array.isArray(a.windows)
-    &&hrValidWindow(a.windows["5h"])&&hrValidWindow(a.windows["7d"])))return false;
+    &&hrValidWindow(a.windows["7d"])
+    /* 5h is optional ONLY for codex (OpenAI lifted it): a live codex seat
+       reports only the weekly window. For any other provider 5h stays
+       mandatory (fail-closed); a present 5h must always be valid. 7d is
+       mandatory for everyone. */
+    &&((a.provider==="codex"&&a.windows["5h"]===undefined)||hrValidWindow(a.windows["5h"]))))return false;
   const h=data.headline;
   if(!h||typeof h!=="object"||Array.isArray(h))return false;
   if(!Number.isInteger(h.current_accounts)||h.current_accounts<0)return false;
@@ -892,8 +908,17 @@ function hrAccount(raw,demote){
   let st=["current","limited","stale","held"].includes(a.state)?a.state:"held";
   if(demote&&st!=="held")st="stale";
   const w5=a.windows&&a.windows["5h"]||null,w7=a.windows&&a.windows["7d"]||null;
+  /* OpenAI lifted Codex's 5h: a live codex seat reports only the weekly window,
+     so an absent 5h is a lifted limit, not a failed read. Omit its row/note and
+     drive the per-account battery tile, cool clock, and timing from 7d instead
+     of a phantom "n/a" 5h. Provider-scoped: a non-codex seat (or a codex seat
+     that still has a 5h) is unchanged, and a non-codex missing 5h never reaches
+     here (hrValidFeed rejects it). */
+  const has5h=provider!=="codex"||w5!=null;
+  const wp=has5h?w5:w7; /* window backing the tile / clock / stale timing */
   const v5=demote?hrDemoteWindow(w5):hrWindow(w5);
   const v7=demote?hrDemoteWindow(w7):hrWindow(w7);
+  const tile=has5h?v5:v7;
   /* model-scoped weekly windows (e.g. "scoped:Fable") ride along for display;
      hrWindow/hrDemoteWindow are null-safe so extras need no pre-validation */
   const extras=[];
@@ -907,15 +932,15 @@ function hrAccount(raw,demote){
     :st==="limited"?{label:"AT LIMIT",tone:"red",dot:true}
     :st==="stale"?{label:"STALE",tone:"dim",dot:false}
     :{label:"WAITING",tone:"dim",dot:false};
-  const cool=st==="limited"?hrClock(w5&&w5.resets_at):null;
+  const cool=st==="limited"?hrClock(wp&&wp.resets_at):null;
   let note;
-  if(st==="current")note="5h "+untilReset(w5&&w5.resets_at)+" · 7d "+untilReset(w7&&w7.resets_at);
+  if(st==="current")note=(has5h?"5h "+untilReset(w5&&w5.resets_at)+" · ":"")+"7d "+untilReset(w7&&w7.resets_at);
   else if(st==="limited")note="window full — "+(cool?"cools until "+cool:"cooling")+" · 7d "+untilReset(w7&&w7.resets_at);
-  else if(st==="stale"){const seen=w5&&Number.isFinite(w5.observed_at)?w5.observed_at:null;
+  else if(st==="stale"){const seen=wp&&Number.isFinite(wp.observed_at)?wp.observed_at:null;
     note=seen?"last verified "+age(seen):"reading held — not verified";}
   else note="no verified reading — held, never promoted to live";
-  return{name:name,provider:provider,state:st,badge:badge,v5:v5,v7:v7,
-         extras:extras,cool:cool,note:note,hasW:st!=="held"};
+  return{name:name,provider:provider,state:st,badge:badge,v5:v5,v7:v7,tile:tile,
+         has5h:has5h,extras:extras,cool:cool,note:note,hasW:st!=="held"};
 }
 function hrView(data,offline){
   const fresh=hrFreshness(data,offline);
@@ -994,8 +1019,10 @@ function hrAcctMarkup(a){
   const dot=a.badge.dot?'<span class="hr-bdot hr-tone-'+a.badge.tone+'" aria-hidden="true"></span>':"";
   const extraRows=(a.extras||[]).map(e=>
     '<div class="hr-winrow"><span class="hr-wlabel">'+esc(e.label.toUpperCase())+'</span><span class="hr-cells h7 hr-tone-'+e.view.tone+'" role="img" aria-label="'+esc(e.label)+" "+esc(e.view.value)+'">'+hrCells(e.view.fill)+'</span><span class="hr-wval hr-tone-'+e.view.tone+'">'+esc(e.view.value)+"</span></div>").join("");
-  const wins=a.hasW?'<div class="hr-wins">'+
-    '<div class="hr-winrow"><span class="hr-wlabel">5H</span><span class="hr-cells h5 hr-tone-'+a.v5.tone+'" role="img" aria-label="5h '+esc(a.v5.value)+'">'+hrCells(a.v5.fill)+'</span><span class="hr-wval hr-tone-'+a.v5.tone+'">'+esc(a.v5.value)+"</span></div>"+
+  /* omit the 5H row when codex's 5h is lifted (a.has5h===false): no phantom
+     "5H n/a" on a live seat. The 7D row and any scoped rows still render. */
+  const fiveRow=a.has5h?'<div class="hr-winrow"><span class="hr-wlabel">5H</span><span class="hr-cells h5 hr-tone-'+a.v5.tone+'" role="img" aria-label="5h '+esc(a.v5.value)+'">'+hrCells(a.v5.fill)+'</span><span class="hr-wval hr-tone-'+a.v5.tone+'">'+esc(a.v5.value)+"</span></div>":"";
+  const wins=a.hasW?'<div class="hr-wins">'+fiveRow+
     '<div class="hr-winrow"><span class="hr-wlabel">7D</span><span class="hr-cells h7 hr-tone-'+a.v7.tone+'" role="img" aria-label="7d '+esc(a.v7.value)+'">'+hrCells(a.v7.fill)+'</span><span class="hr-wval hr-tone-'+a.v7.tone+'">'+esc(a.v7.value)+"</span></div>"+extraRows+"</div>":"";
   return '<div class="hr-acct"><div class="hr-arow">'+
     '<span class="hr-aname">'+esc(a.name)+'</span>'+
@@ -1027,8 +1054,10 @@ function hrPopMarkup(v){
 }
 function hrBarsMarkup(v){
   return v.accts.map(a=>{
-    const last=a.v5.fill==null?6:Math.max(6,a.v5.fill);
-    if(a.state==="current")return '<span class="hr-bar hr-tone-'+a.v5.tone+'" style="--h:'+last+'%" title="'+esc(a.name)+'"></span>';
+    /* a.tile is the per-account battery source: 5h normally, 7d when codex's
+       5h is lifted (so a healthy codex seat shows a filled 7d bar, not empty) */
+    const last=a.tile.fill==null?6:Math.max(6,a.tile.fill);
+    if(a.state==="current")return '<span class="hr-bar hr-tone-'+a.tile.tone+'" style="--h:'+last+'%" title="'+esc(a.name)+'"></span>';
     if(a.state==="limited")return '<span class="hr-bar hr-tone-red" style="--h:6%" title="'+esc(a.name)+'"></span>';
     if(a.state==="stale")return '<span class="hr-bar hr-tone-unknown is-dim" style="--h:'+last+'%" title="'+esc(a.name)+'"></span>';
     return '<span class="hr-bar hr-tone-unknown is-held" style="--h:100%" title="'+esc(a.name)+'"></span>';
@@ -1045,9 +1074,9 @@ function hrSmallMarkup(v){
 function hrMediumMarkup(v){
   const rows=v.accts.map(a=>{
     let toneCls,fill,value,dim="";
-    if(a.state==="current"){toneCls=a.v5.tone;fill=a.v5.fill==null?0:a.v5.fill;value=a.v5.value;}
-    else if(a.state==="limited"){toneCls="red";fill=2;value=a.v5.value;}
-    else if(a.state==="stale"){toneCls="unknown";fill=a.v5.fill==null?0:a.v5.fill;value=a.v5.value;dim=" is-dim";}
+    if(a.state==="current"){toneCls=a.tile.tone;fill=a.tile.fill==null?0:a.tile.fill;value=a.tile.value;}
+    else if(a.state==="limited"){toneCls="red";fill=2;value=a.tile.value;}
+    else if(a.state==="stale"){toneCls="unknown";fill=a.tile.fill==null?0:a.tile.fill;value=a.tile.value;dim=" is-dim";}
     else{toneCls="unknown";fill=0;value="n/a";}
     return '<div class="hr-mrow"><span class="hr-mname">'+esc(a.name)+'</span>'+
       '<span class="hr-mbar'+dim+'"><span class="hr-mfill hr-tone-'+toneCls+'" style="--fill:'+fill+'%"></span></span>'+

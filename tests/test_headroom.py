@@ -175,6 +175,15 @@ class BlockReasonFailClosed(unittest.TestCase):
         # but the opus family IS held
         self.assertIsNotNone(self.reason(row, fam="opus"))
 
+    def test_claude_missing_5h_holds(self):
+        # the 5h window is optional ONLY for codex (OpenAI lifted it). A claude
+        # seat missing its 5h is a failed read and must hold — fail-closed.
+        row = _claude_row()
+        del row["windows"]["5h"]
+        reason = self.reason(row)
+        self.assertIsNotNone(reason)
+        self.assertIn("5h window missing", reason)
+
 
 class ReservePercent(unittest.TestCase):
     """`reserve_percent` skips accounts with less than N% headroom left so a
@@ -518,20 +527,49 @@ class CodexWindowMapping(unittest.TestCase):
         self.assertEqual(w["5h"]["used_percent"], 12.0)
         self.assertEqual(w["7d"]["used_percent"], 88.0)
 
-    def test_weekly_in_primary_slot_with_null_secondary(self):
-        # freshly reset 5h omitted; weekly lands in the primary slot
+    def test_five_hour_lifted_omits_5h(self):
+        # OpenAI lifted the 5h limit (2026-07): only the weekly window is
+        # reported. An absent 5h must be OMITTED, never synthesized as 0% --
+        # faking capacity for a limit that no longer exists is a lie.
         rl = {"primary": {"usedPercent": 16, "windowDurationMins": 10080},
               "secondary": None}
         w = collect.codex_windows(rl, now=1000)
         self.assertEqual(w["7d"]["used_percent"], 16.0)
-        self.assertEqual(w["5h"]["used_percent"], 0.0)  # absent -> available
-        self.assertEqual(w["5h"]["window_minutes"], 300)
+        self.assertNotIn("5h", w)
 
-    def test_only_5h_present(self):
+    def test_only_reports_present_windows(self):
+        # a lone 5h reports 5h only -- the weekly is not synthesized either;
+        # validate_required_windows is what holds a seat missing its weekly.
         rl = {"primary": {"usedPercent": 40, "windowDurationMins": 300}}
         w = collect.codex_windows(rl, now=1000)
         self.assertEqual(w["5h"]["used_percent"], 40.0)
-        self.assertEqual(w["7d"]["used_percent"], 0.0)
+        self.assertNotIn("7d", w)
+
+    def test_scoped_bucket_becomes_scoped_row(self):
+        # a model-scoped bucket (limitName "GPT-5.3-Codex-Spark") rides alongside
+        # the codex windows as a scoped:<codename> weekly row -- the verbose name
+        # is shortened to its trailing codename ("Spark") for a compact label.
+        rl = {"primary": {"usedPercent": 7, "windowDurationMins": 10080},
+              "secondary": None}
+        scoped = {"codex_bengalfox": {
+            "limitName": "GPT-5.3-Codex-Spark",
+            "primary": {"usedPercent": 3, "windowDurationMins": 10080},
+            "secondary": None}}
+        w = collect.codex_windows(rl, now=1000, scoped_limits=scoped)
+        self.assertEqual(w["7d"]["used_percent"], 7.0)
+        self.assertNotIn("5h", w)
+        self.assertNotIn("scoped:GPT-5.3-Codex-Spark", w)
+        self.assertEqual(w["scoped:Spark"]["used_percent"], 3.0)
+        self.assertEqual(w["scoped:Spark"]["window_minutes"], 10080)
+
+    def test_scoped_bucket_without_weekly_is_skipped(self):
+        # a scoped bucket carrying no usable weekly window is dropped, never
+        # rendered as an empty/unknown scoped column.
+        rl = {"primary": {"usedPercent": 7, "windowDurationMins": 10080}}
+        scoped = {"x": {"limitName": "Weird", "primary": None,
+                        "secondary": None}}
+        w = collect.codex_windows(rl, now=1000, scoped_limits=scoped)
+        self.assertNotIn("scoped:Weird", w)
 
     def test_empty_payload_holds(self):
         # an empty rate-limit response proves NOTHING — it must hold the
@@ -544,6 +582,23 @@ class CodexWindowMapping(unittest.TestCase):
         rl = {"primary": {"usedPercent": 10, "windowDurationMins": 60}}
         with self.assertRaises(collect.IdentityBindingError):
             collect.codex_windows(rl, now=1000)
+
+
+class ValidateRequiredWindows(unittest.TestCase):
+    W = {"used_percent": 5.0}
+
+    def test_require_5h_false_allows_missing_5h(self):
+        # codex after the 5h lift: only the weekly window is mandatory
+        collect.validate_required_windows({"7d": self.W}, require_5h=False)
+
+    def test_require_5h_false_still_requires_weekly(self):
+        with self.assertRaises(ValueError):
+            collect.validate_required_windows({"5h": self.W}, require_5h=False)
+
+    def test_default_requires_both(self):
+        with self.assertRaises(ValueError):
+            collect.validate_required_windows({"7d": self.W})
+        collect.validate_required_windows({"5h": self.W, "7d": self.W})
 
 
 class FakeCompleted:
@@ -1309,6 +1364,33 @@ class CodexBlockReasonFailClosed(unittest.TestCase):
                                     {}, self.now)
         self.assertIsNone(reason)
 
+    def test_lifted_5h_still_routes(self):
+        # OpenAI lifted Codex's 5h: a live seat reports only the weekly window.
+        # An absent 5h must NOT block the seat (it used to fail "5h window
+        # missing", blocking every codex seat once the fake 0% was removed).
+        row = _codex_row()
+        del row["windows"]["5h"]
+        self.assertIsNone(self.reason(row))
+
+    def test_present_but_malformed_5h_holds_for_codex(self):
+        # only a genuinely ABSENT 5h is the lifted limit; a present-but-
+        # malformed 5h (null/string/number in a corrupt snapshot) is NOT
+        # lifted — fail closed and hold, never route on it.
+        for bad in (None, "garbage", 5):
+            row = _codex_row()
+            row["windows"]["5h"] = bad
+            reason = self.reason(row)
+            self.assertIsNotNone(reason, bad)
+            self.assertIn("5h window missing", reason)
+
+    def test_missing_weekly_still_holds_for_codex(self):
+        # the weekly (7d) stays mandatory even for codex — fail-closed.
+        row = _codex_row()
+        del row["windows"]["7d"]
+        reason = self.reason(row)
+        self.assertIsNotNone(reason)
+        self.assertIn("7d window missing", reason)
+
 
 class GreatestHeadroom(unittest.TestCase):
     """Candidate order prefers the greatest PROVEN headroom —
@@ -1383,6 +1465,35 @@ class GreatestHeadroom(unittest.TestCase):
                 _claude_row("b", used5h=20.0, used7d=10.0)]
         ranked = self.ranked("sonnet", accounts, rows)
         self.assertEqual([r[0]["name"] for r in ranked], ["a", "b"])
+
+    def test_lifted_5h_seats_are_routable_and_scored_on_weekly(self):
+        # both codex seats have their 5h lifted (absent). They must stay
+        # ROUTABLE (reason None), and _headroom_score must rank them by their
+        # remaining WEEKLY room rather than dropping both to the worst score
+        # (which would tie them and lose the greatest-headroom ordering).
+        accounts = [_codex_account("cx1"), _codex_account("cx2")]
+        rows = [_codex_row("cx1", used7d=70.0), _codex_row("cx2", used7d=20.0)]
+        for row in rows:
+            del row["windows"]["5h"]
+        ranked = self.ranked("codex", accounts, rows)
+        # cx2 has more weekly room (80 vs 30) -> ranked first; both eligible
+        self.assertEqual([a["name"] for a, r in ranked if r is None],
+                         ["cx2", "cx1"])
+
+    def test_pick_returns_lifted_5h_codex_seat(self):
+        account = _codex_account("cx1")
+        row = _codex_row("cx1", used7d=20.0)
+        del row["windows"]["5h"]
+        snapshot = {"generated": time.time(), "accounts": [row]}
+        with mock.patch.object(route.registry, "ordered_for",
+                               return_value=[account]), \
+                mock.patch.object(route.registry, "reserve_percent",
+                                  return_value=0.0), \
+                mock.patch.object(route, "ensure_fresh_snapshot",
+                                  return_value=snapshot):
+            chosen = route.pick("codex")
+        self.assertIsNotNone(chosen)
+        self.assertEqual(chosen["name"], "cx1")
 
 
 class CodexCollectClassification(unittest.TestCase):

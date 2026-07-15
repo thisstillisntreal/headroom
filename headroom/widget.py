@@ -178,11 +178,23 @@ def project(snapshot, evaluated_at=None, force_noncurrent_reason=None):
         base_state = _account_base_state(raw, freshness, evaluated_at)
         raw_windows = raw.get("windows")
         raw_windows = raw_windows if isinstance(raw_windows, dict) else {}
-        windows = {
-            key: _window_projection(raw_windows.get(key), captured_at,
-                                    base_state, evaluated_at)
-            for key in WINDOW_KEYS
-        }
+        windows = {}
+        for key in WINDOW_KEYS:
+            raw_window = raw_windows.get(key)
+            # The 5h window is optional ONLY for codex: OpenAI lifted Codex's
+            # 5h, so a live codex seat reports only the weekly window. A
+            # genuinely ABSENT 5h on a live codex account is a lifted limit —
+            # omit it so it neither renders as a failed read nor poisons the
+            # account state below. A PRESENT but malformed 5h (e.g. "5h": null
+            # in a corrupt snapshot) is NOT lifted: it falls through and
+            # projects held (fail-closed). For any other provider a missing 5h
+            # is a failed read that must project held, and the weekly (7d) stays
+            # mandatory for everyone: a missing 7d still holds the seat.
+            if (key == "5h" and key not in raw_windows and base_state != "held"
+                    and raw.get("provider") == "codex"):
+                continue
+            windows[key] = _window_projection(raw_window, captured_at,
+                                              base_state, evaluated_at)
         # model-scoped weekly windows (e.g. "scoped:Fable") ride along for
         # display with the same projection/demotion rules — but they never
         # drive the ACCOUNT state below: a scoped model cap does not block
@@ -362,14 +374,24 @@ def render_swiftbar(value, evaluated_at=None, force_noncurrent_reason=None,
         state = account.get("state") \
             if account.get("state") in {"current", "limited", "stale", "held"} \
             else "held"
-        five = (account.get("windows") or {}).get("5h") or {}
-        account_value = five.get("left_percent")
+        windows_map = account.get("windows") or {}
+        # OpenAI lifted Codex's 5h: when the session window is absent, color the
+        # account row from the weekly (7d) so a current codex seat reads green,
+        # not grey. Every other provider always carries a 5h, so this falls back
+        # to 7d only for a lifted-5h codex seat.
+        primary = windows_map.get("5h") or windows_map.get("7d") or {}
+        account_value = primary.get("left_percent")
         color = _tone(account_value) if state == "current" \
             else ("red" if state == "limited" else "gray")
         lines.append("{} · {} · {} | color={}".format(
             name, provider, state.upper(), color))
         for key in WINDOW_KEYS:
-            window = (account.get("windows") or {}).get(key) or {}
+            # project() omits an absent 5h on a live codex seat (OpenAI lifted
+            # it); skip the dropped key so a current seat gets no phantom
+            # "--5h: -- (held)" sub-row. 7d is always present (mandatory).
+            if key not in windows_map:
+                continue
+            window = windows_map.get(key) or {}
             window_state = window.get("state")
             current_value = window.get("left_percent")
             last_value = window.get("last_observed_left_percent")
