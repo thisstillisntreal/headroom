@@ -69,6 +69,14 @@ class TempDirCase(unittest.TestCase):
         self.addCleanup(patcher.stop)
         # never leak a held flock between tests
         self.addCleanup(route.release_slot_leases)
+        # _spawn now pre-validates the executable with shutil.which; make every
+        # name resolve by default so these unit tests don't depend on the host
+        # PATH. Tests that want a "missing binary" override this locally.
+        which = mock.patch.object(
+            supervisor.shutil, "which",
+            side_effect=lambda name: "/usr/bin/" + name)
+        which.start()
+        self.addCleanup(which.stop)
 
     def account(self, name="acct-a"):
         return {"name": name, "provider": "claude",
@@ -495,18 +503,54 @@ class SpawnAmbiguityFlag(TempDirCase):
         self.assertTrue(runner.spawned_any)
         self.assertFalse(runner.spawn_ambiguous)
 
-    def test_popen_oserror_is_positively_pre_spawn(self):
+    def test_popen_oserror_now_stays_ambiguous(self):
+        # r5: a Popen OSError is NO LONGER treated as "positively no child".
+        # It is conservative-by-type-independence — a child MAY be live, so the
+        # window stays ambiguous (never cleared inside the window).
         account = self.account()
         runner = supervisor.Supervisor(
             "sonnet", [], account,
             popen=mock.Mock(side_effect=OSError("boom")))
         with mock.patch.object(runner, "_settings_file", return_value=""), \
                 redirect_stderr(io.StringIO()):
+            with self.assertRaises(OSError):
+                runner._spawn(account, [], self.temp.name, False)
+        self.assertFalse(runner.spawned_any)
+        self.assertTrue(runner.spawn_ambiguous)  # stays OPEN
+
+    def test_missing_binary_is_a_positive_pre_spawn_failure(self):
+        # r5: the ONLY thing that positively means "no child" is a pre-spawn
+        # validation failure BEFORE the window — here, the binary not resolving.
+        # spawn_ambiguous must NOT be set (safe to recover / fall back).
+        account = self.account()
+        popen = mock.Mock(return_value=mock.Mock())
+        runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
+        with mock.patch.object(supervisor.shutil, "which", return_value=None), \
+                mock.patch.object(runner, "_settings_file", return_value=""), \
+                redirect_stderr(io.StringIO()):
             with self.assertRaises(supervisor.SupervisorError):
                 runner._spawn(account, [], self.temp.name, False)
-        # a Popen that RAISED means no child — unambiguously pre-spawn
-        self.assertFalse(runner.spawned_any)
+        popen.assert_not_called()          # never entered the spawn window
         self.assertFalse(runner.spawn_ambiguous)
+        self.assertFalse(runner.spawned_any)
+
+    def test_trace_hook_raising_in_popen_window_stays_ambiguous(self):
+        # the exact P0 repro, with no masking machinery: a trace hook that
+        # raises while inside the Popen call must leave the window ambiguous
+        # (a child may be live) and never let run() double-spawn.
+        account = self.account()
+
+        def popen(argv, env=None, cwd=None, **kw):
+            # emulate a trace/profile-induced exception escaping Popen
+            raise RuntimeError("trace hook raised inside the Popen window")
+
+        runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
+        with mock.patch.object(runner, "_settings_file", return_value=""), \
+                redirect_stderr(io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                runner._spawn(account, [], self.temp.name, False)
+        self.assertTrue(runner.spawn_ambiguous)
+        self.assertFalse(runner.spawned_any)
 
     def test_async_failure_in_the_popen_window_stays_ambiguous(self):
         # simulate a signal/trace handler firing the instant Popen returns
@@ -1441,114 +1485,11 @@ class R3CrudeBareArgvValueAware(TempDirCase):
 
 
 # ==========================================================================
-# Round-4 red-team fixes
+# Round-4 red-team fixes  (the r4 signal-masking + preexec_fn machinery was
+# REMOVED in r5 in favour of pre-validate-then-conservative-ambiguity; the
+# mask/preexec tests are gone. The notify-deferral and ambiguous-stop tests
+# below remain valid.)
 # ==========================================================================
-class R4SpawnSignalMask(TempDirCase):
-    """P0(r4): signals are BLOCKED across only the Popen call, so a signal
-    that fires during the fork window cannot run an async handler there — the
-    window stays ambiguous and no source recovery / second spawn happens. The
-    child unblocks the mask via preexec_fn."""
-
-    def test_guard_signals_are_blocked_during_popen_and_restored_after(self):
-        # deterministic proof of the masking: inside the Popen call the guard's
-        # signals are blocked (so no async handler can run there); after
-        # _spawn the prior mask is restored.
-        account = self.account("acct-a")
-        seen = {}
-
-        def popen(argv, env=None, cwd=None, **kw):
-            blocked = signal.pthread_sigmask(signal.SIG_BLOCK, [])
-            seen["during"] = {s for s in supervisor._SPAWN_MASK_SIGNALS
-                              if s in blocked}
-            return mock.Mock()
-
-        before = {s for s in supervisor._SPAWN_MASK_SIGNALS
-                  if s in signal.pthread_sigmask(signal.SIG_BLOCK, [])}
-        runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
-        with mock.patch.object(runner, "_settings_file", return_value=""), \
-                mock.patch.object(notify, "emit"), \
-                redirect_stderr(io.StringIO()):
-            runner._spawn(account, [], self.temp.name, False)
-        after = {s for s in supervisor._SPAWN_MASK_SIGNALS
-                 if s in signal.pthread_sigmask(signal.SIG_BLOCK, [])}
-        self.assertEqual(seen["during"], set(supervisor._SPAWN_MASK_SIGNALS))
-        self.assertEqual(after, before)  # mask restored, nothing left blocked
-
-    def test_signal_delivered_during_popen_does_not_clear_ambiguity(self):
-        # a signal that arrives during the masked Popen window is QUEUED, not
-        # run there; Popen succeeds, so spawn_ambiguous is never cleared and
-        # the queued signal is delivered (to a benign handler) after the mask
-        # is restored.
-        account = self.account("acct-a")
-        ran = {"delivered": False, "in_popen": False}
-        in_popen = {"v": False}
-
-        def handler(signum, frame):
-            ran["delivered"] = True
-            if in_popen["v"]:
-                ran["in_popen"] = True
-
-        def popen(argv, env=None, cwd=None, **kw):
-            in_popen["v"] = True
-            os.kill(os.getpid(), signal.SIGTERM)  # blocked -> queued
-            in_popen["v"] = False
-            return mock.Mock()
-
-        previous = signal.signal(signal.SIGTERM, handler)
-        try:
-            runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
-            with mock.patch.object(runner, "_settings_file",
-                                   return_value=""), \
-                    mock.patch.object(notify, "emit"), \
-                    redirect_stderr(io.StringIO()):
-                runner._spawn(account, [], self.temp.name, False)
-        finally:
-            signal.signal(signal.SIGTERM, previous)
-        self.assertTrue(ran["delivered"])       # queued signal WAS delivered
-        self.assertFalse(ran["in_popen"])        # ...but NOT inside the window
-        self.assertTrue(runner.spawn_ambiguous)  # a live child -> stays open
-        self.assertFalse(runner.spawned_any)
-
-    def test_spawn_passes_preexec_fn_that_unblocks_the_child(self):
-        account = self.account("acct-a")
-        popen = mock.Mock(return_value=mock.Mock())
-        runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
-        with mock.patch.object(runner, "_settings_file", return_value=""), \
-                mock.patch.object(notify, "emit"), \
-                redirect_stderr(io.StringIO()):
-            runner._spawn(account, [], self.temp.name, False)
-        self.assertIs(popen.call_args.kwargs.get("preexec_fn"),
-                      supervisor._unblock_spawn_mask)
-
-    def test_real_child_has_a_clean_signal_mask(self):
-        # end-to-end: the preexec_fn genuinely clears the inherited block, so a
-        # real child does NOT start with SIGTERM/SIGHUP/SIGINT blocked
-        account = self.account("acct-a")
-        reader = os.path.join(self.temp.name, "childmask.py")
-        out = os.path.join(self.temp.name, "mask.out")
-        with open(reader, "w", encoding="utf-8") as handle:
-            handle.write(
-                "import signal, sys\n"
-                "m = signal.pthread_sigmask(signal.SIG_BLOCK, [])\n"
-                "blocked = [s for s in (signal.SIGTERM, signal.SIGHUP,"
-                " signal.SIGINT) if s in m]\n"
-                f"open({out!r}, 'w').write(repr(blocked))\n")
-
-        def popen(argv, env=None, cwd=None, **kw):
-            # run the reader as a real child with the preexec_fn from _spawn
-            return subprocess.Popen(
-                [sys.executable, reader], preexec_fn=kw.get("preexec_fn"))
-
-        runner = supervisor.Supervisor("sonnet", [], account, popen=popen)
-        with mock.patch.object(runner, "_settings_file", return_value=""), \
-                mock.patch.object(notify, "emit"), \
-                redirect_stderr(io.StringIO()):
-            child = runner._spawn(account, [], self.temp.name, False)
-        child.process.wait()
-        with open(out, encoding="utf-8") as handle:
-            self.assertEqual(handle.read(), "[]")  # nothing blocked
-
-
 class R4ShutdownNotifyDeferredUntilForwarded(TempDirCase):
     """P1(r4): the supervision_lost NOTIFY is deferred until the signal has
     been forwarded, so a slow notifier can't delay SIGTERM/SIGHUP forwarding."""
