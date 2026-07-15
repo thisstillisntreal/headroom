@@ -44,7 +44,16 @@ const DEFAULT_WIDGET_URL: &str = "http://127.0.0.1:8377/widget";
 const WIDGET_URL_ENV: &str = "HEADROOM_WIDGET_URL";
 const WINDOW_LABEL: &str = "popover";
 const WINDOW_WIDTH: f64 = 360.0;
+/// Initial height; the popover is resized to fit the fleet each time it opens
+/// (see fit_popover_height) so no account is ever clipped below the fold.
 const WINDOW_HEIGHT: f64 = 640.0;
+const WINDOW_HEIGHT_MIN: f64 = 320.0;
+/// Header + avg-battery headline + footer chrome.
+const POPOVER_BASE_PX: f64 = 250.0;
+/// One account block: name row + up to three window meters (5H/7D/scoped) +
+/// note. A slight overestimate is fine — it only adds a little slack, never
+/// clips; held rows are shorter and simply leave a small gap.
+const POPOVER_PER_ACCOUNT_PX: f64 = 132.0;
 /// TCP connect + HTTP response-read budget for the reachability probe.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(600);
 /// How often the background watcher retries while the fallback page is shown.
@@ -469,6 +478,11 @@ fn toggle_popover(app: &AppHandle) {
             return;
         }
     }
+    // Size the panel to the current fleet BEFORE anchoring, so every account
+    // fits instead of the last rows (often the Codex slots) falling below a
+    // fixed-height fold. Clamped to the screen; the page scrolls if a very
+    // large fleet still exceeds the clamp.
+    fit_popover_height(&window, app);
     // Anchor like a native menu-bar popover: the panel's RIGHT edge aligns
     // with the icon's right edge, directly below the menu bar (macOS). The
     // positioner presets can't express right-edge alignment, so the panel is
@@ -481,6 +495,35 @@ fn toggle_popover(app: &AppHandle) {
     let _ = window.show();
     let _ = window.set_focus();
     sync_view_async(app, false);
+}
+
+/// Number of accounts in the current widget feed (for sizing the popover).
+fn fetch_account_count(widget: &Url) -> Option<usize> {
+    let body = fetch_loopback(widget, "/widget.json")?;
+    let value: serde_json::Value = serde_json::from_str(&body).ok()?;
+    value.get("accounts")?.as_array().map(|accounts| accounts.len())
+}
+
+/// Resize the popover to fit the whole fleet — header plus one block per
+/// account — clamped to 90% of the screen height so it is never taller than
+/// the display (the page's own scroll covers an unusually large fleet). A
+/// bounded loopback read; falls back to a sensible default if unavailable.
+fn fit_popover_height(window: &WebviewWindow, app: &AppHandle) {
+    let count = fetch_account_count(&app.state::<AppState>().widget_url)
+        .unwrap_or(5)
+        .max(1);
+    let desired = POPOVER_BASE_PX + (count as f64) * POPOVER_PER_ACCOUNT_PX;
+    let max_height = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| {
+            let scale = monitor.scale_factor();
+            monitor.size().to_logical::<f64>(scale).height * 0.9
+        })
+        .unwrap_or(900.0);
+    let height = desired.clamp(WINDOW_HEIGHT_MIN, max_height);
+    let _ = window.set_size(tauri::LogicalSize::new(WINDOW_WIDTH, height));
 }
 
 /// Place the panel right-edge-aligned under the tray icon (macOS layout).
