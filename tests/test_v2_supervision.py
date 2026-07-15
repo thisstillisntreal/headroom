@@ -441,16 +441,56 @@ class LaunchFallbackSupervised(TempDirCase):
 
 
 # --------------------------------------------------------------------------
-# P0-3: the real _spawn sets/clears the ambiguity flag correctly
+# P0-3 / P0-1(r3): the real _spawn keeps the ambiguity window OPEN across its
+# entire successful return; run() closes it only once it owns the Child.
 # --------------------------------------------------------------------------
 class SpawnAmbiguityFlag(TempDirCase):
-    def test_successful_popen_marks_spawned_and_clears_ambiguous(self):
+    def test_successful_popen_stays_ambiguous_until_run_owns_child(self):
+        # P0-1(r3): _spawn must NOT clear the window after Popen — a failure
+        # between Popen-success and run()-holds-Child must keep it ambiguous
         account = self.account()
         runner = supervisor.Supervisor(
             "sonnet", [], account, popen=mock.Mock(return_value=mock.Mock()))
         with mock.patch.object(runner, "_settings_file", return_value=""), \
                 redirect_stderr(io.StringIO()):
             runner._spawn(account, [], self.temp.name, False)
+        # the child is live but run() has not taken ownership yet
+        self.assertTrue(runner.spawn_ambiguous)
+        self.assertFalse(runner.spawned_any)
+
+    def test_child_construction_failure_after_popen_stays_ambiguous(self):
+        # P0-1(r3) exact repro: Popen succeeds, then Child(...) raises — the
+        # window must remain OPEN so run() suppresses recovery
+        account = self.account()
+        runner = supervisor.Supervisor(
+            "sonnet", [], account, popen=mock.Mock(return_value=mock.Mock()))
+        with mock.patch.object(runner, "_settings_file", return_value=""), \
+                mock.patch.object(supervisor, "Child",
+                                  side_effect=RuntimeError("child ctor boom")), \
+                mock.patch.object(notify, "emit"), \
+                redirect_stderr(io.StringIO()):
+            with self.assertRaises(RuntimeError):
+                runner._spawn(account, [], self.temp.name, False)
+        self.assertTrue(runner.spawn_ambiguous)
+        self.assertFalse(runner.spawned_any)
+
+    def test_run_closes_the_window_once_it_owns_the_child(self):
+        # the window is closed in run(), not _spawn
+        account = self.account()
+        runner = supervisor.Supervisor("sonnet", [], account)
+        child = mock.Mock()
+        child.account = account
+
+        def fake_spawn(*a, **k):
+            runner.spawn_ambiguous = True  # real _spawn leaves it True
+            return child
+
+        with mock.patch.object(runner, "_spawn", side_effect=fake_spawn), \
+                mock.patch.object(runner, "_reconcile_leases"), \
+                mock.patch.object(runner, "_monitor", return_value=0), \
+                redirect_stderr(io.StringIO()):
+            code = runner.run()
+        self.assertEqual(code, 0)
         self.assertTrue(runner.spawned_any)
         self.assertFalse(runner.spawn_ambiguous)
 
@@ -1039,39 +1079,54 @@ class R2AmbiguousSpawnInRun(TempDirCase):
             self.assertEqual(route.held_lease_names(), ["acct-a"])
 
     def test_ambiguous_target_rotation_does_not_recover_source(self):
-        # Codex's isolated repro: the TARGET Popen creates a child, then an
-        # async exception lands before spawned_any/spawn_ambiguous update.
-        # run() must NOT start source recovery (which would double-run).
+        # Codex's isolated repro: the TARGET Popen creates a child, then a
+        # post-Popen step (e.g. Child construction) raises before run() owns
+        # it. run() must NOT start source recovery (which would double-run),
+        # and the target lease must be retained (the live child may hold it).
         source = self.account("source")
         target = self.account("target")
-        runner = supervisor.Supervisor("sonnet", [], source)
-        child1 = mock.Mock()
-        child1.account = source
-        child1.generation = 1
-        plan = mock.Mock()
-        plan.target = target
-        relaunch = supervisor.Relaunch(
-            target, ["--resume", "sid"], "/cwd", True, "hid", plan)
-        calls = []
+        with mock.patch.dict(os.environ, {"HEADROOM_SLOT_LEASE": "1"}):
+            # source held from the start; the target is acquired DURING the
+            # handoff (as _lease_target really does), modelled in the _monitor
+            # stub below — reconcile is kept REAL so retention is genuine
+            self.assertTrue(route.acquire_slot_lease(source, "sonnet"))
+            runner = supervisor.Supervisor("sonnet", [], source)
+            child1 = mock.Mock()
+            child1.account = source
+            child1.generation = 1
+            plan = mock.Mock()
+            plan.target = target
+            relaunch = supervisor.Relaunch(
+                target, ["--resume", "sid"], "/cwd", True, "hid", plan)
+            calls = []
 
-        def fake_spawn(acct, args, cwd, automatic, plan=None):
-            calls.append(acct["name"])
-            if len(calls) == 1:
-                return child1
-            runner.spawn_ambiguous = True  # target Popen window interrupted
-            raise supervisor.SupervisorError("async in target Popen window")
+            def fake_spawn(acct, args, cwd, automatic, plan=None):
+                calls.append(acct["name"])
+                if len(calls) == 1:
+                    return child1
+                # real _spawn leaves spawn_ambiguous True on a post-Popen fail
+                runner.spawn_ambiguous = True
+                raise RuntimeError("post-popen Child construction boom")
 
-        with mock.patch.object(runner, "_spawn", side_effect=fake_spawn), \
-                mock.patch.object(runner, "_monitor", return_value=relaunch), \
-                mock.patch.object(runner, "_reconcile_leases"), \
-                mock.patch.object(runner, "_failure"), \
-                mock.patch.object(supervisor.handoff, "append_action"), \
-                redirect_stderr(io.StringIO()):
-            code = runner.run()
-        self.assertEqual(code, 127)
-        # exactly two spawns: source, target — NEVER a third (source recovery)
-        self.assertEqual(calls, ["source", "target"])
-        self.assertEqual(runner._ambiguous_account, "target")
+            def monitor_stub(child, pending_handoff_id=""):
+                # the handoff takes the target lease before returning (P0-2)
+                self.assertTrue(route.acquire_slot_lease(target, "sonnet"))
+                return relaunch
+
+            with mock.patch.object(runner, "_spawn", side_effect=fake_spawn), \
+                    mock.patch.object(runner, "_monitor",
+                                      side_effect=monitor_stub), \
+                    mock.patch.object(runner, "_failure"), \
+                    mock.patch.object(supervisor.handoff, "append_action"), \
+                    redirect_stderr(io.StringIO()):
+                code = runner.run()
+            self.assertEqual(code, 127)
+            # exactly two spawns: source, target — NEVER a third
+            self.assertEqual(calls, ["source", "target"])
+            self.assertEqual(runner._ambiguous_account, "target")
+            # the target lease is RETAINED (the possibly-live child holds it);
+            # the source lease was reconciled away when the target spawned
+            self.assertEqual(route.held_lease_names(), ["target"])
 
 
 class R2FailedRotationReleasesTarget(TempDirCase):
@@ -1288,6 +1343,99 @@ class R2PassFdsAndCaps(TempDirCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["schema"], 2)
+
+
+# ==========================================================================
+# Round-3 red-team fixes
+# ==========================================================================
+class R3ShutdownSignalNotifiesLoss(TempDirCase):
+    """P1-2(r3): a shutdown signal disarms auto-handoff via _lose_supervision,
+    so supervision_lost fires once even if the child survives the signal."""
+
+    def test_shutdown_signal_routes_through_lose_supervision(self):
+        account = self.account()
+        runner = supervisor.Supervisor(
+            "sonnet", [], account, now=lambda: 1000.0,
+            sleep=lambda seconds: None)
+        child = mock.Mock()
+        child.account = account
+        child.automation = True
+        child.binding = object()          # not None -> no bind-timeout path
+        child.launched_at = 0.0
+        child.supervision_loss_notified = False
+        poll_seq = iter([None, 0])        # continue once, then the child exits
+        child.process.poll.side_effect = lambda: next(poll_seq)
+
+        class FakeGuard:
+            shutdown_signal = 15          # SIGTERM already latched + forwarded
+
+            def install(self):
+                pass
+
+            def restore(self):
+                pass
+
+            def poll(self, process):
+                pass
+
+        with mock.patch.object(supervisor, "_SignalGuard", FakeGuard), \
+                mock.patch.object(runner, "_handle_events",
+                                  return_value=None), \
+                mock.patch.object(notify, "emit") as emit, \
+                redirect_stderr(io.StringIO()):
+            returncode = runner._monitor(child)
+        self.assertEqual(returncode, 0)
+        self.assertFalse(child.automation)
+        lost = [call.args[0] for call in emit.call_args_list
+                if call.args[0]["event"] == "supervision_lost"]
+        self.assertEqual(len(lost), 1)  # exactly once, not per poll
+        self.assertEqual(lost[0]["reason"], "shutdown signal received")
+
+
+class R3CrudeBareArgvValueAware(TempDirCase):
+    """P2-3: the pre-import fallback argv is value-aware — an option value that
+    merely looks like a headroom flag is preserved, not stripped."""
+
+    def test_option_value_that_looks_like_a_headroom_flag_is_preserved(self):
+        argv = __main__._crude_bare_argv(
+            "claude",
+            ["--system-prompt", "--headroom-auto-handoff", "-p", "hi"])
+        self.assertEqual(
+            argv,
+            ["claude", "--system-prompt", "--headroom-auto-handoff",
+             "-p", "hi"])
+
+    def test_real_owned_flags_are_still_stripped(self):
+        argv = __main__._crude_bare_argv(
+            "claude", ["--headroom-launch-fallback", "--model", "sonnet"])
+        self.assertEqual(argv, ["claude", "--model", "sonnet"])
+
+    def test_owned_flag_as_a_value_after_equals_is_untouched(self):
+        # --model=... is a single token; a following owned flag is a real flag
+        argv = __main__._crude_bare_argv(
+            "claude", ["--model=sonnet", "--headroom-launch-fallback"])
+        self.assertEqual(argv, ["claude", "--model=sonnet"])
+
+    def test_local_value_flags_mirror_supervisor(self):
+        # keep the pre-import copy honest against the canonical list
+        self.assertEqual(set(__main__._CLAUDE_VALUE_FLAGS),
+                         set(supervisor.CLAUDE_VALUE_FLAGS))
+
+    def test_import_failure_preserves_option_value_that_looks_like_a_flag(self):
+        # end-to-end: env-based fallback + import failure + a prompt value that
+        # looks like a headroom flag -> the bare invocation keeps the value
+        with mock.patch.dict(os.environ,
+                             {"HEADROOM_LAUNCH_FALLBACK": "1"}), \
+                mock.patch.object(__main__, "_prepare_launch",
+                                  side_effect=RuntimeError("import blew up")), \
+                mock.patch.object(__main__.os, "execvp") as execute, \
+                redirect_stderr(io.StringIO()):
+            code = __main__._dispatch(
+                ["claude", "--system-prompt", "--headroom-auto-handoff"])
+        self.assertEqual(code, 0)
+        self.assertEqual(execute.call_args.args[1],
+                         ["claude", "--system-prompt",
+                          "--headroom-auto-handoff"])
 
 
 if __name__ == "__main__":

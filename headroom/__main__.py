@@ -87,6 +87,20 @@ _OWNED_LAUNCH_FLAGS = frozenset({
     "--headroom-launch-fallback", "--headroom-auto-handoff",
     "--headroom-no-auto-handoff"})
 
+# Claude value-taking options — a LOCAL mirror of supervisor.CLAUDE_VALUE_FLAGS
+# kept here so the pre-import fallback can be value-aware WITHOUT importing
+# supervisor (the very import that may have failed). Keep in sync with
+# supervisor.CLAUDE_VALUE_FLAGS. Used only to avoid mistaking an option VALUE
+# that happens to look like a headroom flag for the flag itself (P2-3).
+_CLAUDE_VALUE_FLAGS = frozenset({
+    "--model", "--settings", "--system-prompt", "--append-system-prompt",
+    "--agents", "--allowedTools", "--disallowedTools", "--permission-mode",
+    "--permission-prompt-tool", "--mcp-config", "--add-dir", "--ide",
+    "--fallback-model", "--json-schema", "--max-budget-usd",
+    "--input-format", "--output-format", "--debug-file", "--betas",
+    "--plugin-dir", "--session-id", "--resume", "-r",
+})
+
 
 def _fallback_intent(args):
     """Whether the launch fallback is requested, decided WITHOUT importing
@@ -99,13 +113,24 @@ def _fallback_intent(args):
 
 def _crude_bare_argv(command, args):
     """Best-effort bare CLI argv for the pre-import disaster fallback: strip
-    exact headroom-owned flags before `--`. This can't consult
-    CLAUDE_VALUE_FLAGS (importing supervisor is the very thing that may have
-    failed), so in the astronomically unlikely case a headroom flag NAME is a
-    real flag's value it would be dropped — acceptable only on this rare
-    import-failure path; the normal path uses supervisor.split_headroom_flags."""
+    headroom-owned flags before `--`, but value-aware — the argument that
+    FOLLOWS a Claude value-taking option (e.g. `--system-prompt`) is that
+    option's value and is preserved even if it happens to look like a headroom
+    flag (P2-3). The normal path uses supervisor.split_headroom_flags; this is
+    the reduced parser used only when supervisor could not be imported."""
     separator = args.index("--") if "--" in args else len(args)
-    head = [arg for arg in args[:separator] if arg not in _OWNED_LAUNCH_FLAGS]
+    head = []
+    value_expected = False
+    for arg in args[:separator]:
+        if value_expected:
+            head.append(arg)  # an option value — never a headroom flag
+            value_expected = False
+            continue
+        if arg in _OWNED_LAUNCH_FLAGS:
+            continue
+        head.append(arg)
+        if arg in _CLAUDE_VALUE_FLAGS:
+            value_expected = True
     return [command] + head + args[separator:]
 
 

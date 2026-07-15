@@ -790,11 +790,16 @@ class Supervisor:
         except OSError as error:
             self.spawn_ambiguous = False  # Popen raised — no child exists
             raise SupervisorError(f"cannot start Claude: {error}") from error
-        self.spawned_any = True
-        self.spawn_ambiguous = False
-        # launch notify only AFTER a real child exists and the no-fallback
-        # boundary is recorded, so a lost `fallback` event can never leave a
-        # dispatcher believing "supervised and started" when nothing did (P1-5)
+        # Popen succeeded: a child IS live. Do NOT clear spawn_ambiguous or set
+        # spawned_any here — leave the window OPEN across the ENTIRE successful
+        # return (the notify below AND the Child construction). run() closes
+        # the window only once it has safely received this Child and taken
+        # ownership, so any failure between Popen-success and run()-holds-Child
+        # (e.g. Child construction) keeps spawn_ambiguous True → the run() gate
+        # suppresses source recovery and retains the lease. (P0-1)
+        # launch notify only AFTER a real child exists, so a lost `fallback`
+        # event can never leave a dispatcher believing "supervised and started"
+        # when nothing did (P1-5)
         if self.generation == 1:
             notify.emit({"event": "launch", "mode": "supervised",
                          "account": account.get("name", ""),
@@ -1328,7 +1333,13 @@ class Supervisor:
             while True:
                 signals.poll(child.process)
                 if signals.shutdown_signal is not None:
-                    child.automation = False
+                    # a shutdown signal disarms auto-handoff; if the child
+                    # ignores/survives the forwarded signal it must not stay
+                    # live with supervision silently off — route through
+                    # _lose_supervision so supervision_lost fires once (P1-2).
+                    # signals.poll already forwarded the signal; this only
+                    # records the loss, it does not delay forwarding.
+                    _lose_supervision(child, "shutdown signal received")
                 proof = self._handle_events(
                     child, pending_handoff_id, proof)
                 returncode = child.process.poll()
@@ -1453,6 +1464,13 @@ class Supervisor:
                         self._print_manual_recovery(recovery_plan)
                     clean_exit = True
                     return 127
+                # run() has now safely RECEIVED the child and taken ownership:
+                # close the ambiguity window HERE (P0-1), outside the recovery
+                # try/except above, so any failure between Popen-success and
+                # this point kept spawn_ambiguous True and suppressed recovery.
+                # spawned_any flips at the same safe point.
+                self.spawned_any = True
+                self.spawn_ambiguous = False
                 pending_plan = None
                 recovery_plan = None
                 # the active child now exists on `child.account`: hold exactly
