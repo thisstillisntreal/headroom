@@ -12,7 +12,7 @@ import os
 import sys
 
 from . import collect as collector
-from . import connect, dashboard, paths, registry
+from . import connect, costs, dashboard, paths, registry
 
 THEMES = [
     ("midnight", "Midnight — dark control-room: near-black, glowing meters"),
@@ -93,7 +93,8 @@ def run_setup():
     # -- 2. connect more accounts ------------------------------------------
     while ask_yes_no("\nConnect another account (opens the provider's own "
                      "login flow)?", False):
-        provider = connect.prompt_choice("Provider?", ["claude", "codex", "grok"])
+        provider = connect.prompt_choice(
+            "Provider?", ["claude", "codex", "grok", "manus"])
         taken = {account["name"] for account in config["accounts"]}
         default_name = next(candidate for candidate in
                             [f"{provider}-{index}" for index in range(1, 100)]
@@ -106,10 +107,33 @@ def run_setup():
               "Re-run `headroom setup` when ready.")
         return 1
 
+    # -- 2b. monthly cost for each account ---------------------------------
+    print("\nMonthly cost per account (what you pay, USD). "
+          "Empty keeps the list-price guess or skips.")
+    for account in config["accounts"]:
+        guessed = costs.default_monthly_cost(
+            account.get("provider"), account.get("plan"))
+        current = account.get("monthly_cost_usd", guessed)
+        default = ("" if current is None else
+                   (str(int(current)) if float(current) == int(current)
+                    else str(current)))
+        raw = ask(
+            f"  {account['name']} ({account['provider']}) $/mo", default)
+        if raw.strip() == "" and current is None:
+            account.pop("monthly_cost_usd", None)
+            continue
+        try:
+            account["monthly_cost_usd"] = float(raw if raw.strip() else current)
+        except (TypeError, ValueError):
+            if current is not None:
+                account["monthly_cost_usd"] = float(current)
+
     print("\nRotation preference: accounts are tried in the order listed.")
     for index, account in enumerate(config["accounts"], 1):
+        cost = account.get("monthly_cost_usd")
+        cost_s = costs.format_usd(cost) or "cost unset"
         print(f"  {index}. {account['name']} ({account['provider']}, "
-              f"{account.get('expected_email', 'unknown')})")
+              f"{account.get('expected_email', 'unknown')}, {cost_s})")
     order = ask("Reorder? (e.g. `2,1,3`, empty keeps this order)", "")
     if order:
         try:

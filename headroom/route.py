@@ -538,7 +538,7 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     # and a non-codex seat missing any standard window still holds (fail-closed).
     # Grok SuperGrok meters a monthly allotment only — score on `month`.
     provider = account.get("provider")
-    if provider == "grok":
+    if provider in ("grok", "manus"):
         required_windows = ("month",)
     else:
         required_windows = ("5h", "7d")
@@ -658,7 +658,7 @@ def _headroom_score(row):
     # percent, scores worst (fail-closed ordering).
     # Grok scores only on the monthly allotment window.
     provider = row.get("provider")
-    if provider == "grok":
+    if provider in ("grok", "manus"):
         keys = ("month",)
     else:
         keys = ("5h", "7d")
@@ -722,6 +722,7 @@ def env_key(account):
         "claude": "CLAUDE_CONFIG_DIR",
         "codex": "CODEX_HOME",
         "grok": "GROK_HOME",
+        "manus": "MANUS_HOME",
     }.get(account["provider"], "CLAUDE_CONFIG_DIR")
 
 

@@ -108,3 +108,35 @@ def _fake_jwt(claims):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CostsCatalogTest(unittest.TestCase):
+    def test_defaults_and_override(self):
+        from headroom import costs
+        self.assertEqual(costs.default_monthly_cost("claude", "Max 20x"), 200.0)
+        self.assertEqual(costs.default_monthly_cost("manus", "pro"), 39.0)
+        self.assertEqual(
+            costs.resolve_monthly_cost(
+                {"provider": "claude", "monthly_cost_usd": 42}, "Max 20x"),
+            42.0)
+
+
+class ManusCreditsTest(unittest.TestCase):
+    def test_periodic_quota_percent(self):
+        windows, credits, plan = collect.manus_credit_windows({
+            "ok": True,
+            "data": {
+                "total_credits": 100,
+                "periodic_credits": 25,
+                "pro_monthly_credits": 100,
+                "free_credits": 0,
+                "addon_credits": 0,
+                "refresh_credits": 0,
+                "max_refresh_credits": 0,
+                "next_refresh_time": 0,
+                "refresh_interval": "",
+            }
+        }, now=10)
+        self.assertEqual(windows["month"]["used_percent"], 75.0)
+        self.assertEqual(plan, "Manus")
+        self.assertEqual(credits["total"], 100)

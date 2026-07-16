@@ -183,8 +183,9 @@ def project(snapshot, evaluated_at=None, force_noncurrent_reason=None):
         raw_windows = raw.get("windows")
         raw_windows = raw_windows if isinstance(raw_windows, dict) else {}
         windows = {}
-        is_grok = raw.get("provider") == "grok"
-        standard_keys = GROK_WINDOW_KEYS if is_grok else WINDOW_KEYS
+        # Grok + Manus meter a monthly allotment (credits / SuperGrok pool).
+        is_monthly = raw.get("provider") in ("grok", "manus")
+        standard_keys = GROK_WINDOW_KEYS if is_monthly else WINDOW_KEYS
         for key in standard_keys:
             raw_window = raw_windows.get(key)
             # The 5h window is optional ONLY for codex: OpenAI lifted Codex's

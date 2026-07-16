@@ -32,7 +32,7 @@ import re
 
 from . import paths
 
-PROVIDERS = ("claude", "codex", "grok")
+PROVIDERS = ("claude", "codex", "grok", "manus")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 DEFAULT_DASHBOARD = {
     "theme": "midnight",
@@ -52,6 +52,7 @@ FAMILY_PROVIDER = {
     "codex": "codex",
     "gpt": "codex",
     "grok": "grok",
+    "manus": "manus",
 }
 
 
@@ -61,7 +62,8 @@ class RegistryError(ValueError):
 
 def family(model):
     model = (model or "").lower().strip()
-    for name in ("fable", "opus", "sonnet", "haiku", "codex", "gpt", "grok"):
+    for name in ("fable", "opus", "sonnet", "haiku", "codex", "gpt", "grok",
+                 "manus"):
         if name in model:
             return "codex" if name == "gpt" else name
     if not model or "claude" in model:
@@ -70,7 +72,7 @@ def family(model):
     # scoped model would bypass its own weekly cap.
     raise RegistryError(
         f"unknown model family: {model!r} "
-        f"(use opus/sonnet/haiku/claude/codex/grok)")
+        f"(use opus/sonnet/haiku/claude/codex/grok/manus)")
 
 
 def family_provider(fam):
@@ -116,6 +118,13 @@ def validate(config):
                 and not isinstance(account["reserved"], bool):
             raise RegistryError(
                 f"account {name}: reserved must be true or false")
+        if "monthly_cost_usd" in account:
+            cost = account["monthly_cost_usd"]
+            if isinstance(cost, bool) or not isinstance(cost, (int, float)) \
+                    or not (cost >= 0) or cost != cost:  # reject NaN
+                raise RegistryError(
+                    f"account {name}: monthly_cost_usd must be a "
+                    f"non-negative number")
         if "handoff_group" in account:
             group = account["handoff_group"]
             if not isinstance(group, str) or not group.strip():

@@ -21,23 +21,28 @@ import sys
 import time
 
 from . import collect as collector
-from . import paths, registry
+from . import costs, paths, registry
 
 CREDENTIAL_FILES = {
     "claude": [".credentials.json", ".claude.json"],
     "codex": ["auth.json"],
     "grok": ["auth.json"],
+    "manus": ["auth.json"],
 }
 DEFAULT_HOMES = {
     "claude": "~/.claude",
     "codex": "~/.codex",
     "grok": "~/.grok",
+    "manus": "~/.manus",
 }
-PROVIDER_BINARIES = {"claude": "claude", "codex": "codex", "grok": "grok"}
+PROVIDER_BINARIES = {
+    "claude": "claude", "codex": "codex", "grok": "grok", "manus": "manus",
+}
 HOME_ENV = {
     "claude": "CLAUDE_CONFIG_DIR",
     "codex": "CODEX_HOME",
     "grok": "GROK_HOME",
+    "manus": "MANUS_HOME",
 }
 
 
@@ -101,6 +106,8 @@ def slot_identity(provider, home):
         elif provider == "grok":
             # local-only during connect/detect — avoid network so adopt works offline
             identity = collector.grok_local_identity(home)
+        elif provider == "manus":
+            identity = collector.manus_local_identity(home)
         else:
             identity = collector.codex_identity(home)
         return identity
@@ -114,6 +121,12 @@ def detect_existing():
     for provider, default in DEFAULT_HOMES.items():
         env_key = HOME_ENV[provider]
         home = os.path.expanduser(os.environ.get(env_key, default))
+        # Manus may only have MANUS_API_KEY in the environment — synthesize a
+        # default home so the wizard can still offer to adopt it.
+        if provider == "manus" and not os.path.isdir(home):
+            if not os.environ.get("MANUS_API_KEY", "").strip():
+                continue
+            os.makedirs(home, mode=0o700, exist_ok=True)
         if not os.path.isdir(home):
             continue
         identity = slot_identity(provider, home)
@@ -122,6 +135,47 @@ def detect_existing():
                           "email": identity["email"],
                           "fingerprint": identity.get("account_fingerprint")})
     return found
+
+
+def write_manus_auth(home, api_key, email=None, plan=None):
+    """Persist a Manus API key into the slot home (mode 0600)."""
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    payload = {"api_key": api_key.strip()}
+    if email:
+        payload["email"] = email
+    if plan:
+        payload["plan"] = plan
+    paths.write_json_atomic(os.path.join(home, "auth.json"), payload, mode=0o600)
+
+
+def connect_manus_key(config, name, api_key, email=None, monthly_cost_usd=None,
+                      quiet=False):
+    """Create/update an isolated Manus slot from a raw API key."""
+    if not registry.NAME_RE.fullmatch(name):
+        print(f"slot name {name!r} invalid", file=sys.stderr)
+        return None
+    if not api_key or not str(api_key).strip():
+        print("manus API key is empty", file=sys.stderr)
+        return None
+    home = os.path.join(paths.homes_dir(), name)
+    write_manus_auth(home, api_key, email=email)
+    identity = slot_identity("manus", home)
+    if not identity:
+        print("could not bind Manus identity from that API key", file=sys.stderr)
+        return None
+    duplicates = existing_fingerprints(config, "manus")
+    fingerprint = identity.get("account_fingerprint")
+    if fingerprint in duplicates:
+        print(f"that Manus key is already connected as slot "
+              f"'{duplicates[fingerprint]}'", file=sys.stderr)
+        return None
+    expected = email or (identity["email"]
+                         if not identity["email"].startswith("manus:") else None)
+    entry = add_account(config, name, "manus", home, expected,
+                        monthly_cost_usd=monthly_cost_usd)
+    if not quiet:
+        print(f"connected: {name} -> {identity['email']} (manus)")
+    return entry
 
 
 def backup_credentials(home, provider):
@@ -163,12 +217,15 @@ def existing_fingerprints(config, provider, exclude_name=None):
     return result
 
 
-def add_account(config, name, provider, home, expected_email=None):
+def add_account(config, name, provider, home, expected_email=None,
+                monthly_cost_usd=None):
     # always store an absolute, canonical home — a relative path would resolve
     # against whatever directory a later command runs from
     entry = {"name": name, "provider": provider, "home": registry.expand(home)}
     if expected_email:
         entry["expected_email"] = expected_email
+    if monthly_cost_usd is not None:
+        entry["monthly_cost_usd"] = float(monthly_cost_usd)
 
     def _append(cfg):
         if not any(a.get("name") == name for a in cfg.get("accounts", [])):
@@ -257,6 +314,27 @@ def _interactive_login(config, name, provider, home, expected_email=None,
 
 def connect_fresh(config, name, provider, quiet=False):
     """Isolated home + interactive provider login + verify + rollback."""
+    if provider == "manus":
+        # Manus has no CLI login — API key only.
+        if not quiet:
+            print("Manus uses API keys (no browser login).")
+            print("Create one: manus.im → settings → integrations → API")
+        api_key = input("Paste Manus API key: ").strip()
+        email = input("Email label (optional): ").strip() or None
+        default_cost = costs.default_monthly_cost("manus", "pro")
+        cost_raw = input(
+            f"Monthly cost USD [{default_cost if default_cost is not None else ''}]: "
+        ).strip()
+        monthly = None
+        if cost_raw:
+            try:
+                monthly = float(cost_raw)
+            except ValueError:
+                monthly = default_cost
+        else:
+            monthly = default_cost
+        return connect_manus_key(config, name, api_key, email=email,
+                                 monthly_cost_usd=monthly, quiet=quiet)
     if not registry.NAME_RE.fullmatch(name):
         print(f"slot name {name!r} invalid: lowercase letters, digits, - and _ "
               f"only (max 32 chars)", file=sys.stderr)

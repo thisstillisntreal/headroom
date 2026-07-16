@@ -598,7 +598,7 @@ function displayState(a){
      a non-codex seat always counts 5h too, so a missing 5h there still holds
      (fail-closed). Grok SuperGrok meters a monthly allotment only. */
   const win=(d&&d.windows)||{};
-  const keys=a.provider==="grok"?["month"]
+  const keys=(a.provider==="grok"||a.provider==="manus")?["month"]
     :["5h","7d"].filter(k=>k==="7d"||a.provider!=="codex"||win[k]!==undefined);
   const states=keys.map(k=>intrinsicWindowState(a,k));
   if(states.includes("held"))return"held";
@@ -654,7 +654,8 @@ function windowMarkup(account,key){
      cleanly, and other providers still fail closed to "n/a". */
   const absentLimit=!w&&!key.startsWith("scoped:")
     &&((account.provider==="codex"&&key==="5h")
-       ||(account.provider==="grok"&&(key==="5h"||key==="7d")))
+       ||((account.provider==="grok"||account.provider==="manus")
+          &&(key==="5h"||key==="7d")))
     &&displayState(account)!=="held";
   const value=unknown?(absentLimit?"—":"n/a"):Math.round(left)+"% left";
   const note=unknown?(absentLimit?"no "+key+" limit":(w?"reading unavailable":(key.startsWith("scoped:")?"no scoped cap":"no reading yet"))):untilReset(w.resets_at);
@@ -683,12 +684,19 @@ function accountState(account){
     return{cls:"idle",label:"Waiting",note:"run Codex once to start tracking"};
   return{cls:"held",label:"Held",note:account.note||account.error_code||"no verified reading"};
 }
+function formatCost(usd){
+  if(usd==null||!Number.isFinite(Number(usd)))return null;
+  const n=Number(usd);
+  return Number.isInteger(n)?"$"+n+"/mo":"$"+n.toFixed(2)+"/mo";
+}
 function accountMarkup(account,columns){
   const s=accountState(account);
   const dot=s.cls==="live"?'<span class="live-dot" aria-hidden="true"></span>':"";
+  const cost=formatCost(account.monthly_cost_usd);
+  const planBits=[account.plan||account.provider,cost].filter(Boolean).join(" · ");
   return '<article class="account is-'+s.cls+'" style="--win-cols:'+columns.length+'">'+
     '<div class="acct-identity"><span class="acct-email">'+esc(account.email||account.name)+"</span>"+
-    '<div class="acct-meta"><span>'+esc(account.name)+"</span><span>"+esc(account.plan||account.provider)+"</span></div></div>"+
+    '<div class="acct-meta"><span>'+esc(account.name)+"</span><span>"+esc(planBits)+"</span></div></div>"+
     columns.map(k=>windowMarkup(account,k)).join("")+
     '<div class="state"><span class="state-badge state-'+s.cls+'">'+dot+esc(s.label)+"</span>"+
     '<p class="state-note">'+esc(s.note)+"</p></div></article>";
@@ -696,12 +704,14 @@ function accountMarkup(account,columns){
 function providerMarkup(provider,accounts){
   if(!accounts.length)return"";
   const columns=windowColumns(accounts);
-  const title=provider==="claude"?"Claude":"Codex";
-  const sub="real-time";
+  const titles={claude:"Claude",codex:"Codex",grok:"Grok",manus:"Manus"};
+  const title=titles[provider]||provider;
+  const spend=accounts.reduce((s,a)=>s+(Number.isFinite(Number(a.monthly_cost_usd))?Number(a.monthly_cost_usd):0),0);
+  const sub=spend>0?(formatCost(spend)+" fleet"):"real-time";
   return '<section class="provider"><header class="provider-head">'+
-    '<h2 class="provider-name">'+title+'</h2><span class="provider-count">'+
+    '<h2 class="provider-name">'+esc(title)+'</h2><span class="provider-count">'+
     accounts.length+(accounts.length===1?" subscription":" subscriptions")+
-    ' <span class="provider-mode">· '+sub+'</span></span></header>'+
+    ' <span class="provider-mode">· '+esc(sub)+'</span></span></header>'+
     accounts.map(a=>accountMarkup(a,columns)).join("")+"</section>";
 }
 function validate(data){
@@ -728,18 +738,27 @@ function render(data,forceNoncurrent){
   /* Include current windows from limited accounts in summary metrics,
      not just fully-current accounts — windowView already handles the mixed case. */
   const readings=[];
-  accounts.forEach(a=>["5h","7d"].forEach(k=>{
+  accounts.forEach(a=>["5h","7d","month"].forEach(k=>{
     const v=windowView(a,k);if(v.left!=null&&v.state==="current")readings.push({left:v.left,who:a.email||a.name});}));
   const avg=readings.length?Math.round(readings.reduce((s,r)=>s+r.left,0)/readings.length):null;
   const lowest=readings.length?readings.reduce((b,r)=>r.left<b.left?r:b):null;
   const claude=accounts.filter(a=>a.provider==="claude");
   const codex=accounts.filter(a=>a.provider==="codex");
+  const grok=accounts.filter(a=>a.provider==="grok");
+  const manus=accounts.filter(a=>a.provider==="manus");
+  const fleetSpend=accounts.reduce((s,a)=>s+(Number.isFinite(Number(a.monthly_cost_usd))?Number(a.monthly_cost_usd):0),0);
   set("verified",current.length+"/"+accounts.length);
   set("average",avg==null?"n/a":avg+"%");
   set("lowest",lowest?Math.round(lowest.left)+"%":"n/a");
   set("lowest-account",lowest?lowest.who:"no current readings");
   set("account-count",String(accounts.length));
-  set("account-note",(claude.length?("Claude "+claude.length):"")+(claude.length&&codex.length?" · ":"")+(codex.length?("Codex "+codex.length):""));
+  const bits=[];
+  if(claude.length)bits.push("Claude "+claude.length);
+  if(codex.length)bits.push("Codex "+codex.length);
+  if(grok.length)bits.push("Grok "+grok.length);
+  if(manus.length)bits.push("Manus "+manus.length);
+  if(fleetSpend>0)bits.push(formatCost(fleetSpend)+" total");
+  set("account-note",bits.join(" · ")||"–");
   /* top-bar instruments */
   document.getElementById("verified-viz").innerHTML=accounts.map(a=>
     '<span class="seg '+(isCurrent(a)?"is-on":"is-off")+'" title="'+esc(a.name)+": "+(isCurrent(a)?"verified":"held")+'"></span>').join("");
@@ -748,14 +767,17 @@ function render(data,forceNoncurrent){
   gauge.querySelector(".gauge-fill").style.setProperty("--fill",(avg==null?0:avg)+"%");
   document.getElementById("lowest-viz").innerHTML=meterMarkup(lowest?lowest.left:null);
   document.getElementById("fleet-viz").innerHTML=accounts.map(a=>{
-    const view=windowView(a,"5h"),left=view.left;
+    const primary=(a.provider==="grok"||a.provider==="manus")?"month":"5h";
+    const view=windowView(a,primary),left=view.left;
     if(view.state!=="current"||left==null)return'<span class="fbar is-unknown" title="'+esc(a.name)+': unknown"></span>';
-    return'<span class="fbar tone-'+view.tone+'" style="--h:'+Math.max(4,left)+'%" title="'+esc(a.name)+": "+Math.round(left)+'% session left"></span>';
+    return'<span class="fbar tone-'+view.tone+'" style="--h:'+Math.max(4,left)+'%" title="'+esc(a.name)+": "+Math.round(left)+'% left"></span>';
   }).join("");
   set("snapshot-age","snapshot "+age(data.generated));
-  set("source-line",current.length+" of "+accounts.length+" verified");
+  set("source-line",current.length+" of "+accounts.length+" verified"
+    +(fleetSpend>0?" · "+formatCost(fleetSpend)+" fleet":""));
   document.getElementById("providers").innerHTML=
-    providerMarkup("claude",claude)+providerMarkup("codex",codex);
+    providerMarkup("claude",claude)+providerMarkup("codex",codex)
+    +providerMarkup("grok",grok)+providerMarkup("manus",manus);
   const warnings=(data.integrity_warnings||[]).slice();
   if(sourceFailed)warnings.unshift("refresh failed — readings shown as held until collection succeeds");
   if(snapshotState!=="current")warnings.unshift("snapshot is noncurrent (maximum "+Math.floor(SNAPSHOT_MAX_AGE/60)+" minutes) — readings shown as held until a fresh collect");

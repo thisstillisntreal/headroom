@@ -44,7 +44,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 
-from . import paths, registry
+from . import costs, paths, registry
 
 IDENTITY_TIMEOUT = paths.env_int("HEADROOM_IDENTITY_TIMEOUT", 15)
 CODEX_STALE_AFTER = paths.env_int("HEADROOM_CODEX_STALE_AFTER", 1800)
@@ -58,7 +58,7 @@ PUBLIC_FIELDS = {
     "name", "email", "provider", "plan", "ok", "note", "error_code", "retry_at",
     "captured_at", "source", "stale", "windows", "identity_verified",
     "identity_method", "trust_state", "routable", "subscription",
-    "throttle_carryover",
+    "throttle_carryover", "monthly_cost_usd", "credits",
 }
 
 
@@ -297,6 +297,8 @@ def credential_digest(provider, home):
             token = (claude_oauth(home) or {}).get("accessToken")
         elif provider == "grok":
             token = (grok_auth_entry(home) or {}).get("key")
+        elif provider == "manus":
+            token = manus_api_key(home)
         else:
             token = ((paths.load_json(os.path.join(home, "auth.json")) or {})
                      .get("tokens") or {}).get("access_token")
@@ -314,6 +316,8 @@ def local_binding(provider, home):
             fp = claude_local_identity(home)["account_fingerprint"]
         elif provider == "grok":
             fp = grok_local_identity(home)["account_fingerprint"]
+        elif provider == "manus":
+            fp = manus_local_identity(home)["account_fingerprint"]
         else:
             auth = paths.load_json(os.path.join(home, "auth.json")) or {}
             claims = decode_jwt_payload((auth.get("tokens") or {}).get("id_token"))
@@ -938,6 +942,196 @@ def grok_limits(home, expected_email=None, opener=None):
     return identity, windows, now
 
 
+# ------------------------------------------------------------------- manus
+
+MANUS_CREDITS_URL = os.environ.get(
+    "HEADROOM_MANUS_CREDITS_URL",
+    "https://api.manus.ai/v2/usage.availableCredits",
+)
+
+
+def manus_auth(home):
+    """Load ``auth.json`` for a Manus slot (api_key + optional email)."""
+    auth = paths.load_json(os.path.join(home, "auth.json"))
+    return auth if isinstance(auth, dict) else None
+
+
+def manus_api_key(home):
+    """API key from slot auth.json, else MANUS_API_KEY env (default home only)."""
+    auth = manus_auth(home) or {}
+    key = auth.get("api_key") or auth.get("apiKey") or auth.get("key")
+    if isinstance(key, str) and key.strip():
+        return key.strip()
+    # Env fallback only when the slot is the default ~/.manus home — never
+    # leak a machine-wide key into an isolated multi-account home.
+    default = os.path.realpath(os.path.expanduser(
+        os.environ.get("MANUS_HOME", "~/.manus")))
+    if os.path.realpath(home) == default:
+        env_key = os.environ.get("MANUS_API_KEY", "").strip()
+        if env_key:
+            return env_key
+    return None
+
+
+def manus_local_identity(home):
+    auth = manus_auth(home) or {}
+    key = manus_api_key(home)
+    if not key:
+        raise IdentityBindingError("manus_auth_missing")
+    email = auth.get("email")
+    # Fingerprint the key itself — Manus API keys do not expose a user id
+    # without a separate call, and availableCredits returns balance only.
+    return {
+        "verified": False,
+        "email": email or ("manus:" + fingerprint(key)[:8]),
+        "account_fingerprint": fingerprint(key),
+        "method": "manus_local_api_key",
+        "plan_type": auth.get("plan") or "Manus",
+    }
+
+
+def manus_credit_windows(payload, now=None):
+    """Map usage.availableCredits data to a monthly (and optional refresh) window.
+
+    Prefer the VIP periodic quota when present: used = pro_monthly − remaining
+    periodic. Otherwise fall back to total_credits as a soft remaining-balance
+    window (0% used while balance > 0).
+    """
+    now = int(time.time()) if now is None else int(now)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        # some responses may be unwrapped
+        data = payload if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        raise IdentityBindingError("manus_capacity_unrecognized")
+
+    def _int(name):
+        value = data.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if not math.isfinite(value):
+            return None
+        return int(value)
+
+    total = _int("total_credits")
+    periodic = _int("periodic_credits")
+    pro_monthly = _int("pro_monthly_credits")
+    free = _int("free_credits")
+    addon = _int("addon_credits")
+    refresh = _int("refresh_credits")
+    max_refresh = _int("max_refresh_credits")
+    next_refresh = _int("next_refresh_time")
+    interval = data.get("refresh_interval") or ""
+
+    windows = {}
+    if pro_monthly is not None and pro_monthly > 0 and periodic is not None:
+        used = max(0.0, float(pro_monthly - max(0, periodic)))
+        percent = round(min(100.0, (used / pro_monthly) * 100.0), 1)
+        windows["month"] = {
+            "used_percent": percent,
+            "resets_at": None,
+            "window_minutes": 43200,  # nominal month; provider doesn't expose
+            "observed_at": now,
+            "freshness": "fresh",
+            "used_units": used,
+            "limit_units": float(pro_monthly),
+            "remaining_units": float(max(0, periodic)),
+        }
+    elif total is not None:
+        # No VIP monthly quota: treat empty wallet as limited, else show room.
+        windows["month"] = {
+            "used_percent": 100.0 if total <= 0 else 0.0,
+            "resets_at": next_refresh if next_refresh and next_refresh > 0 else None,
+            "window_minutes": None,
+            "observed_at": now,
+            "freshness": "fresh",
+            "used_units": 0.0 if total > 0 else 1.0,
+            "limit_units": float(total) if total > 0 else 1.0,
+            "remaining_units": float(max(0, total)),
+        }
+    else:
+        raise IdentityBindingError("manus_capacity_unrecognized")
+
+    if (interval in ("daily", "weekly") and max_refresh and max_refresh > 0
+            and refresh is not None):
+        used = max(0.0, float(max_refresh - max(0, refresh)))
+        percent = round(min(100.0, (used / max_refresh) * 100.0), 1)
+        key = "5h" if interval == "daily" else "7d"
+        # Map daily→session-like and weekly→weekly for the standard columns.
+        windows[key] = {
+            "used_percent": percent,
+            "resets_at": next_refresh if next_refresh and next_refresh > 0 else None,
+            "window_minutes": 1440 if interval == "daily" else 10080,
+            "observed_at": now,
+            "freshness": "fresh",
+            "used_units": used,
+            "limit_units": float(max_refresh),
+            "remaining_units": float(max(0, refresh)),
+        }
+
+    credits = {
+        "total": total,
+        "periodic": periodic,
+        "pro_monthly": pro_monthly,
+        "free": free,
+        "addon": addon,
+        "refresh": refresh,
+        "max_refresh": max_refresh,
+        "next_refresh_time": next_refresh if next_refresh else None,
+        "refresh_interval": interval or None,
+    }
+    plan = "Manus"
+    if pro_monthly and pro_monthly >= 4000:
+        plan = "Manus Pro"
+    elif pro_monthly and pro_monthly > 0:
+        plan = "Manus"
+    return windows, credits, plan
+
+
+def manus_limits(home, expected_email=None, opener=None):
+    identity = manus_local_identity(home)
+    if expected_email and identity.get("email") \
+            and not identity["email"].startswith("manus:") \
+            and identity["email"].lower() != expected_email.lower():
+        raise IdentityBindingError("slot_bound_to_unexpected_email")
+    key = manus_api_key(home)
+    if not key:
+        raise IdentityBindingError("manus_auth_missing")
+    open_fn = open_authenticated if opener is None else opener
+    request = urllib.request.Request(
+        MANUS_CREDITS_URL,
+        headers={
+            "x-manus-api-key": key,
+            "accept": "application/json",
+            "user-agent": "headroom",
+        },
+    )
+    try:
+        response = open_fn(request, timeout=30)
+    except urllib.error.HTTPError as error:
+        if error.code == 429:
+            raise ProviderThrottleError(
+                retry_after_epoch(error.headers), provider_response=True
+            ) from error
+        if error.code in (401, 403):
+            raise IdentityBindingError("manus_usage_token_rejected") from error
+        raise
+    with response:
+        payload = json.load(response)
+    if isinstance(payload, dict) and payload.get("ok") is False:
+        raise IdentityBindingError("manus_usage_token_rejected")
+    now = int(time.time())
+    windows, credits, plan = manus_credit_windows(payload, now=now)
+    identity["verified"] = True
+    identity["method"] = "manus_available_credits"
+    identity["plan_type"] = plan
+    identity["credential_digest"] = credential_digest("manus", home)
+    # Prefer an operator-supplied email over the synthetic key label.
+    if expected_email and identity["email"].startswith("manus:"):
+        identity["email"] = expected_email
+    return identity, windows, credits, now
+
+
 # ------------------------------------------------------------------ limits
 
 def limit_entry(limit, minutes):
@@ -1324,6 +1518,29 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 result["windows"] = windows
                 validate_required_windows(result["windows"], required=("month",))
                 result["ok"] = True
+            elif account["provider"] == "manus":
+                expected = account.get("expected_email")
+                manus_retry_at = active_backoff(backoff, "manus_credits_api", now)
+                if manus_retry_at > now:
+                    raise ProviderThrottleError(manus_retry_at)
+                identity, windows, credits, captured = manus_limits(
+                    account["home"], expected_email=expected)
+                result["identity"] = identity
+                result["identity_verified"] = identity.get("verified", False)
+                result["identity_method"] = identity.get("method")
+                result["email"] = identity.get("email")
+                result["plan"] = identity.get("plan_type") or "Manus"
+                result["subscription"] = {
+                    "status": "active" if identity.get("verified") else "unknown",
+                    "source": "manus_credits_api",
+                }
+                result["source"] = "manus_credits_api"
+                result["stale"] = False
+                result["captured_at"] = captured
+                result["windows"] = windows
+                result["credits"] = credits
+                validate_required_windows(result["windows"], required=("month",))
+                result["ok"] = True
             else:
                 expected = account.get("expected_email")
                 codex_retry_at = active_backoff(backoff, "codex_app_server", now)
@@ -1414,6 +1631,7 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 backoff_name = {
                     "claude": "anthropic_usage_api",
                     "grok": "grok_billing_api",
+                    "manus": "manus_credits_api",
                     "codex": "codex_app_server",
                 }.get(account.get("provider"), "anthropic_usage_api")
                 persist_backoff(error.retry_at, backoff_name)
@@ -1466,6 +1684,13 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                     "no Grok login found in this slot's home — run "
                     f"`headroom connect {account['name']}` or `grok login` "
                     "with GROK_HOME pointed at the slot.")
+            elif error.code in ("manus_auth_missing",
+                                "manus_usage_token_rejected"):
+                result["note"] = (
+                    "Manus API key missing or rejected — create a key at "
+                    "manus.im app → settings → integrations → API, then "
+                    f"`headroom connect {account['name']} --provider manus` "
+                    "or put it in the slot's auth.json / MANUS_API_KEY.")
             elif error.code == "claude_credentials_missing":
                 # verified identity but the token couldn't be read. On macOS the
                 # token is in the login Keychain (headroom reads it via
@@ -1488,6 +1713,10 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
             # `note` is published, so it must stay generic.
             result["error"] = type(error).__name__ + ": " + str(error)[:120]
             result["note"] = "collector error; see private snapshot for detail"
+        # Operator-declared monthly cost (config), with plan-catalog fallback.
+        cost = costs.resolve_monthly_cost(account, result.get("plan"))
+        if cost is not None:
+            result["monthly_cost_usd"] = cost
         snapshot["accounts"].append(result)
     snapshot["integrity_warnings"] = apply_integrity(snapshot["accounts"])
     completed = int(time.time())
