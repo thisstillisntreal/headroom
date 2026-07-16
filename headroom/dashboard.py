@@ -144,11 +144,15 @@ def build_demo(out_dir=None):
         data = json.load(handle)
     now = int(time.time())
     data["generated"] = now - 30
-    resets = {"5h": now + 2 * 3600 + 11 * 60, "7d": now + 3 * 86400}
+    resets = {
+        "5h": now + 2 * 3600 + 11 * 60,
+        "7d": now + 3 * 86400,
+        "month": now + 15 * 86400,
+    }
     for account in data.get("accounts", []):
         account["captured_at"] = now - 30
         for key, window in (account.get("windows") or {}).items():
-            window["resets_at"] = resets["5h"] if key == "5h" else resets["7d"]
+            window["resets_at"] = resets.get(key, resets["7d"])
             if "observed_at" in window:
                 window["observed_at"] = now - 30
         sub = account.get("subscription")

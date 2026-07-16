@@ -26,16 +26,30 @@ from . import paths, registry
 CREDENTIAL_FILES = {
     "claude": [".credentials.json", ".claude.json"],
     "codex": ["auth.json"],
+    "grok": ["auth.json"],
 }
-DEFAULT_HOMES = {"claude": "~/.claude", "codex": "~/.codex"}
+DEFAULT_HOMES = {
+    "claude": "~/.claude",
+    "codex": "~/.codex",
+    "grok": "~/.grok",
+}
+PROVIDER_BINARIES = {"claude": "claude", "codex": "codex", "grok": "grok"}
+HOME_ENV = {
+    "claude": "CLAUDE_CONFIG_DIR",
+    "codex": "CODEX_HOME",
+    "grok": "GROK_HOME",
+}
 
 
 def provider_binary(provider):
-    return shutil.which("claude" if provider == "claude" else "codex")
+    return shutil.which(PROVIDER_BINARIES.get(provider, provider))
 
 
 def login_argv(provider, binary):
-    return [binary, "auth", "login"] if provider == "claude" else [binary, "login"]
+    if provider == "claude":
+        return [binary, "auth", "login"]
+    # codex + grok both use a plain `login` subcommand
+    return [binary, "login"]
 
 
 def darwin_keychain_guard(config, provider, quiet=False, runner=None):
@@ -84,6 +98,9 @@ def slot_identity(provider, home):
     try:
         if provider == "claude":
             identity = collector.claude_identity(home)
+        elif provider == "grok":
+            # local-only during connect/detect — avoid network so adopt works offline
+            identity = collector.grok_local_identity(home)
         else:
             identity = collector.codex_identity(home)
         return identity
@@ -95,12 +112,8 @@ def detect_existing():
     """Discover logins already on this machine, for the wizard/adopt flow."""
     found = []
     for provider, default in DEFAULT_HOMES.items():
-        home = os.path.expanduser(
-            os.environ.get(
-                "CLAUDE_CONFIG_DIR" if provider == "claude" else "CODEX_HOME",
-                default,
-            )
-        )
+        env_key = HOME_ENV[provider]
+        home = os.path.expanduser(os.environ.get(env_key, default))
         if not os.path.isdir(home):
             continue
         identity = slot_identity(provider, home)
@@ -185,8 +198,9 @@ def _interactive_login(config, name, provider, home, expected_email=None,
     """
     binary = provider_binary(provider)
     if not binary:
-        print(f"cannot find the `{'claude' if provider == 'claude' else 'codex'}` "
-              f"CLI on PATH — install it first", file=sys.stderr)
+        cli_name = PROVIDER_BINARIES.get(provider, provider)
+        print(f"cannot find the `{cli_name}` CLI on PATH — install it first",
+              file=sys.stderr)
         return None
     # BEFORE the login runs: on macOS a new claude login clobbers the shared
     # Keychain token that an existing slot may depend on — refusing afterwards
@@ -206,7 +220,7 @@ def _interactive_login(config, name, provider, home, expected_email=None,
                     os.remove(target)
 
     env = collector.scrubbed_env()
-    env["CLAUDE_CONFIG_DIR" if provider == "claude" else "CODEX_HOME"] = home
+    env[HOME_ENV[provider]] = home
     if not quiet:
         print(f"\nStarting the {provider} login for slot '{name}'.")
         print("Complete the browser flow with the account you want on THIS slot.\n")

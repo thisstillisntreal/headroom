@@ -11,6 +11,12 @@ Codex: read live from the Codex app-server (``codex app-server`` ->
 CODEX_HOME. Falls back to on-disk ``rate_limits`` session telemetry only when
 the app-server is unavailable (older Codex CLI). No inference tokens spent.
 
+Grok: monthly allotment from the Grok Build chat-proxy billing endpoint
+(``https://cli-chat-proxy.grok.com/v1/billing``), authenticated with the OIDC
+JWT already stored in ``$GROK_HOME/auth.json`` (default ``~/.grok``). Identity
+is bound to the local ``user_id`` / JWT ``sub`` and re-verified via
+``/v1/user``. No inference tokens spent.
+
 Fail-closed rules:
   * an account with unverifiable identity or an out-of-range reading is HELD
     (ok=false) rather than guessed at;
@@ -105,6 +111,8 @@ AUTH_OVERRIDE_VARS = (
     "CLOUD_ML_REGION", "ANTHROPIC_VERTEX_PROJECT_ID", "GOOGLE_APPLICATION_CREDENTIALS",
     # OpenAI / Codex
     "OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_API_KEY", "CODEX_AGENT_IDENTITY",
+    # xAI / Grok
+    "XAI_API_KEY", "GROK_AUTH", "GROK_AUTH_PROVIDER_COMMAND",
 )
 
 
@@ -279,13 +287,16 @@ def claude_oauth(home, runner=subprocess.run):
 
 def credential_digest(provider, home):
     """A digest of the ACTUAL token the provider CLI will use — the Claude
-    `.credentials.json` accessToken or the Codex `auth.json` access_token.
+    `.credentials.json` accessToken, the Codex `auth.json` access_token, or
+    the Grok OIDC JWT in `$GROK_HOME/auth.json`.
     Binding to this (not just the identity metadata) closes the split-token
     TOCTOU: swapping only the credential file changes this digest even if the
     identity metadata still names the old account."""
     try:
         if provider == "claude":
             token = (claude_oauth(home) or {}).get("accessToken")
+        elif provider == "grok":
+            token = (grok_auth_entry(home) or {}).get("key")
         else:
             token = ((paths.load_json(os.path.join(home, "auth.json")) or {})
                      .get("tokens") or {}).get("access_token")
@@ -301,6 +312,8 @@ def local_binding(provider, home):
     try:
         if provider == "claude":
             fp = claude_local_identity(home)["account_fingerprint"]
+        elif provider == "grok":
+            fp = grok_local_identity(home)["account_fingerprint"]
         else:
             auth = paths.load_json(os.path.join(home, "auth.json")) or {}
             claims = decode_jwt_payload((auth.get("tokens") or {}).get("id_token"))
@@ -716,6 +729,215 @@ def codex_subscription(provider_claims, now=None):
     }
 
 
+# -------------------------------------------------------------------- grok
+
+GROK_BILLING_URL = os.environ.get(
+    "HEADROOM_GROK_BILLING_URL",
+    "https://cli-chat-proxy.grok.com/v1/billing",
+)
+GROK_USER_URL = os.environ.get(
+    "HEADROOM_GROK_USER_URL",
+    "https://cli-chat-proxy.grok.com/v1/user",
+)
+GROK_TIER_LABELS = {
+    0: "Free",
+    1: "Grok",
+    2: "Grok",
+    3: "SuperGrok",
+    4: "SuperGrok",
+    5: "SuperGrok Heavy",
+}
+
+
+def grok_auth_entry(home):
+    """Return the active OIDC/auth entry from ``$GROK_HOME/auth.json``, or None.
+
+    Grok stores credentials as a map of ``issuer::client_id`` → entry. Prefer
+    an OIDC entry with a JWT ``key`` and email; otherwise take the first usable
+    entry. Headroom never refreshes tokens itself.
+    """
+    auth = paths.load_json(os.path.join(home, "auth.json"))
+    if not isinstance(auth, dict) or not auth:
+        return None
+    preferred = None
+    for entry in auth.values():
+        if not isinstance(entry, dict):
+            continue
+        if not entry.get("key"):
+            continue
+        if preferred is None:
+            preferred = entry
+        if entry.get("auth_mode") == "oidc" and entry.get("email"):
+            return entry
+    return preferred
+
+
+def grok_local_identity(home):
+    """Identity from local auth.json only (no network)."""
+    entry = grok_auth_entry(home)
+    if not entry:
+        raise IdentityBindingError("grok_auth_missing")
+    user_id = entry.get("user_id") or entry.get("principal_id")
+    email = entry.get("email")
+    if not user_id:
+        # fall back to JWT sub when metadata is incomplete
+        claims = decode_jwt_payload(entry.get("key"))
+        user_id = claims.get("sub") or claims.get("principal_id")
+        email = email or claims.get("email")
+    if not user_id:
+        raise IdentityBindingError("grok_identity_id_missing")
+    if not email:
+        raise IdentityBindingError("grok_identity_email_missing")
+    claims = decode_jwt_payload(entry.get("key"))
+    tier = claims.get("tier")
+    return {
+        "verified": False,
+        "email": email,
+        "account_fingerprint": fingerprint(user_id),
+        "method": "grok_local_auth",
+        "plan_type": GROK_TIER_LABELS.get(tier, f"Tier {tier}" if tier is not None
+                                          else "Grok"),
+        "tier": tier,
+        "team_id": entry.get("team_id") or claims.get("team_id"),
+    }
+
+
+def grok_token_expired(entry, now=None):
+    """True when the cached access JWT is past its local expires_at."""
+    now = time.time() if now is None else now
+    expires_at = entry.get("expires_at")
+    epoch = iso_ep(expires_at)
+    if epoch is not None:
+        return epoch <= now
+    claims = decode_jwt_payload(entry.get("key"))
+    exp = claims.get("exp")
+    if isinstance(exp, (int, float)) and not isinstance(exp, bool):
+        return exp <= now
+    return False
+
+
+def grok_identity(home, expected_email=None, opener=None):
+    """Local identity + optional live verify via the chat-proxy /v1/user."""
+    identity = grok_local_identity(home)
+    entry = grok_auth_entry(home) or {}
+    if expected_email and identity["email"].lower() != expected_email.lower():
+        raise IdentityBindingError("slot_bound_to_unexpected_email")
+    if grok_token_expired(entry):
+        raise IdentityBindingError("grok_usage_token_expired")
+    token = entry.get("key")
+    if not token:
+        raise IdentityBindingError("grok_auth_missing")
+    open_fn = open_authenticated if opener is None else opener
+    try:
+        request = urllib.request.Request(
+            GROK_USER_URL,
+            headers={
+                "authorization": "Bearer " + token,
+                "accept": "application/json",
+                "user-agent": "headroom",
+                "x-grok-client-surface": "grok-build",
+            },
+        )
+        with open_fn(request, timeout=IDENTITY_TIMEOUT) as response:
+            user = json.load(response)
+        remote_id = user.get("userId") or user.get("user_id") or user.get("principalId")
+        remote_email = user.get("email")
+        if remote_id and fingerprint(remote_id) != identity["account_fingerprint"]:
+            raise IdentityBindingError("grok_identity_changed")
+        if remote_email:
+            if expected_email and remote_email.lower() != expected_email.lower():
+                raise IdentityBindingError("slot_bound_to_unexpected_email")
+            identity["email"] = remote_email
+        identity["verified"] = True
+        identity["method"] = "grok_user_api"
+        if user.get("hasGrokCodeAccess") is False:
+            identity["plan_type"] = identity.get("plan_type") or "Grok"
+    except IdentityBindingError:
+        raise
+    except (OSError, ValueError, urllib.error.URLError, json.JSONDecodeError,
+            urllib.error.HTTPError):
+        # local-only is still usable for dashboard; router lowers trust
+        pass
+    identity["credential_digest"] = credential_digest("grok", home)
+    return identity
+
+
+def grok_unwrap_val(value):
+    """Billing fields arrive as ``{"val": N}`` or bare numbers."""
+    if isinstance(value, dict) and "val" in value:
+        value = value["val"]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def grok_billing_windows(payload, now=None):
+    """Map the chat-proxy billing payload to a single monthly usage window."""
+    now = int(time.time()) if now is None else int(now)
+    config = payload.get("config") if isinstance(payload, dict) else None
+    if not isinstance(config, dict):
+        raise IdentityBindingError("grok_capacity_unrecognized")
+    used = grok_unwrap_val(config.get("used"))
+    limit = grok_unwrap_val(config.get("monthlyLimit"))
+    if used is None or limit is None or limit <= 0:
+        raise IdentityBindingError("grok_capacity_unrecognized")
+    percent = round(min(100.0, max(0.0, (used / limit) * 100.0)), 1)
+    period_start = iso_ep(config.get("billingPeriodStart"))
+    period_end = iso_ep(config.get("billingPeriodEnd"))
+    window_minutes = None
+    if period_start is not None and period_end is not None and period_end > period_start:
+        window_minutes = int(round((period_end - period_start) / 60.0))
+    return {
+        "month": {
+            "used_percent": percent,
+            "resets_at": period_end,
+            "window_minutes": window_minutes,
+            "observed_at": now,
+            "freshness": "fresh",
+            "used_units": used,
+            "limit_units": limit,
+        }
+    }
+
+
+def grok_limits(home, expected_email=None, opener=None):
+    """Live Grok monthly allotment read. Returns identity + windows fields."""
+    identity = grok_identity(home, expected_email=expected_email, opener=opener)
+    entry = grok_auth_entry(home) or {}
+    token = entry.get("key")
+    if not token:
+        raise IdentityBindingError("grok_auth_missing")
+    if grok_token_expired(entry):
+        raise IdentityBindingError("grok_usage_token_expired")
+    open_fn = open_authenticated if opener is None else opener
+    request = urllib.request.Request(
+        GROK_BILLING_URL,
+        headers={
+            "authorization": "Bearer " + token,
+            "accept": "application/json",
+            "user-agent": "headroom",
+            "x-grok-client-surface": "grok-build",
+        },
+    )
+    try:
+        response = open_fn(request, timeout=30)
+    except urllib.error.HTTPError as error:
+        if error.code == 429:
+            raise ProviderThrottleError(
+                retry_after_epoch(error.headers), provider_response=True
+            ) from error
+        if error.code in (401, 403):
+            raise IdentityBindingError("grok_usage_token_rejected") from error
+        raise
+    with response:
+        data = json.load(response)
+    now = int(time.time())
+    windows = grok_billing_windows(data, now=now)
+    return identity, windows, now
+
+
 # ------------------------------------------------------------------ limits
 
 def limit_entry(limit, minutes):
@@ -912,10 +1134,14 @@ def codex_limits(home, now=None):
 
 # ---------------------------------------------------------------- snapshot
 
-def validate_required_windows(windows, require_5h=True):
+def validate_required_windows(windows, require_5h=True, required=None):
     # codex passes require_5h=False: OpenAI lifted the 5h limit, so a codex
     # seat legitimately reports only the weekly window (see codex_windows).
-    for key in (("5h", "7d") if require_5h else ("7d",)):
+    # grok passes required=("month",): SuperGrok meters a monthly allotment,
+    # not 5h/7d rolling windows.
+    if required is None:
+        required = ("5h", "7d") if require_5h else ("7d",)
+    for key in required:
         window = windows.get(key)
         if not isinstance(window, dict):
             raise ValueError(f"missing required {key} usage window")
@@ -1076,6 +1302,28 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                     result["pin_usage_org"] = result["source_identity_fingerprint"]
                 validate_required_windows(result["windows"])
                 result["ok"] = True
+            elif account["provider"] == "grok":
+                expected = account.get("expected_email")
+                grok_retry_at = active_backoff(backoff, "grok_billing_api", now)
+                if grok_retry_at > now:
+                    raise ProviderThrottleError(grok_retry_at)
+                identity, windows, captured = grok_limits(
+                    account["home"], expected_email=expected)
+                result["identity"] = identity
+                result["identity_verified"] = identity.get("verified", False)
+                result["identity_method"] = identity.get("method")
+                result["email"] = identity.get("email")
+                result["plan"] = identity.get("plan_type") or "Grok"
+                result["subscription"] = {
+                    "status": "active" if identity.get("verified") else "unknown",
+                    "source": "grok_billing_api",
+                }
+                result["source"] = "grok_billing_api"
+                result["stale"] = False
+                result["captured_at"] = captured
+                result["windows"] = windows
+                validate_required_windows(result["windows"], required=("month",))
+                result["ok"] = True
             else:
                 expected = account.get("expected_email")
                 codex_retry_at = active_backoff(backoff, "codex_app_server", now)
@@ -1163,7 +1411,12 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
         except ProviderThrottleError as error:
             claude_backoff_until = max(claude_backoff_until, error.retry_at)
             if error.provider_response and persist_backoff is not None:
-                persist_backoff(claude_backoff_until)
+                backoff_name = {
+                    "claude": "anthropic_usage_api",
+                    "grok": "grok_billing_api",
+                    "codex": "codex_app_server",
+                }.get(account.get("provider"), "anthropic_usage_api")
+                persist_backoff(error.retry_at, backoff_name)
             carried = _throttle_carryover(previous, account, now,
                                           result.get("identity"))
             if carried is not None:
@@ -1198,6 +1451,21 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                     "account (the CLI refreshes its token) or `headroom auth "
                     f"refresh {account['name']}` to re-login; readings held "
                     "until then.")
+            elif error.code in ("grok_usage_token_expired",
+                                "grok_usage_token_rejected"):
+                what = ("has expired" if error.code.endswith("expired")
+                        else "was rejected by the billing API (expired or "
+                             "revoked)")
+                result["note"] = (
+                    f"cached Grok token {what} — headroom never refreshes "
+                    "credentials itself. Run `grok login` (or one Grok turn "
+                    "so the CLI refreshes) on this account; readings held "
+                    "until then.")
+            elif error.code == "grok_auth_missing":
+                result["note"] = (
+                    "no Grok login found in this slot's home — run "
+                    f"`headroom connect {account['name']}` or `grok login` "
+                    "with GROK_HOME pointed at the slot.")
             elif error.code == "claude_credentials_missing":
                 # verified identity but the token couldn't be read. On macOS the
                 # token is in the login Keychain (headroom reads it via

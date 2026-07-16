@@ -17,6 +17,8 @@ from . import paths
 SCHEMA = "headroom_widget@1"
 TEXT_SCHEMA = "headroom_widget_txt@1"
 WINDOW_KEYS = ("5h", "7d")
+# Grok SuperGrok meters a monthly allotment only — scored separately from 5h/7d.
+GROK_WINDOW_KEYS = ("month",)
 SNAPSHOT_MAX_AGE = paths.env_int("HEADROOM_SNAPSHOT_MAX_AGE", 900)
 OBSERVATION_MAX_AGE = paths.env_int("HEADROOM_OBSERVATION_MAX_AGE", 1800)
 DASHBOARD_HREF = "http://127.0.0.1:8377/"
@@ -136,10 +138,10 @@ def calculate_headline(accounts):
     current = sum(1 for account in accounts
                   if account.get("state") == "current")
     candidates = []
-    averages = {"5h": [], "7d": []}
+    averages = {"5h": [], "7d": [], "month": []}
     for account in accounts:
         windows = account.get("windows") or {}
-        window = windows.get("5h") or {}
+        window = windows.get("5h") or windows.get("month") or {}
         value = window.get("left_percent")
         if (account.get("state") == "current"
                 and window.get("state") == "current" and _number(value)):
@@ -160,6 +162,7 @@ def calculate_headline(accounts):
         "fullest_5h_left_percent": max(candidates) if candidates else None,
         "avg_5h_left_percent": _avg(averages["5h"]),
         "avg_7d_left_percent": _avg(averages["7d"]),
+        "avg_month_left_percent": _avg(averages["month"]),
     }
 
 
@@ -180,7 +183,9 @@ def project(snapshot, evaluated_at=None, force_noncurrent_reason=None):
         raw_windows = raw.get("windows")
         raw_windows = raw_windows if isinstance(raw_windows, dict) else {}
         windows = {}
-        for key in WINDOW_KEYS:
+        is_grok = raw.get("provider") == "grok"
+        standard_keys = GROK_WINDOW_KEYS if is_grok else WINDOW_KEYS
+        for key in standard_keys:
             raw_window = raw_windows.get(key)
             # The 5h window is optional ONLY for codex: OpenAI lifted Codex's
             # 5h, so a live codex seat reports only the weekly window. A
@@ -191,6 +196,7 @@ def project(snapshot, evaluated_at=None, force_noncurrent_reason=None):
             # projects held (fail-closed). For any other provider a missing 5h
             # is a failed read that must project held, and the weekly (7d) stays
             # mandatory for everyone: a missing 7d still holds the seat.
+            # Grok only projects the monthly allotment (standard_keys above).
             if (key == "5h" and key not in raw_windows and base_state != "held"
                     and raw.get("provider") == "codex"):
                 continue
@@ -205,8 +211,13 @@ def project(snapshot, evaluated_at=None, force_noncurrent_reason=None):
                     and key not in windows:
                 windows[key] = _window_projection(
                     raw_window, captured_at, base_state, evaluated_at)
+            # surface month when a mixed fleet also has non-grok accounts that
+            # don't project it via standard_keys
+            if key == "month" and key not in windows:
+                windows[key] = _window_projection(
+                    raw_window, captured_at, base_state, evaluated_at)
         states = {window["state"] for key, window in windows.items()
-                  if key in WINDOW_KEYS}
+                  if key in standard_keys}
         if base_state == "held" or "held" in states:
             state = "held"
         elif base_state == "stale" or "stale" in states:

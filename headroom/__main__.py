@@ -3,7 +3,7 @@ for Claude Code and Codex subscriptions.
 
 usage:
   headroom setup                    first-run wizard (accounts + dashboard style)
-  headroom connect [name] [--provider claude|codex] [--adopt PATH]
+  headroom connect [name] [--provider claude|codex|grok] [--adopt PATH]
                                     add an account (fresh login or adopt existing)
   headroom auth refresh <slot>     interactively re-login an owned Claude slot
                                     (then run `headroom collect`; never automatic)
@@ -21,7 +21,7 @@ usage:
   headroom run <model> -- <cmd...>  headless run with auto-rotation on limit-hit
   headroom rotate [model]           cool the current account down, pick the next
   headroom handoff [--session UUID] [--to SLOT] [--model FAMILY]
-                   [--provider claude|codex] [--from SLOT]
+                   [--provider claude|codex|grok] [--from SLOT]
                    [--headless BATON] [--print | --yes] [--force]
                                     hand a Claude or Codex conversation to
                                     another account (provider auto-detected
@@ -493,7 +493,7 @@ def _dispatch(argv):
             print(f"HEADROOM_DIR {paths.base_dir()}")
         except ValueError as error:
             print(f"HEADROOM_DIR INVALID: {error}")
-        for cli in ("claude", "codex"):
+        for cli in ("claude", "codex", "grok"):
             found = shutil.which(cli)
             print(f"{cli:<10} {found or 'not found on PATH'}")
         try:

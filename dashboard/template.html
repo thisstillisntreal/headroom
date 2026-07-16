@@ -596,9 +596,11 @@ function displayState(a){
   /* 5h is optional only for a live codex seat (OpenAI lifted it): skip an
      absent 5h so it can't force "held". 7d is always counted (mandatory), and
      a non-codex seat always counts 5h too, so a missing 5h there still holds
-     (fail-closed). */
+     (fail-closed). Grok SuperGrok meters a monthly allotment only. */
   const win=(d&&d.windows)||{};
-  const states=["5h","7d"].filter(k=>k==="7d"||a.provider!=="codex"||win[k]!==undefined).map(k=>intrinsicWindowState(a,k));
+  const keys=a.provider==="grok"?["month"]
+    :["5h","7d"].filter(k=>k==="7d"||a.provider!=="codex"||win[k]!==undefined);
+  const states=keys.map(k=>intrinsicWindowState(a,k));
   if(states.includes("held"))return"held";
   if(states.includes("stale"))return"stale";
   return states.includes("limited")?"limited":"current";
@@ -621,13 +623,14 @@ function isCurrent(a){return displayState(a)==="current";}
 function windowLabel(key){
   if(key==="5h")return"Session 5h";
   if(key==="7d")return"Weekly all";
+  if(key==="month")return"Monthly allotment";
   if(key.startsWith("scoped:"))return"Weekly "+key.slice(7);
   return key;
 }
 function windowColumns(accounts){
   const keys=["5h","7d"];
   accounts.forEach(a=>Object.keys(a.windows||{}).forEach(k=>{
-    if(k.startsWith("scoped:")&&!keys.includes(k))keys.push(k);}));
+    if((k.startsWith("scoped:")||k==="month")&&!keys.includes(k))keys.push(k);}));
   return keys;
 }
 
@@ -644,12 +647,15 @@ function windowMarkup(account,key){
   const w=(account.windows||{})[key]||null;
   const view=windowView(account,key),left=view.left;
   const unknown=left==null;
-  /* A standard window absent from a live CODEX account is a lifted limit
-     (OpenAI removed Codex's 5h), not a failed read: render it neutrally, never
-     as a fake 0% or an n/a error. Gate on codex + not-held (not isCurrent) so a
-     LIMITED codex seat — 7d capped, 5h lifted — still reads "no 5h limit", and
-     a non-codex absent window still fails closed to "n/a". */
-  const absentLimit=!w&&!key.startsWith("scoped:")&&account.provider==="codex"&&displayState(account)!=="held";
+  /* A standard window absent from a live CODEX/GROK account is a lifted/N/A
+     limit, not a failed read: render it neutrally, never as a fake 0% or an
+     n/a error. Codex: 5h lifted. Grok: only monthly allotment exists, so 5h/7d
+     are not metered. Gate on provider + not-held so limited seats still read
+     cleanly, and other providers still fail closed to "n/a". */
+  const absentLimit=!w&&!key.startsWith("scoped:")
+    &&((account.provider==="codex"&&key==="5h")
+       ||(account.provider==="grok"&&(key==="5h"||key==="7d")))
+    &&displayState(account)!=="held";
   const value=unknown?(absentLimit?"—":"n/a"):Math.round(left)+"% left";
   const note=unknown?(absentLimit?"no "+key+" limit":(w?"reading unavailable":(key.startsWith("scoped:")?"no scoped cap":"no reading yet"))):untilReset(w.resets_at);
   return '<div class="win"><span class="win-name">'+esc(windowLabel(key))+

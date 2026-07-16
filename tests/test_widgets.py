@@ -268,7 +268,8 @@ class WidgetContractTests(unittest.TestCase):
             "current_accounts": 2, "total_accounts": 2,
             "fullest_5h_left_percent": 92.0,
             "avg_5h_left_percent": 68.5,   # (45 + 92) / 2
-            "avg_7d_left_percent": 60.0})
+            "avg_7d_left_percent": 60.0,
+            "avg_month_left_percent": None})
 
     def test_headline_excludes_noncurrent_candidates(self):
         value = widget.project(usage_snapshot(
@@ -1107,7 +1108,8 @@ class LiquidGlassWidgetTests(unittest.TestCase):
             "current_accounts": 7, "total_accounts": 7,
             "fullest_5h_left_percent": 100.0,
             "avg_5h_left_percent": 77.6,
-            "avg_7d_left_percent": 71.4})
+            "avg_7d_left_percent": 71.4,
+            "avg_month_left_percent": None})
         providers = {row["provider"] for row in value["accounts"]}
         self.assertEqual(providers, {"claude", "codex"})
         for row in value["accounts"]:

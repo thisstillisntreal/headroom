@@ -536,8 +536,14 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     # weekly window, so an absent 5h is a lifted limit, not a missing reading.
     # Skip it for codex; the weekly (7d) stays mandatory for every provider,
     # and a non-codex seat missing any standard window still holds (fail-closed).
-    codex = account.get("provider") == "codex"
-    for key in ("5h", "7d"):
+    # Grok SuperGrok meters a monthly allotment only — score on `month`.
+    provider = account.get("provider")
+    if provider == "grok":
+        required_windows = ("month",)
+    else:
+        required_windows = ("5h", "7d")
+    codex = provider == "codex"
+    for key in required_windows:
         window = windows.get(key)
         if not isinstance(window, dict):
             # Only a genuinely ABSENT 5h is the lifted limit. A PRESENT but
@@ -650,9 +656,15 @@ def _headroom_score(row):
     # windows are present. Reachable for codex now that block_reason no longer
     # blocks an absent 5h. 7d stays required — its absence, or any unreadable
     # percent, scores worst (fail-closed ordering).
-    codex = row.get("provider") == "codex"
+    # Grok scores only on the monthly allotment window.
+    provider = row.get("provider")
+    if provider == "grok":
+        keys = ("month",)
+    else:
+        keys = ("5h", "7d")
+    codex = provider == "codex"
     values = []
-    for key in ("5h", "7d"):
+    for key in keys:
         window = windows.get(key)
         if not isinstance(window, dict):
             if key == "5h" and codex:
@@ -706,12 +718,16 @@ def pick(fam):
 
 
 def env_key(account):
-    return "CLAUDE_CONFIG_DIR" if account["provider"] == "claude" else "CODEX_HOME"
+    return {
+        "claude": "CLAUDE_CONFIG_DIR",
+        "codex": "CODEX_HOME",
+        "grok": "GROK_HOME",
+    }.get(account["provider"], "CLAUDE_CONFIG_DIR")
 
 
 def env_pinned_account(fam):
     """The registered account an explicitly exported CLAUDE_CONFIG_DIR /
-    CODEX_HOME names, or None.
+    CODEX_HOME / GROK_HOME names, or None.
 
     When a caller has already routed (exported the config home) before
     invoking headroom, that choice is respected as the *initial* account
@@ -720,8 +736,7 @@ def env_pinned_account(fam):
     environment value counts; the provider default home is not a pin."""
     try:
         provider = registry.family_provider(fam)
-        value = os.environ.get(
-            "CLAUDE_CONFIG_DIR" if provider == "claude" else "CODEX_HOME", "")
+        value = os.environ.get(env_key({"provider": provider}), "")
         value = value.strip()
         if not value:
             return None

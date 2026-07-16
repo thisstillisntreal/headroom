@@ -93,7 +93,7 @@ def run_setup():
     # -- 2. connect more accounts ------------------------------------------
     while ask_yes_no("\nConnect another account (opens the provider's own "
                      "login flow)?", False):
-        provider = connect.prompt_choice("Provider?", ["claude", "codex"])
+        provider = connect.prompt_choice("Provider?", ["claude", "codex", "grok"])
         taken = {account["name"] for account in config["accounts"]}
         default_name = next(candidate for candidate in
                             [f"{provider}-{index}" for index in range(1, 100)]
