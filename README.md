@@ -1,15 +1,52 @@
 # headroom
 
-**A live dashboard for every Claude and Codex subscription you own — read
-straight from the providers *without spending a single token* — that rotates
-you to the next account with headroom the moment one hits a limit.**
+**A live dashboard for every AI subscription you own — read straight from the
+providers *without spending a single token* — that rotates you to the next
+account with headroom the moment one hits a limit.**
 
 The heart of headroom is a **live web dashboard you run locally**. Run
-`headroom serve`, open `http://127.0.0.1:8377`, and every account's 5-hour,
-weekly, and model-scoped capacity is on one page, updating in real time. It's
-an ordinary local web page, so it works in any browser on any OS — you're not
-tied to one machine. A menu-bar app and pinnable desktop widgets are optional
-extras layered on the same data, for a glance without opening a tab.
+`headroom serve`, open `http://127.0.0.1:8377`, and every account's capacity
+windows are on one page, updating in real time. It's an ordinary local web
+page, so it works in any browser on any OS — you're not tied to one machine.
+A menu-bar app and pinnable desktop widgets are optional extras layered on
+the same data, for a glance without opening a tab.
+
+### What the dashboard tracks
+
+| Provider | How usage is read | Typical windows |
+|---|---|---|
+| **Claude** | Anthropic OAuth usage API (Keychain / config home) | 5h, 7d, model-scoped |
+| **Codex / ChatGPT** | Codex app-server rate limits (or session telemetry fallback) | 5h (when present), 7d, scoped |
+| **Manus** | Manus `usage.availableCredits` API key | Total credits, monthly allotment; optional renew date/amount |
+| **NVIDIA** (free tier) | Local request/token ledger + optional Insights key | Rolling 5h / 7d / month |
+
+Multi-account slots work the original headroom way: each extra Claude/Codex
+login gets an isolated home under `~/.headroom/homes/<slot>` so one Mac can
+hold several identities without clobbering Keychain or config files.
+
+### Fleet management on the page (local serve only)
+
+With `headroom serve` (loopback only):
+
+- **+ Accounts / Edit on a card** — set monthly cost ($/mo → yearly shown),
+  expected email pin, reserved flag, and **renews on / renews at** for
+  use-it-or-lose-it allotments.
+- **Reorder** — ↑↓ or drag account cards within a provider; reorder whole
+  provider sections (Claude / Codex / Manus / …). Order is preference order
+  for routing and dashboard layout.
+- **Manus tank** — total available (free + monthly left); full tank =
+  monthly (or your renew-at amount). Free credits can push the needle
+  **past Full**.
+- **History / waste / burn goals / Insights** — local history charts, waste
+  at window reset, optional “use it or lose it” deadlines, optional NVIDIA
+  Insights key (stored only in `~/.headroom/secrets.json`).
+
+Config-only edits (cost, renew pins, reorder) update the public snapshot
+**without** waiting on a full multi-provider network collect. Use **Refresh**
+or `headroom collect` when you want live capacity re-read.
+
+Secrets never ship with the repo: live `config.json`, `secrets.json`, `homes/`,
+and `state/` stay under `~/.headroom/` (gitignored).
 
 https://github.com/user-attachments/assets/71e8ec51-8f0f-4ec2-806f-221b9eb6571f
 
@@ -31,24 +68,26 @@ live from the dashboard. The setup wizard asks how you want it to look.
 
 ## Why this exists
 
-If you run more than one Claude or ChatGPT subscription (work + personal +
-team), you know the drill: a session dies with *"you've hit your limit"*, you
-have no idea how much is left on the other accounts, and you burn ten minutes
-logging in and out to find out.
+If you run more than one AI subscription (work + personal + team, Claude and
+ChatGPT, plus credit-based tools), you know the drill: a session dies with
+*"you've hit your limit"*, you have no idea how much is left on the other
+accounts, and you burn ten minutes logging in and out to find out.
 
 headroom fixes all three problems:
 
-1. **See** — every account's 5-hour, weekly, and model-scoped windows on one
-   page, color-coded by what's *left*, not what's used.
-2. **Read for free** — usage comes live from the same reads your CLIs already
-   use (Anthropic's OAuth usage API; the Codex app-server's rate-limits read).
-   Checking your limits never consumes them.
-3. **Rotate** — `headroom claude` launches on the first account in your
-   preference order with *proven* headroom. When a limit hits,
-   `headroom rotate` (or the `/rotator` skill inside Claude Code) cools that
-   login down until its window resets and hands you the next one. Set a
-   **reserve** (e.g. 10%) and it skips any account already below that much
-   headroom, so a session starts fresh instead of hitting a wall mid-task.
+1. **See** — every connected account's capacity on one page, color-coded by
+   what's *left*, not what's used (session/weekly windows for Claude and
+   Codex; credit tanks for Manus; local rolling usage for NVIDIA free tier).
+2. **Read for free** — usage comes from the same reads your tools already
+   use (Anthropic OAuth usage, Codex app-server rate limits, Manus credits
+   API, local NVIDIA ledger). Checking limits never burns them.
+3. **Rotate** — `headroom claude` / `headroom codex` launch on the first
+   account in your preference order with *proven* headroom. When a limit
+   hits, `headroom rotate` (or the `/rotator` skill inside Claude Code)
+   cools that login down until its window resets and hands you the next
+   one. Set a **reserve** (e.g. 10%) and it skips any account already below
+   that much headroom, so a session starts fresh instead of hitting a wall
+   mid-task.
 
 ## New in v0.2: automatic Claude conversation handoff
 
@@ -97,11 +136,11 @@ platform.
 ## Quickstart
 
 Requirements: Python 3.9+ (stdlib only — no pip installs), macOS or Linux,
-and the `claude` and/or `codex` CLIs you already use. (On macOS the Claude
-token lives in the login Keychain; headroom reads it directly — approve the
-Keychain prompt on first run. Multiple Claude accounts on one Mac need a
-current Claude Code version — see
-[docs/KNOWN-LIMITS.md](docs/KNOWN-LIMITS.md).)
+and the CLIs you already use (`claude`, `codex`, and optionally others you
+connect for dashboard tracking). On macOS the Claude token lives in the
+login Keychain; headroom reads it directly — approve the Keychain prompt on
+first run. Multiple Claude accounts on one Mac need a current Claude Code
+version — see [docs/KNOWN-LIMITS.md](docs/KNOWN-LIMITS.md).
 
 ```bash
 git clone https://github.com/domanski-ai/headroom
@@ -114,10 +153,12 @@ headroom setup            # the wizard: connects accounts, styles your dashboard
 Want to see it before connecting anything? `headroom serve --demo` opens the
 dashboard on bundled sample data — it's exactly what the screenshots show.
 
-The wizard finds logins already on your machine (`~/.claude`, `~/.codex`) and
-adopts them in place — credentials are never moved, copied, or read beyond
+The wizard finds logins already on your machine (`~/.claude`, `~/.codex`, …)
+and adopts them in place — credentials are never moved, copied, or read beyond
 what's needed to verify who's logged in. Extra accounts get their own isolated
-config home and log in through the provider's own flow.
+config home and log in through the provider's own flow. API-key providers
+(Manus, NVIDIA) take a key you paste into the local manage UI; keys land in
+`~/.headroom` only.
 
 Then:
 
@@ -200,8 +241,9 @@ menu actions, and clean exit.
 | command | what it does |
 |---|---|
 | `headroom setup` | first-run wizard: accounts + dashboard style quiz |
-| `headroom connect` | add another account (guided login, clobber-proof) |
+| `headroom connect` | add another account (guided login or API key, clobber-proof) |
 | `headroom collect` | refresh usage for every account (no tokens spent) |
+| `headroom dashboard` | rebuild the static dashboard shell + public `usage.json` |
 | `headroom status [model]` | table: every account, its windows, and exactly why any is skipped |
 | `headroom pick <model>` | print the best account name (exit 2 if none) — script-friendly |
 | `headroom env <model>` | print the `export CLAUDE_CONFIG_DIR=...` line for the best account |
@@ -247,9 +289,16 @@ authenticated cap proof.
   (On an older Codex CLI without the app-server, headroom falls back to a
   best-effort session-log read and the router holds those accounts until a
   fresh reading appears.)
+- **Manus — real-time credits.** A Manus API key (Integrations → API) reads
+  `usage.availableCredits`: free credits, monthly allotment remaining, and
+  refresh pool. The dashboard shows total available and a full-tank mark
+  (monthly allotment or your pinned renew-at amount).
+- **NVIDIA free tier — local ledger.** Optional free API key for Insights and
+  a per-machine usage ledger (rolling windows). No provider routing required.
 
-Every account is optional — run only Claude, only Codex, or both. Both
-providers are read live, identity-bound, and fully routed.
+Every account is optional — connect only the providers you use. Claude and
+Codex remain the launch/rotate surfaces; other providers are capacity and
+cost visibility on the same dashboard.
 - Snapshots are written atomically. The dashboard gets a sanitized projection
   (optionally with emails redacted) — raw identity material stays in the
   private state directory with `0600` permissions.
@@ -374,10 +423,12 @@ coordinator to stand up.
 
 ## Hosting the dashboard somewhere else
 
-`headroom dashboard` builds two static files (`index.html` + `usage.json`)
-in `~/.headroom/state/public/`. Put them behind any static host or reverse
-proxy; add a cron for `headroom collect` to keep the JSON fresh. Turn on
-`redact_emails` in setup if the page might be visible to others.
+`headroom dashboard` builds the static shell (`index.html` + `static/` CSS/JS
+partials + `usage.json`) under `~/.headroom/state/public/`. Put them behind
+any static host or reverse proxy; add a cron for `headroom collect` to keep
+the JSON fresh. Turn on `redact_emails` in setup if the page might be visible
+to others. Account **management** (add/edit/reorder, one-click login) only
+runs on loopback `headroom serve` — not on a publicly hosted static copy.
 
 ## Security posture
 
