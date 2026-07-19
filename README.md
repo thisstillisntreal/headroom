@@ -17,12 +17,13 @@ the same data, for a glance without opening a tab.
 |---|---|---|
 | **Claude** | Anthropic OAuth usage API (Keychain / config home) | 5h, 7d, model-scoped |
 | **Codex / ChatGPT** | Codex app-server rate limits (or session telemetry fallback) | 5h (when present), 7d, scoped |
+| **Grok** | xAI billing / SuperGrok allotment (CLI login home) | Monthly pool (and related windows when exposed) |
 | **Manus** | Manus `usage.availableCredits` API key | Total credits, monthly allotment; optional renew date/amount |
 | **NVIDIA** (free tier) | Local request/token ledger + optional Insights key | Rolling 5h / 7d / month |
 
-Multi-account slots work the original headroom way: each extra Claude/Codex
-login gets an isolated home under `~/.headroom/homes/<slot>` so one Mac can
-hold several identities without clobbering Keychain or config files.
+Multi-account slots work the original headroom way: each extra Claude / Codex /
+Grok login gets an isolated home under `~/.headroom/homes/<slot>` so one Mac
+can hold several identities without clobbering Keychain or config files.
 
 ### Fleet management on the page (local serve only)
 
@@ -32,8 +33,8 @@ With `headroom serve` (loopback only):
   expected email pin, reserved flag, and **renews on / renews at** for
   use-it-or-lose-it allotments.
 - **Reorder** — ↑↓ or drag account cards within a provider; reorder whole
-  provider sections (Claude / Codex / Manus / …). Order is preference order
-  for routing and dashboard layout.
+  provider sections (Claude / Codex / Grok / Manus / NVIDIA). Order is
+  preference order for routing and dashboard layout.
 - **Manus tank** — total available (free + monthly left); full tank =
   monthly (or your renew-at amount). Free credits can push the needle
   **past Full**.
@@ -77,10 +78,11 @@ headroom fixes all three problems:
 
 1. **See** — every connected account's capacity on one page, color-coded by
    what's *left*, not what's used (session/weekly windows for Claude and
-   Codex; credit tanks for Manus; local rolling usage for NVIDIA free tier).
+   Codex; SuperGrok monthly allotment for Grok; credit tanks for Manus;
+   local rolling usage for NVIDIA free tier).
 2. **Read for free** — usage comes from the same reads your tools already
-   use (Anthropic OAuth usage, Codex app-server rate limits, Manus credits
-   API, local NVIDIA ledger). Checking limits never burns them.
+   use (Anthropic OAuth usage, Codex app-server rate limits, Grok billing,
+   Manus credits API, local NVIDIA ledger). Checking limits never burns them.
 3. **Rotate** — `headroom claude` / `headroom codex` launch on the first
    account in your preference order with *proven* headroom. When a limit
    hits, `headroom rotate` (or the `/rotator` skill inside Claude Code)
@@ -289,6 +291,10 @@ authenticated cap proof.
   (On an older Codex CLI without the app-server, headroom falls back to a
   best-effort session-log read and the router holds those accounts until a
   fresh reading appears.)
+- **Grok — SuperGrok allotment.** headroom reads the Grok CLI’s billing /
+  usage endpoints from that slot’s config home (same isolated-home model as
+  Claude/Codex). Monthly SuperGrok capacity shows on the dashboard with the
+  rest of the fleet.
 - **Manus — real-time credits.** A Manus API key (Integrations → API) reads
   `usage.availableCredits`: free credits, monthly allotment remaining, and
   refresh pool. The dashboard shows total available and a full-tank mark
@@ -297,8 +303,8 @@ authenticated cap proof.
   a per-machine usage ledger (rolling windows). No provider routing required.
 
 Every account is optional — connect only the providers you use. Claude and
-Codex remain the launch/rotate surfaces; other providers are capacity and
-cost visibility on the same dashboard.
+Codex remain the primary launch/rotate surfaces; Grok, Manus, and NVIDIA
+share the same dashboard for capacity and cost visibility.
 - Snapshots are written atomically. The dashboard gets a sanitized projection
   (optionally with emails redacted) — raw identity material stays in the
   private state directory with `0600` permissions.
