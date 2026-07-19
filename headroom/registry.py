@@ -32,13 +32,15 @@ import re
 
 from . import paths
 
-PROVIDERS = ("claude", "codex", "grok", "manus")
+PROVIDERS = ("claude", "codex", "grok", "manus", "nvidia")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
 DEFAULT_DASHBOARD = {
     "theme": "midnight",
     "title": "AI Fleet",
     "redact_emails": True,
     "port": 8377,
+    # Dashboard section order (Claude / Codex / Grok / Manus / NVIDIA)
+    "provider_order": list(PROVIDERS),
 }
 
 # Model-family -> provider. `pick`/`run` accept any model string; family()
@@ -53,6 +55,9 @@ FAMILY_PROVIDER = {
     "gpt": "codex",
     "grok": "grok",
     "manus": "manus",
+    "nvidia": "nvidia",
+    "nim": "nvidia",
+    "nemotron": "nvidia",
 }
 
 
@@ -63,16 +68,20 @@ class RegistryError(ValueError):
 def family(model):
     model = (model or "").lower().strip()
     for name in ("fable", "opus", "sonnet", "haiku", "codex", "gpt", "grok",
-                 "manus"):
+                 "manus", "nvidia", "nim", "nemotron"):
         if name in model:
-            return "codex" if name == "gpt" else name
+            if name == "gpt":
+                return "codex"
+            if name in ("nim", "nemotron"):
+                return "nvidia"
+            return name
     if not model or "claude" in model:
         return "claude"
     # An unknown model must not silently route as generic Claude — a typo'd
     # scoped model would bypass its own weekly cap.
     raise RegistryError(
         f"unknown model family: {model!r} "
-        f"(use opus/sonnet/haiku/claude/codex/grok/manus)")
+        f"(use opus/sonnet/haiku/claude/codex/grok/manus/nvidia)")
 
 
 def family_provider(fam):

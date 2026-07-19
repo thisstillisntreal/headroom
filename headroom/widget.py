@@ -185,7 +185,11 @@ def project(snapshot, evaluated_at=None, force_noncurrent_reason=None):
         windows = {}
         # Grok + Manus meter a monthly allotment (credits / SuperGrok pool).
         is_monthly = raw.get("provider") in ("grok", "manus")
-        standard_keys = GROK_WINDOW_KEYS if is_monthly else WINDOW_KEYS
+        # NVIDIA tracks soft 5h/7d/month from the local API ledger
+        if raw.get("provider") == "nvidia":
+            standard_keys = ("5h", "7d", "month")
+        else:
+            standard_keys = GROK_WINDOW_KEYS if is_monthly else WINDOW_KEYS
         for key in standard_keys:
             raw_window = raw_windows.get(key)
             # The 5h window is optional ONLY for codex: OpenAI lifted Codex's

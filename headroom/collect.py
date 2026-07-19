@@ -58,7 +58,8 @@ PUBLIC_FIELDS = {
     "name", "email", "provider", "plan", "ok", "note", "error_code", "retry_at",
     "captured_at", "source", "stale", "windows", "identity_verified",
     "identity_method", "trust_state", "routable", "subscription",
-    "throttle_carryover", "monthly_cost_usd", "credits",
+    "throttle_carryover", "monthly_cost_usd", "annual_cost_usd", "credits",
+    "usage", "renews_on", "renew_amount",
 }
 
 
@@ -299,6 +300,8 @@ def credential_digest(provider, home):
             token = (grok_auth_entry(home) or {}).get("key")
         elif provider == "manus":
             token = manus_api_key(home)
+        elif provider == "nvidia":
+            token = nvidia_api_key(home)
         else:
             token = ((paths.load_json(os.path.join(home, "auth.json")) or {})
                      .get("tokens") or {}).get("access_token")
@@ -318,6 +321,8 @@ def local_binding(provider, home):
             fp = grok_local_identity(home)["account_fingerprint"]
         elif provider == "manus":
             fp = manus_local_identity(home)["account_fingerprint"]
+        elif provider == "nvidia":
+            fp = nvidia_local_identity(home)["account_fingerprint"]
         else:
             auth = paths.load_json(os.path.join(home, "auth.json")) or {}
             claims = decode_jwt_payload((auth.get("tokens") or {}).get("id_token"))
@@ -348,12 +353,32 @@ def claude_bin():
     return shutil.which("claude")
 
 
+def is_default_claude_home(home):
+    """True when home is the Claude CLI's default config dir (~/.claude).
+
+    The current Claude Code CLI treats CLAUDE_CONFIG_DIR specially: when it is
+    unset, credentials live in the legacy shared Keychain item
+    ``Claude Code-credentials``. When it is set (even to ``~/.claude``), the
+    CLI looks for a *namespaced* Keychain item and reports loggedOut even if
+    the user is fully signed in. Headroom must therefore leave
+    CLAUDE_CONFIG_DIR unset for the default home.
+    """
+    try:
+        return os.path.realpath(home) == os.path.realpath(
+            os.path.expanduser("~/.claude"))
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def claude_identity(home, runner=subprocess.run):
     """Provider-verified identity via `claude auth status`; local fallback."""
     binary = claude_bin()
     if binary:
         env = scrubbed_env()
-        env["CLAUDE_CONFIG_DIR"] = home
+        # Only isolate non-default homes. Setting CLAUDE_CONFIG_DIR for the
+        # default ~/.claude home makes the CLI miss the shared Keychain token.
+        if not is_default_claude_home(home):
+            env["CLAUDE_CONFIG_DIR"] = home
         try:
             process = runner(
                 [binary, "auth", "status", "--json"], env=env,
@@ -372,7 +397,41 @@ def claude_identity(home, runner=subprocess.run):
                     }
         except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError):
             pass
-    return claude_local_identity(home)
+    try:
+        return claude_local_identity(home)
+    except IdentityBindingError:
+        # Keychain-backed default login with no oauthAccount in .claude.json:
+        # still surface a usable identity when the OAuth token is present so
+        # adopt/connect/collect can bind the slot.
+        if is_default_claude_home(home):
+            oauth = claude_oauth(home) or {}
+            if oauth.get("accessToken"):
+                # One more try: bare auth status with the process env (no
+                # scrub) only for the default home — some installs keep the
+                # token only reachable that way.
+                if binary:
+                    try:
+                        process = runner(
+                            [binary, "auth", "status", "--json"],
+                            capture_output=True, text=True,
+                            timeout=IDENTITY_TIMEOUT,
+                        )
+                        if process.returncode == 0:
+                            status = json.loads(process.stdout)
+                            if status.get("loggedIn"):
+                                org_id = status.get("orgId")
+                                return {
+                                    "verified": True,
+                                    "email": status.get("email"),
+                                    "account_fingerprint": (
+                                        fingerprint(org_id) if org_id else None),
+                                    "method": "claude_auth_status_default",
+                                    "plan_type": status.get("subscriptionType"),
+                                }
+                    except (OSError, subprocess.SubprocessError, ValueError,
+                            json.JSONDecodeError):
+                        pass
+        raise
 
 
 def codex_bin():
@@ -991,11 +1050,21 @@ def manus_local_identity(home):
 
 
 def manus_credit_windows(payload, now=None):
-    """Map usage.availableCredits data to a monthly (and optional refresh) window.
+    """Map usage.availableCredits data to monthly + daily-refresh windows.
 
-    Prefer the VIP periodic quota when present: used = pro_monthly − remaining
-    periodic. Otherwise fall back to total_credits as a soft remaining-balance
-    window (0% used while balance > 0).
+    Live Manus Pro UI maps like this (API field → meaning):
+
+    * total_credits          — free + periodic + refresh (wallet sum)
+    * free_credits           — Free credits
+    * periodic_credits       — Monthly credits remaining
+    * pro_monthly_credits    — Monthly credits allotment (e.g. 4000 Pro)
+    * refresh_credits        — Daily refresh remaining
+    * max_refresh_credits    — Daily refresh cap (e.g. 300)
+    * next_refresh_time      — epoch when daily pool refills (string or int)
+    * refresh_interval       — "daily" | "weekly"
+
+    Manus UI "Credits" total is free + monthly remaining (not including the
+    daily refresh pool). We surface that as ``spendable``.
     """
     now = int(time.time()) if now is None else int(now)
     data = payload.get("data") if isinstance(payload, dict) else None
@@ -1007,11 +1076,26 @@ def manus_credit_windows(payload, now=None):
 
     def _int(name):
         value = data.get(name)
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if isinstance(value, bool):
             return None
-        if not math.isfinite(value):
-            return None
-        return int(value)
+        if isinstance(value, (int, float)):
+            if not math.isfinite(value):
+                return None
+            return int(value)
+        # Manus returns next_refresh_time (and occasionally other fields)
+        # as a decimal string — coerce carefully.
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                number = float(text) if ("." in text or "e" in text.lower()) else int(text)
+            except ValueError:
+                return None
+            if not math.isfinite(number):
+                return None
+            return int(number)
+        return None
 
     total = _int("total_credits")
     periodic = _int("periodic_credits")
@@ -1021,7 +1105,15 @@ def manus_credit_windows(payload, now=None):
     refresh = _int("refresh_credits")
     max_refresh = _int("max_refresh_credits")
     next_refresh = _int("next_refresh_time")
-    interval = data.get("refresh_interval") or ""
+    interval = (data.get("refresh_interval") or "").strip().lower()
+
+    # Manus UI "Credits" = free + monthly remaining (excludes daily refresh).
+    spendable = None
+    parts = [n for n in (free, periodic) if n is not None]
+    if parts:
+        spendable = max(0, sum(max(0, n) for n in parts))
+        if addon is not None and addon > 0:
+            spendable += addon
 
     windows = {}
     if pro_monthly is not None and pro_monthly > 0 and periodic is not None:
@@ -1029,13 +1121,14 @@ def manus_credit_windows(payload, now=None):
         percent = round(min(100.0, (used / pro_monthly) * 100.0), 1)
         windows["month"] = {
             "used_percent": percent,
-            "resets_at": None,
-            "window_minutes": 43200,  # nominal month; provider doesn't expose
+            "resets_at": None,  # API does not expose monthly renewal epoch
+            "window_minutes": 43200,  # nominal month
             "observed_at": now,
             "freshness": "fresh",
             "used_units": used,
             "limit_units": float(pro_monthly),
             "remaining_units": float(max(0, periodic)),
+            "label": "Monthly credits",
         }
     elif total is not None:
         # No VIP monthly quota: treat empty wallet as limited, else show room.
@@ -1048,6 +1141,7 @@ def manus_credit_windows(payload, now=None):
             "used_units": 0.0 if total > 0 else 1.0,
             "limit_units": float(total) if total > 0 else 1.0,
             "remaining_units": float(max(0, total)),
+            "label": "Credits",
         }
     else:
         raise IdentityBindingError("manus_capacity_unrecognized")
@@ -1067,10 +1161,13 @@ def manus_credit_windows(payload, now=None):
             "used_units": used,
             "limit_units": float(max_refresh),
             "remaining_units": float(max(0, refresh)),
+            "label": ("Daily refresh" if interval == "daily"
+                      else "Weekly refresh"),
         }
 
     credits = {
         "total": total,
+        "spendable": spendable,  # free + monthly remaining (= Manus UI Credits)
         "periodic": periodic,
         "pro_monthly": pro_monthly,
         "free": free,
@@ -1086,6 +1183,57 @@ def manus_credit_windows(payload, now=None):
     elif pro_monthly and pro_monthly > 0:
         plan = "Manus"
     return windows, credits, plan
+
+
+def manus_total_available(credits):
+    """Free + monthly remaining (= Manus UI Credits / total available)."""
+    if not isinstance(credits, dict):
+        return None
+    if credits.get("spendable") is not None:
+        try:
+            return float(credits["spendable"])
+        except (TypeError, ValueError):
+            pass
+    free = credits.get("free")
+    periodic = credits.get("periodic")
+    if free is None and periodic is None:
+        return None
+    total = 0.0
+    if free is not None:
+        total += max(0.0, float(free))
+    if periodic is not None:
+        total += max(0.0, float(periodic))
+    return total
+
+
+def manus_tank_full(credits, renew_amount=None):
+    """Full tank = operator renew_amount if set, else pro_monthly allotment."""
+    if renew_amount is not None:
+        try:
+            value = float(renew_amount)
+            if math.isfinite(value) and value > 0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    if not isinstance(credits, dict):
+        return None
+    pro = credits.get("pro_monthly")
+    if pro is None:
+        return None
+    try:
+        value = float(pro)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
+
+
+def manus_tank_fill_percent(credits, renew_amount=None):
+    """Total available / full tank * 100. May exceed 100 (past F)."""
+    avail = manus_total_available(credits)
+    full = manus_tank_full(credits, renew_amount=renew_amount)
+    if avail is None or full is None or full <= 0:
+        return None
+    return max(0.0, (avail / full) * 100.0)
 
 
 def manus_limits(home, expected_email=None, opener=None):
@@ -1130,6 +1278,112 @@ def manus_limits(home, expected_email=None, opener=None):
     if expected_email and identity["email"].startswith("manus:"):
         identity["email"] = expected_email
     return identity, windows, credits, now
+
+
+# ------------------------------------------------------------------ nvidia
+
+def nvidia_auth(home):
+    auth = paths.load_json(os.path.join(home, "auth.json"))
+    return auth if isinstance(auth, dict) else None
+
+
+def nvidia_api_key(home):
+    """Key from slot auth.json, else shared insights/env key when linked."""
+    auth = nvidia_auth(home) or {}
+    key = auth.get("api_key") or auth.get("apiKey") or auth.get("key")
+    if isinstance(key, str) and key.strip():
+        return key.strip()
+    # Shared insights key (Manage accounts → NVIDIA / Insights)
+    if auth.get("use_insights_key") is not False:
+        # default True when no dedicated key: use shared insights/env key
+        try:
+            from . import insights as insights_mod
+            shared, _source = insights_mod.get_api_key()
+            if shared:
+                return shared
+        except Exception:  # noqa: BLE001
+            pass
+    for name in ("NVIDIA_API_KEY", "NVDIA_API_KEY", "NGC_API_KEY"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return None
+
+
+def nvidia_local_identity(home):
+    auth = nvidia_auth(home) or {}
+    key = nvidia_api_key(home)
+    if not key:
+        raise IdentityBindingError("nvidia_auth_missing")
+    email = auth.get("email")
+    return {
+        "verified": False,
+        "email": email or ("nvidia:" + fingerprint(key)[:8]),
+        "account_fingerprint": fingerprint(key),
+        "method": "nvidia_local_api_key",
+        "plan_type": auth.get("plan") or "NVIDIA Free",
+    }
+
+
+def nvidia_limits(home, expected_email=None, caps=None):
+    from . import nvidia_track
+    identity_local = nvidia_local_identity(home)
+    key = nvidia_api_key(home)
+    if not key:
+        raise IdentityBindingError("nvidia_auth_missing")
+    if expected_email and identity_local.get("email") \
+            and not str(identity_local["email"]).startswith("nvidia:") \
+            and identity_local["email"].lower() != expected_email.lower():
+        raise IdentityBindingError("slot_bound_to_unexpected_email")
+
+    try:
+        live = nvidia_track.fetch_identity(key)
+        identity = {
+            "verified": True,
+            "email": live.get("email") or identity_local["email"],
+            "account_fingerprint": fingerprint(
+                live.get("account_id") or live.get("email") or key),
+            "method": live.get("method") or "ngc_users_me",
+            "plan_type": live.get("plan_type") or "NVIDIA Free",
+            "username": live.get("username"),
+            "org": live.get("org"),
+            "credential_digest": credential_digest("nvidia", home),
+        }
+        if expected_email and identity["email"] \
+                and not str(identity["email"]).startswith("nvidia:") \
+                and identity["email"].lower() != expected_email.lower():
+            raise IdentityBindingError("slot_bound_to_unexpected_email")
+    except ValueError as error:
+        code = str(error)
+        if code in ("nvidia_usage_token_rejected", "nvidia_auth_missing",
+                    "nvidia_identity_email_missing",
+                    "nvidia_identity_unrecognized"):
+            raise IdentityBindingError(code) from error
+        # network blip: fall back to local identity + still report ledger
+        identity = dict(identity_local)
+        identity["credential_digest"] = credential_digest("nvidia", home)
+
+    # Soft caps: secrets insights.nvidia_caps or auth.json caps
+    auth = nvidia_auth(home) or {}
+    if caps is None:
+        caps = auth.get("caps")
+        if caps is None:
+            try:
+                from . import insights as insights_mod
+                secrets = insights_mod.load_secrets()
+                caps = (secrets.get("insights") or {}).get("nvidia_caps")
+            except Exception:  # noqa: BLE001
+                caps = None
+
+    now = int(time.time())
+    totals = nvidia_track.rolling_totals(now=now)
+    windows = nvidia_track.windows_from_totals(totals, caps=caps, now=now)
+    usage = {
+        "totals": totals,
+        "caps": nvidia_track.resolve_caps(caps),
+        "ledger": "state/nvidia-usage.jsonl",
+    }
+    return identity, windows, usage, now
 
 
 # ------------------------------------------------------------------ limits
@@ -1541,6 +1795,26 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                 result["credits"] = credits
                 validate_required_windows(result["windows"], required=("month",))
                 result["ok"] = True
+            elif account["provider"] == "nvidia":
+                expected = account.get("expected_email")
+                identity, windows, usage, captured = nvidia_limits(
+                    account["home"], expected_email=expected)
+                result["identity"] = identity
+                result["identity_verified"] = identity.get("verified", False)
+                result["identity_method"] = identity.get("method")
+                result["email"] = identity.get("email")
+                result["plan"] = identity.get("plan_type") or "NVIDIA Free"
+                result["subscription"] = {
+                    "status": "active" if identity.get("verified") else "local",
+                    "source": "nvidia_local_ledger",
+                }
+                result["source"] = "nvidia_local_ledger"
+                result["stale"] = False
+                result["captured_at"] = captured
+                result["windows"] = windows
+                result["credits"] = usage  # request/token ledger summary
+                validate_required_windows(result["windows"])
+                result["ok"] = True
             else:
                 expected = account.get("expected_email")
                 codex_retry_at = active_backoff(backoff, "codex_app_server", now)
@@ -1691,6 +1965,12 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
                     "manus.im app → settings → integrations → API, then "
                     f"`headroom connect {account['name']} --provider manus` "
                     "or put it in the slot's auth.json / MANUS_API_KEY.")
+            elif error.code in ("nvidia_auth_missing",
+                                "nvidia_usage_token_rejected"):
+                result["note"] = (
+                    "NVIDIA API key missing or rejected — add a free key at "
+                    "build.nvidia.com (Manage accounts → Insights API key), "
+                    "or connect an nvidia slot with the same key.")
             elif error.code == "claude_credentials_missing":
                 # verified identity but the token couldn't be read. On macOS the
                 # token is in the login Keychain (headroom reads it via
@@ -1714,9 +1994,21 @@ def collect(accounts, backoff=None, persist_backoff=None, previous=None):
             result["error"] = type(error).__name__ + ": " + str(error)[:120]
             result["note"] = "collector error; see private snapshot for detail"
         # Operator-declared monthly cost (config), with plan-catalog fallback.
+        # annual_cost_usd is always monthly × 12 when monthly is known.
         cost = costs.resolve_monthly_cost(account, result.get("plan"))
         if cost is not None:
             result["monthly_cost_usd"] = cost
+            result["annual_cost_usd"] = costs.annual_cost(cost)
+        # Operator renewal pin (when the allotment renews + amount it renews to)
+        renews_on = account.get("renews_on")
+        if isinstance(renews_on, str) and renews_on.strip():
+            result["renews_on"] = renews_on.strip()[:10]
+        renew_amount = account.get("renew_amount")
+        if isinstance(renew_amount, (int, float)) and not isinstance(renew_amount, bool) \
+                and math.isfinite(renew_amount) and renew_amount >= 0:
+            result["renew_amount"] = (
+                int(renew_amount) if renew_amount == int(renew_amount)
+                else float(renew_amount))
         snapshot["accounts"].append(result)
     snapshot["integrity_warnings"] = apply_integrity(snapshot["accounts"])
     completed = int(time.time())
@@ -1737,6 +2029,15 @@ def redact_email(address):
 
 
 def public_snapshot(snapshot, redact_emails=False):
+    # Enrich windows (have/used/left/countdown) + update waste ledger
+    try:
+        from . import usage_ledger
+        enriched_rows, fleet_usage = usage_ledger.update_from_snapshot(snapshot)
+        enriched_by_name = {row["name"]: row for row in enriched_rows}
+    except Exception:  # noqa: BLE001 — usage enrichment must never block publish
+        enriched_by_name = {}
+        fleet_usage = None
+
     accounts = []
     for account in snapshot["accounts"]:
         public = {k: v for k, v in account.items() if k in PUBLIC_FIELDS}
@@ -1745,8 +2046,14 @@ def public_snapshot(snapshot, redact_emails=False):
             public["note"] = "collector error; see private snapshot"
         if redact_emails:
             public["email"] = redact_email(public.get("email"))
+        extra = enriched_by_name.get(account.get("name"))
+        if extra:
+            if extra.get("windows"):
+                public["windows"] = extra["windows"]
+            if extra.get("usage"):
+                public["usage"] = extra["usage"]
         accounts.append(public)
-    return {
+    out = {
         "schema_version": snapshot["schema_version"],
         "run_id": snapshot["run_id"],
         "generated": snapshot["generated"],
@@ -1754,6 +2061,19 @@ def public_snapshot(snapshot, redact_emails=False):
         "integrity_warnings": snapshot.get("integrity_warnings", []),
         "accounts": accounts,
     }
+    if fleet_usage:
+        out["fleet_usage"] = {
+            "tracking_started": fleet_usage.get("tracking_started"),
+            "tracking_started_iso": fleet_usage.get("tracking_started_iso"),
+            "tracking_age_seconds": fleet_usage.get("tracking_age_seconds"),
+            "lifetime_wasted_percent_points": fleet_usage.get(
+                "fleet_lifetime_wasted_percent_points"),
+            "lifetime_wasted_units": fleet_usage.get(
+                "fleet_lifetime_wasted_units"),
+            "lifetime_used_units": fleet_usage.get("fleet_lifetime_used_units"),
+            "reset_events": fleet_usage.get("fleet_reset_events"),
+        }
+    return out
 
 
 @contextlib.contextmanager
@@ -1820,11 +2140,26 @@ def run_collect(quiet=False):
         # redaction change made mid-collect governs the published projection,
         # and default to redacted if unset
         settings = registry.dashboard_settings()
+        public = public_snapshot(snapshot, settings.get("redact_emails", True))
         paths.write_json_atomic(
             paths.public_snapshot_path(),
-            public_snapshot(snapshot, settings.get("redact_emails", True)),
+            public,
             mode=0o644,
         )
+        # Local history for dashboard charts (never blocks collect on failure).
+        # Record from the private snapshot so multi-account shade identity uses
+        # full emails; the /api/history endpoint redacts labels for the UI.
+        try:
+            from . import history as history_mod
+            history_mod.record_snapshot(snapshot)
+        except Exception:  # noqa: BLE001
+            pass
+        # Use-it-or-lose-it alerts (email / notify cmd) — best-effort
+        try:
+            from . import burn as burn_mod
+            burn_mod.check_and_notify(force=False)
+        except Exception:  # noqa: BLE001
+            pass
         if not quiet:
             print_snapshot(snapshot)
         return snapshot

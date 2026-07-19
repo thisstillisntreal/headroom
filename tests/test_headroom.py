@@ -919,7 +919,8 @@ class HandoffSafety(unittest.TestCase):
                                          "/missing", ts=200)])
         source = handoff.resolve_source(self.SID, self.accounts, self.cwd)
         self.assertEqual(source.session_id, self.SID)
-        self.assertEqual(source.transcript_path, self.transcript)
+        self.assertEqual(os.path.realpath(source.transcript_path),
+                         os.path.realpath(self.transcript))
 
     def test_journal_current_cwd_resolves_source(self):
         self._journal([self._journal_row(self.SID, self.transcript)])
@@ -955,7 +956,8 @@ class HandoffSafety(unittest.TestCase):
         old = time.time() - 20
         os.utime(transcript, (old, old))
         source = handoff.resolve_source(accounts=self.accounts, cwd=cwd)
-        self.assertEqual(source.transcript_path, transcript)
+        self.assertEqual(os.path.realpath(source.transcript_path),
+                         os.path.realpath(transcript))
 
     def test_fresh_mtime_refuses_still_running_source(self):
         os.utime(self.transcript, None)
@@ -1036,7 +1038,8 @@ class HandoffSafety(unittest.TestCase):
 
         source = handoff.resolve_source(self.SID, self.accounts, self.cwd)
 
-        self.assertEqual(source.transcript_path, self.transcript)
+        self.assertEqual(os.path.realpath(source.transcript_path),
+                         os.path.realpath(self.transcript))
         self.assertEqual(source.account["name"], "source")
         with self.assertRaisesRegex(handoff.HandoffError, "already handed off"):
             handoff.guard_not_duplicate(self.SID, digest)
@@ -2156,7 +2159,8 @@ class AuthRefreshCommand(unittest.TestCase):
 
     def test_refresh_relogs_owned_slot_without_changing_registry_or_pins(self):
         def login(_argv, env):
-            self.assertEqual(env["CLAUDE_CONFIG_DIR"], self.home)
+            self.assertEqual(os.path.realpath(env["CLAUDE_CONFIG_DIR"]),
+                             os.path.realpath(self.home))
             self.assertNotIn("ANTHROPIC_API_KEY", env)
             with open(self.credentials, "w") as handle:
                 json.dump({"claudeAiOauth": {"accessToken": "new"}}, handle)

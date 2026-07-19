@@ -540,6 +540,8 @@ def block_reason(account, fam, snapshot_row, cool, now, reserve=None):
     provider = account.get("provider")
     if provider in ("grok", "manus"):
         required_windows = ("month",)
+    elif provider == "nvidia":
+        required_windows = ("5h", "7d", "month")
     else:
         required_windows = ("5h", "7d")
     codex = provider == "codex"
@@ -660,6 +662,8 @@ def _headroom_score(row):
     provider = row.get("provider")
     if provider in ("grok", "manus"):
         keys = ("month",)
+    elif provider == "nvidia":
+        keys = ("5h", "7d", "month")
     else:
         keys = ("5h", "7d")
     codex = provider == "codex"
@@ -723,6 +727,7 @@ def env_key(account):
         "codex": "CODEX_HOME",
         "grok": "GROK_HOME",
         "manus": "MANUS_HOME",
+        "nvidia": "NVIDIA_HOME",
     }.get(account["provider"], "CLAUDE_CONFIG_DIR")
 
 

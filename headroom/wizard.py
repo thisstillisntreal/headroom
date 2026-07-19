@@ -131,7 +131,7 @@ def run_setup():
     print("\nRotation preference: accounts are tried in the order listed.")
     for index, account in enumerate(config["accounts"], 1):
         cost = account.get("monthly_cost_usd")
-        cost_s = costs.format_usd(cost) or "cost unset"
+        cost_s = costs.format_monthly_with_annual(cost) or "cost unset"
         print(f"  {index}. {account['name']} ({account['provider']}, "
               f"{account.get('expected_email', 'unknown')}, {cost_s})")
     order = ask("Reorder? (e.g. `2,1,3`, empty keeps this order)", "")

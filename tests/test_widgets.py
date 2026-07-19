@@ -354,9 +354,9 @@ class CodexLiftedFiveHourDashboardJS(unittest.TestCase):
 
     @staticmethod
     def _harness():
-        with open(dashboard.TEMPLATE) as handle:
-            html = handle.read()
-        section = html.split(
+        # JS lives in static/js/app.js after shell decomposition
+        js = dashboard.dashboard_js_source()
+        section = js.split(
             "/* ------------------------------------------------------------- helpers */",
             1)[1].split(
             "/* --------------------------------------------------------------- theme */",
@@ -641,8 +641,15 @@ class DashboardHttpTests(unittest.TestCase):
 
     @staticmethod
     def template_text():
+        # Composite of shell + inlined static assets (self-contained for tests)
         with open(dashboard.TEMPLATE) as handle:
-            return handle.read()
+            shell = handle.read()
+        shell = re.sub(r'<link rel="stylesheet"[^>]*>\s*', "", shell)
+        shell = re.sub(
+            r'<script src="static/js/app\.js"[^>]*>\s*</script>\s*', "", shell)
+        return (shell + "\n<style>\n" + dashboard.dashboard_css_source()
+                + "\n</style>\n<script>\n" + dashboard.dashboard_js_source()
+                + "\n</script>\n")
 
     def test_endpoint_and_cli_use_byte_identical_renderer(self):
         snapshot = usage_snapshot(usage_account())
@@ -685,10 +692,13 @@ class DashboardHttpTests(unittest.TestCase):
             normal = memory_get(*server, "/")
             compact = memory_get(*server, "/?compact=1")
         self.assertEqual(normal[2], compact[2])
-        self.assertIn(b'params.get("compact")==="1"', compact[2])
+        # Compact mode is implemented in the extracted app JS, not the thin shell
+        self.assertIn('params.get("compact")==="1"', dashboard.dashboard_js_source())
         templates = [name for name in os.listdir(os.path.dirname(dashboard.TEMPLATE))
                      if name.endswith(".html")]
         self.assertEqual(templates, ["template.html"])
+        static_js = os.path.join(os.path.dirname(dashboard.TEMPLATE), "static", "js", "app.js")
+        self.assertTrue(os.path.isfile(static_js), "dashboard JS partial must exist")
 
     def test_demo_widget_routes_never_collect(self):
         with mock.patch.object(widget.time, "time", return_value=NOW), \
@@ -708,14 +718,12 @@ class DashboardHttpTests(unittest.TestCase):
         for _, headers, _ in responses:
             self.assertEqual(headers.get("cache-control"), "no-store")
             self.assertEqual(headers.get("x-content-type-options"), "nosniff")
-            # containment even inside an embedding webview: same-origin
-            # fetches + inline style/script only — no frames, objects,
-            # forms, popup targets, or external subresources. Pinned as the
-            # EXACT policy so no directive can silently loosen or vanish.
+            # Same-origin static CSS/JS + inline CONFIG bootstrap; no frames,
+            # objects, forms, or external hosts. Pinned as the EXACT policy.
             self.assertEqual(
                 headers.get("content-security-policy"),
-                "default-src 'none'; script-src 'unsafe-inline'; "
-                "style-src 'unsafe-inline'; img-src 'self' data:; "
+                "default-src 'none'; script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
                 "connect-src 'self'; frame-src 'none'; object-src 'none'; "
                 "form-action 'none'; base-uri 'none'")
 
@@ -779,8 +787,7 @@ class DashboardHttpTests(unittest.TestCase):
         self.assertEqual(forced["accounts"][0]["state"], "stale")
         self.assertEqual(forced["accounts"][0]["windows"]["5h"]["tone"],
                          "unknown")
-        script = self.template_text().split("<script>", 1)[1].split(
-            "</script>", 1)[0]
+        script = dashboard.dashboard_js_source()
         render_body = script.split("function render(data,forceNoncurrent){",
                                    1)[1].split("\n}", 1)[0]
         fallback = script.split("async function load(manual){", 1)[1].split(
@@ -827,7 +834,10 @@ class DashboardHttpTests(unittest.TestCase):
                 html = handle.read()
             with open(os.path.join(output, "usage.json")) as handle:
                 payload = json.load(handle)
-        match = re.search(r"const CONFIG = (\{.*?\});", html)
+        match = re.search(
+            r"window\.__HEADROOM_CONFIG__\s*=\s*(\{.*?\});", html)
+        if match is None:
+            match = re.search(r"const CONFIG = (\{.*?\});", html)
         self.assertIsNotNone(match)
         injected = json.loads(match.group(1))
         self.assertEqual(injected["snapshot_max_age"],
@@ -836,6 +846,66 @@ class DashboardHttpTests(unittest.TestCase):
                          widget.OBSERVATION_MAX_AGE)
         self.assertEqual(payload["_headroom_display"]["accounts"][0][
             "windows"]["5h"]["tone"], "green")
+
+    def test_serve_path_csp_allows_same_origin_static_partials(self):
+        """Shipped build + Handler: index references static/* and CSP allows 'self'.
+
+        Regression: after shell decomposition, CSP with only 'unsafe-inline'
+        blocked static/js/app.js and static/css/dashboard.css under headroom serve.
+        """
+        config = {"schema_version": 1,
+                  "dashboard": {"theme": "midnight", "title": "csp-test"},
+                  "accounts": []}
+        with tempfile.TemporaryDirectory() as directory:
+            output = os.path.join(directory, "public")
+            os.makedirs(output)
+            source = os.path.join(output, "usage.json")
+            with open(source, "w") as handle:
+                json.dump(usage_snapshot(usage_account()), handle)
+            with redirect_stdout(io.StringIO()), \
+                    mock.patch.object(widget.time, "time", return_value=NOW):
+                dashboard.build(config, output, source)
+
+            # Real built artifacts on disk (not a re-inlined test composite)
+            index_path = os.path.join(output, "index.html")
+            js_path = os.path.join(output, "static", "js", "app.js")
+            css_path = os.path.join(output, "static", "css", "dashboard.css")
+            self.assertTrue(os.path.isfile(index_path))
+            self.assertTrue(os.path.isfile(js_path))
+            self.assertTrue(os.path.isfile(css_path))
+            self.assertGreater(os.path.getsize(js_path), 1000)
+            self.assertGreater(os.path.getsize(css_path), 100)
+            with open(index_path) as handle:
+                html = handle.read()
+            self.assertIn('href="static/css/dashboard.css"', html)
+            self.assertIn('src="static/js/app.js"', html)
+
+            class BuiltHandler(dashboard.Handler):
+                demo = True
+
+            # CSP on index must allow same-origin script/style
+            status, headers, body = memory_get(
+                BuiltHandler, output, "/")
+            self.assertEqual(status, 200)
+            csp = headers.get("content-security-policy") or ""
+            self.assertIn("script-src 'self'", csp)
+            self.assertIn("style-src 'self'", csp)
+            # Still no remote script hosts
+            self.assertNotIn("https:", csp.split("script-src", 1)[1].split(";", 1)[0]
+                             if "script-src" in csp else "")
+
+            # Static partials actually serve (real Handler path)
+            js_status, js_headers, js_body = memory_get(
+                BuiltHandler, output, "/static/js/app.js")
+            self.assertEqual(js_status, 200)
+            self.assertGreater(len(js_body), 1000)
+            self.assertIn(b"function render(", js_body)
+
+            css_status, _, css_body = memory_get(
+                BuiltHandler, output, "/static/css/dashboard.css")
+            self.assertEqual(css_status, 200)
+            self.assertGreater(len(css_body), 100)
+            self.assertIn(b".shell", css_body)
 
     def test_widget_href_uses_actual_server_address_port(self):
         port = 49152
@@ -887,21 +957,29 @@ class LiquidGlassWidgetTests(unittest.TestCase):
 
     @staticmethod
     def template_text():
+        # Composite shell + inlined CSS/JS (self-contained assertions)
         with open(dashboard.TEMPLATE) as handle:
-            return handle.read()
+            shell = handle.read()
+        shell = re.sub(r'<link rel="stylesheet"[^>]*>\s*', "", shell)
+        shell = re.sub(
+            r'<script src="static/js/app\.js"[^>]*>\s*</script>\s*', "", shell)
+        return (shell + "\n<style>\n" + dashboard.dashboard_css_source()
+                + "\n</style>\n<script>\n" + dashboard.dashboard_js_source()
+                + "\n</script>\n")
 
     @classmethod
     def widget_css(cls):
-        return cls.template_text().split(
+        css = dashboard.dashboard_css_source()
+        return css.split(
             "/* ==================================================== widget: liquid glass",
-            1)[1].split("</style>", 1)[0]
+            1)[1]
 
     @classmethod
     def widget_script(cls):
-        return cls.template_text().split(
+        return dashboard.dashboard_js_source().split(
             "/* =================================================== liquid-glass widget */",
             1)[1].split(
-            "/* --------------------------------------------------------------- theme */",
+            "/* =================================================== end liquid-glass widget */",
             1)[0]
 
     @classmethod
@@ -1096,9 +1174,17 @@ class LiquidGlassWidgetTests(unittest.TestCase):
         self.assertNotIn("<link", template)
         self.assertNotIn("@import", template)
         self.assertNotIn("url(http", template)
-        allowed = "https://github.com/domanski-ai/headroom"
+        # Widget surface must not phone home. Placeholder/config URLs in the
+        # manage/insights forms (e.g. NVIDIA base URL default) are allowed only
+        # as static form defaults, not as loaded script hosts.
+        allowed_prefix = (
+            "https://github.com/domanski-ai/headroom",
+            "https://integrate.api.nvidia.com/",  # insights form default only
+        )
         for url in re.findall(r"https?://[^\s\"'<>)]+", template):
-            self.assertEqual(url, allowed)
+            self.assertTrue(
+                any(url == p or url.startswith(p) for p in allowed_prefix),
+                msg="unexpected external URL in dashboard surface: " + url)
 
     # --------------------------------- the three design scenarios, real data
     def test_cruising_scenario_projects_live_meters(self):
@@ -1180,24 +1266,26 @@ class UbersichtWidgetTests(unittest.TestCase):
 
     @classmethod
     def sources(cls):
+        # template path still keys as "template" but JS is loaded from app.js
         return {"template": dashboard.TEMPLATE, "small": cls.SMALL,
                 "medium": cls.MEDIUM, "preview": cls.PREVIEW}
 
     @classmethod
     def guard_js(cls, path):
         """Extract the executable state-mapping JS from one of the copies."""
-        text = cls.read(path)
-        if path.endswith("template.html"):
+        if path.endswith("template.html") or path.endswith("app.js"):
+            text = dashboard.dashboard_js_source()
             code = text.split(
                 "/* =================================================== liquid-glass widget */",
                 1)[1].split(
-                "/* --------------------------------------------------------------- theme */",
+                "/* =================================================== end liquid-glass widget */",
                 1)[0]
             return ('const SNAPSHOT_MAX_AGE=900;\n'
                     'function clamp(v,lo,hi){return Math.min(hi,Math.max(lo,v));}\n'
                     'function esc(v){return String(v==null?"":v);}\n'
                     'function untilReset(v){return "resets soon";}\n'
                     'function age(v){return "just now";}\n') + code
+        text = cls.read(path)
         if path.endswith("preview.html"):
             return text.split('"use strict";', 1)[1].split(
                 "document.querySelectorAll", 1)[0]

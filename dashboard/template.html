@@ -5,494 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex,nofollow">
 <title>headroom</title>
-<style>
-/* ================================================================== base */
-:root {
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --radius: 0px;
-  --cell-gap: 3px;
-  --cell-radius: 1px;
-  --panel-shadow: none;
-  --cell-glow: none;
-  --meter-height: 14px;
-}
-
-/* ============================================================== themes */
-/* MIDNIGHT — dark control room */
-[data-theme="midnight"] {
-  --bg: #0b0e14; --bg-grid: rgba(255,255,255,.025);
-  --panel: #11151f; --panel-2: #0e1219;
-  --line: #1e2430; --line-strong: #2a3242;
-  --ink: #e8ecf4; --ink-2: #8b93a5; --ink-3: #5a6274;
-  --accent: #7aa2ff;
-  --green: #3ddc84; --yellow: #ffd54a; --orange: #ff9640; --red: #ff5d5d;
-  --unknown: #454c5c;
-  --cell-bg: #1a1f2b;
-  --cell-glow: 0 0 6px;
-  --panel-shadow: 0 1px 0 rgba(255,255,255,.03) inset;
-  --radius: 6px;
-}
-/* MINIMAL — white space and hairlines */
-[data-theme="minimal"] {
-  --bg: #ffffff; --bg-grid: transparent;
-  --panel: #ffffff; --panel-2: #fafafa;
-  --line: #ececec; --line-strong: #d8d8d8;
-  --ink: #111111; --ink-2: #6f6f6f; --ink-3: #a3a3a3;
-  --accent: #111111;
-  --green: #1db954; --yellow: #e6b800; --orange: #f07c22; --red: #e5484d;
-  --unknown: #d0d0d0;
-  --cell-bg: #f2f2f2;
-  --meter-height: 8px;
-  --cell-gap: 2px;
-  --radius: 0px;
-}
-/* CHROME — brushed metal instrument panel */
-[data-theme="chrome"] {
-  --bg: #c9cdd3;
-  --bg-grid: transparent;
-  --panel: linear-gradient(180deg, #f4f6f8 0%, #dfe3e8 55%, #d2d7dd 100%);
-  --panel-2: linear-gradient(180deg, #e8ebef, #d8dce2);
-  --line: #aeb4bc; --line-strong: #8f96a0;
-  --ink: #23262b; --ink-2: #565c66; --ink-3: #7d838d;
-  --accent: #2f6fed;
-  --green: #1e9e55; --yellow: #d3a10a; --orange: #e2711d; --red: #cf3f3f;
-  --unknown: #a6acb5;
-  --cell-bg: linear-gradient(180deg, #b9bec6, #cdd2d9);
-  --panel-shadow: 0 1px 0 #ffffff inset, 0 -1px 0 rgba(0,0,0,.08) inset,
-                  0 2px 6px rgba(30,35,42,.18);
-  --radius: 8px;
-  --cell-radius: 2px;
-}
-/* PAPER — warm parchment ledger */
-[data-theme="paper"] {
-  --bg: #f5efe6; --bg-grid: rgba(21,18,16,.035);
-  --panel: #fbf6eb; --panel-2: #f3ecdd;
-  --line: #c5ac85; --line-strong: #a98f68;
-  --ink: #151210; --ink-2: #3a2f25; --ink-3: #6e5e4d;
-  --accent: #c87555;
-  --green: #3f7d4e; --yellow: #c59b24; --orange: #c76a31; --red: #b0413a;
-  --unknown: #8b8277;
-  --cell-bg: #e6d2ba;
-  --radius: 0px;
-}
-/* TERMINAL — green phosphor CRT */
-[data-theme="terminal"] {
-  --bg: #050805; --bg-grid: rgba(51,255,102,.04);
-  --panel: #070b07; --panel-2: #060906;
-  --line: #123c1c; --line-strong: #1d5a2b;
-  --ink: #33ff66; --ink-2: #1fae47; --ink-3: #157a32;
-  --accent: #33ff66;
-  --green: #33ff66; --yellow: #e8ff47; --orange: #ffb347; --red: #ff4747;
-  --unknown: #123c1c;
-  --cell-bg: #0a140c;
-  --cell-glow: 0 0 8px;
-  --sans: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  --radius: 0px;
-}
-[data-theme="terminal"] body { text-shadow: 0 0 4px rgba(51,255,102,.35); }
-[data-theme="terminal"] .panel { box-shadow: 0 0 12px rgba(51,255,102,.06) inset; }
-
-/* ================================================================ layout */
-* { box-sizing: border-box; }
-html { background: var(--bg); }
-body {
-  margin: 0; min-width: 320px; color: var(--ink);
-  font-family: var(--sans); line-height: 1.45;
-  -webkit-font-smoothing: antialiased;
-}
-body::before {
-  content: ""; position: fixed; inset: 0; pointer-events: none;
-  background-image:
-    linear-gradient(var(--bg-grid) 1px, transparent 1px),
-    linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px);
-  background-size: 32px 32px;
-}
-.shell { position: relative; z-index: 1; width: min(100% - 36px, 1280px);
-         margin: 0 auto; padding: 22px 0 56px; }
-
-.toolbar { display: flex; flex-wrap: wrap; gap: 14px 24px; align-items: center;
-           padding-bottom: 16px; border-bottom: 1px solid var(--line-strong); }
-.toolbar .brand { flex: 1 1 auto; min-width: 200px; }
-.title { margin: 0; font: 700 17px/1.2 var(--mono); letter-spacing: -.02em; }
-.subtitle { margin: 4px 0 0; color: var(--ink-3); font: 500 11px/1.3 var(--mono); }
-.snapshot { color: var(--ink-2); font: 500 11px/1.5 var(--mono); text-align: right; }
-.controls { display: flex; gap: 8px; align-items: center; }
-select.theme-picker, button.refresh {
-  appearance: none; padding: 8px 12px; border: 1px solid var(--line-strong);
-  border-radius: var(--radius); background: var(--panel); color: var(--ink);
-  font: 600 11px var(--mono); cursor: pointer; box-shadow: var(--panel-shadow);
-}
-button.refresh:disabled { opacity: .55; cursor: wait; }
-
-.summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;
-           margin-top: 16px; }
-.summary-item { display: flex; flex-direction: column; justify-content: space-between;
-                gap: 8px; min-height: 104px; padding: 12px 14px;
-                border: 1px solid var(--line); border-radius: var(--radius);
-                background: var(--panel); box-shadow: var(--panel-shadow); }
-.summary-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
-.summary-label { display: block; color: var(--ink-3); font: 700 9px/1.3 var(--mono);
-                 letter-spacing: .1em; text-transform: uppercase; }
-.summary-note { margin: 0; color: var(--ink-2); font: 400 9.5px/1.3 var(--mono);
-                white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.summary-value { font: 700 20px/1 var(--mono); }
-.viz { flex: 1 0 auto; display: flex; align-items: flex-end; }
-/* verified: one segment per account */
-.seg-row { display: grid; grid-auto-flow: column; grid-auto-columns: 1fr;
-           gap: var(--cell-gap); height: 10px; width: 100%; align-self: end; }
-.seg { border-radius: var(--cell-radius); background: var(--cell-bg); }
-.seg.is-on { background: var(--green); box-shadow: var(--cell-glow) var(--green); }
-.seg.is-off { background: var(--cell-bg); }
-/* average: a single gauge with tick marks */
-.gauge { position: relative; height: 10px; width: 100%; align-self: end;
-         border-radius: var(--cell-radius); background: var(--cell-bg); overflow: hidden; }
-.gauge-fill { position: absolute; inset: 0; width: var(--fill, 0%);
-              background: var(--tone, var(--unknown));
-              box-shadow: var(--cell-glow) var(--tone, transparent); }
-.gauge-ticks { position: absolute; inset: 0; display: grid;
-               grid-template-columns: repeat(10, 1fr); }
-.gauge-ticks span { border-right: 1px solid var(--bg); }
-.gauge-ticks span:last-child { border-right: 0; }
-/* lowest: a compact battery meter */
-.summary-item .meter { height: 10px; margin-top: 0; width: 100%; align-self: end; }
-/* fleet: one bar per account, height = session headroom */
-.fleet-bars { display: flex; align-items: flex-end; justify-content: flex-start;
-              gap: var(--cell-gap); height: 38px; width: 100%; align-self: end; }
-.fbar { flex: 1; min-width: 6px; max-width: 22px; border-radius: var(--cell-radius);
-        background: var(--tone, var(--unknown)); height: var(--h, 4%);
-        box-shadow: var(--cell-glow) var(--tone, transparent); }
-.fbar.is-unknown { background: var(--unknown); height: 100%; opacity: .55;
-                   box-shadow: none; }
-
-.provider { margin-top: 26px; }
-.provider-head { display: flex; align-items: baseline; gap: 12px; margin: 0 0 8px; }
-.provider-name { margin: 0; font: 700 13px/1.2 var(--mono); letter-spacing: .06em;
-                 text-transform: uppercase; }
-.provider-count { color: var(--ink-3); font: 500 10px var(--mono); }
-
-.account { display: grid;
-           grid-template-columns: minmax(190px, 1.1fr) repeat(var(--win-cols, 2), minmax(150px, 1fr)) minmax(120px, .7fr);
-           gap: 16px; padding: 15px 16px; margin-top: 8px;
-           border: 1px solid var(--line); border-radius: var(--radius);
-           background: var(--panel); box-shadow: var(--panel-shadow); }
-.account.is-held { opacity: .75; }
-.acct-email { display: block; font: 600 12px/1.35 var(--mono); word-break: break-all; }
-.acct-meta { margin-top: 5px; color: var(--ink-3); font: 500 9.5px/1.5 var(--mono); }
-.acct-meta span { display: inline-block; margin-right: 10px; }
-
-.win-name { color: var(--ink-2); font: 700 9px/1.3 var(--mono);
-            letter-spacing: .09em; text-transform: uppercase; }
-.win-value { float: right; font: 700 11px/1.3 var(--mono); }
-.meter { display: grid; grid-template-columns: repeat(10, 1fr); gap: var(--cell-gap);
-         height: var(--meter-height); margin-top: 7px; }
-.cell { position: relative; border-radius: var(--cell-radius); background: var(--cell-bg);
-        overflow: hidden; }
-.cell::after { content: ""; position: absolute; inset: 0; width: var(--fill, 0%);
-               background: var(--tone, var(--unknown));
-               box-shadow: var(--cell-glow) var(--tone, transparent); }
-.win-note { margin: 6px 0 0; color: var(--ink-3); font: 400 9px/1.4 var(--mono); }
-.tone-green { --tone: var(--green); } .tone-yellow { --tone: var(--yellow); }
-.tone-orange { --tone: var(--orange); } .tone-red { --tone: var(--red); }
-.tone-unknown { --tone: var(--unknown); }
-.win-value.tone-green { color: var(--green); } .win-value.tone-yellow { color: var(--yellow); }
-.win-value.tone-orange { color: var(--orange); } .win-value.tone-red { color: var(--red); }
-
-.state { text-align: right; }
-.state-badge { display: inline-flex; align-items: center; gap: 7px;
-               font: 700 9.5px/1.3 var(--mono); letter-spacing: .09em;
-               text-transform: uppercase; }
-.live-dot { position: relative; width: 7px; height: 7px; border-radius: 50%;
-            background: var(--green); }
-.live-dot::after { content: ""; position: absolute; inset: -4px;
-                   border: 1px solid var(--green); border-radius: 50%; }
-.state-note { margin: 6px 0 0; color: var(--ink-3); font: 400 9px/1.45 var(--mono); }
-.state-live { color: var(--green); }
-.state-idle { color: var(--ink-3); }        /* calm — idle is expected, not an error */
-.state-limited { color: var(--orange); }
-.state-held { color: var(--ink-3); }
-.account.is-idle, .account.is-held { opacity: .82; }
-.account.is-limited { opacity: .9; }
-.provider-mode { color: var(--ink-3); font-weight: 500; text-transform: none;
-                 letter-spacing: 0; }
-
-.statusline { margin-top: 14px; color: var(--ink-2); font: 500 10px/1.5 var(--mono); }
-.statusline.is-error { color: var(--red); }
-.empty { margin-top: 14px; padding: 36px 18px; border: 1px solid var(--line);
-         border-radius: var(--radius); background: var(--panel); text-align: center;
-         font: 600 12px/1.6 var(--mono); }
-.empty small { display: block; margin-top: 6px; color: var(--ink-3);
-               font-size: 9.5px; font-weight: 400; }
-.legend { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 22px;
-          padding-top: 14px; border-top: 1px solid var(--line);
-          color: var(--ink-3); font: 500 9px/1.4 var(--mono);
-          text-transform: uppercase; letter-spacing: .05em; }
-.legend-item { display: inline-flex; align-items: center; gap: 6px; }
-.swatch { width: 16px; height: 5px; border-radius: 2px; background: var(--tone); }
-.credit { margin-top: 26px; color: var(--ink-3); font: 500 9px var(--mono); }
-.credit a { color: var(--ink-2); }
-
-@media (prefers-reduced-motion: no-preference) {
-  .live-dot::after { animation: pulse 1.8s ease-out infinite; }
-  @keyframes pulse { from { opacity: .6; transform: scale(.6); }
-                     to { opacity: 0; transform: scale(1.6); } }
-}
-@media (max-width: 860px) {
-  .summary { grid-template-columns: 1fr 1fr; }
-  .account { grid-template-columns: 1fr 1fr; }
-  .acct-identity { grid-column: 1 / -1; }
-  .state { grid-column: 1 / -1; text-align: left; }
-}
-@media (max-width: 560px) {
-  .shell { width: min(100% - 24px, 1280px); }
-  .account { grid-template-columns: 1fr; }
-  .toolbar { align-items: flex-start; }
-  .snapshot { text-align: left; }
-}
-
-/* ==================================================== widget: liquid glass
-   The /widget surface (and ?compact=1) renders this liquid-glass popover
-   instead of the full dashboard: a pinned menu-bar-style card on macOS
-   (Chrome --app / Safari Add to Dock) and Windows (Edge install-as-app),
-   plus ?size=small / ?size=medium desktop-widget layouts for embedding.
-   Theme variable sets mirror the five dashboard themes with glass tokens. */
-.hr {
-  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-  --pop-radius: 18px; --widget-radius: 26px; --cell-gap: 3px; --cell-radius: 1px;
-  --bg: #0b0e14; --bg-grid: rgba(255,255,255,.025); --panel: #11151f; --panel-2: #0e1219;
-  --line: #1e2430; --line-strong: #2a3242; --ink: #e8ecf4; --ink-2: #8b93a5; --ink-3: #5a6274;
-  --accent: #7aa2ff; --green: #3ddc84; --yellow: #ffd54a; --orange: #ff9640; --red: #ff5d5d;
-  --unknown: #454c5c; --cell-bg: #1a1f2b; --cell-glow: 0 0 6px;
-  --glass: rgba(19,23,34,.6); --glass-2: rgba(13,16,25,.55);
-  --glass-line: rgba(255,255,255,.14); --glass-hi: 0 1px 0 rgba(255,255,255,.1) inset;
-  --sep: rgba(255,255,255,.07); --row-hov: rgba(255,255,255,.06);
-  --shadow-pop: 0 28px 70px rgba(0,0,0,.5), 0 3px 10px rgba(0,0,0,.4);
-  --wall: linear-gradient(160deg,#1a2757 0%,#0e1430 48%,#0a0d18 100%);
-  --blob-a: rgba(122,162,255,.4); --blob-b: rgba(61,220,132,.28);
-}
-.hr[data-theme="minimal"] {
-  --cell-gap: 2px; --cell-glow: none;
-  --bg: #ffffff; --bg-grid: transparent; --panel: #ffffff; --panel-2: #fafafa;
-  --line: #ececec; --line-strong: #d8d8d8; --ink: #111111; --ink-2: #6f6f6f; --ink-3: #a3a3a3;
-  --accent: #111111; --green: #1db954; --yellow: #e6b800; --orange: #f07c22; --red: #e5484d;
-  --unknown: #d0d0d0; --cell-bg: #ececec;
-  --glass: rgba(255,255,255,.55); --glass-2: rgba(250,250,250,.5);
-  --glass-line: rgba(0,0,0,.1); --glass-hi: 0 1px 0 rgba(255,255,255,.75) inset;
-  --sep: rgba(0,0,0,.07); --row-hov: rgba(0,0,0,.045);
-  --shadow-pop: 0 24px 55px rgba(20,20,25,.18), 0 2px 8px rgba(20,20,25,.1);
-  --wall: linear-gradient(165deg,#eceff2 0%,#f8f8f9 55%,#e4e6ea 100%);
-  --blob-a: rgba(29,185,84,.22); --blob-b: rgba(80,120,255,.14);
-}
-.hr[data-theme="chrome"] {
-  --cell-radius: 2px; --cell-glow: none;
-  --bg: #c9cdd3; --bg-grid: transparent;
-  --panel: linear-gradient(180deg,#f4f6f8 0%,#dfe3e8 55%,#d2d7dd 100%);
-  --panel-2: linear-gradient(180deg,#e8ebef,#d8dce2);
-  --line: #aeb4bc; --line-strong: #8f96a0; --ink: #23262b; --ink-2: #565c66; --ink-3: #7d838d;
-  --accent: #2f6fed; --green: #1e9e55; --yellow: #d3a10a; --orange: #e2711d; --red: #cf3f3f;
-  --unknown: #a6acb5; --cell-bg: #b9bec6;
-  --glass: rgba(240,243,246,.55); --glass-2: rgba(224,228,233,.5);
-  --glass-line: rgba(0,0,0,.14); --glass-hi: 0 1px 0 rgba(255,255,255,.85) inset;
-  --sep: rgba(0,0,0,.09); --row-hov: rgba(30,35,42,.06);
-  --shadow-pop: 0 26px 60px rgba(30,35,42,.32), 0 2px 8px rgba(30,35,42,.2);
-  --wall: linear-gradient(170deg,#dde1e7 0%,#c0c6ce 52%,#a9b0b9 100%);
-  --blob-a: rgba(47,111,237,.26); --blob-b: rgba(30,158,85,.2);
-}
-.hr[data-theme="paper"] {
-  --widget-radius: 22px; --cell-glow: none;
-  --bg: #f5efe6; --bg-grid: rgba(21,18,16,.035); --panel: #fbf6eb; --panel-2: #f3ecdd;
-  --line: #c5ac85; --line-strong: #a98f68; --ink: #151210; --ink-2: #3a2f25; --ink-3: #6e5e4d;
-  --accent: #c87555; --green: #3f7d4e; --yellow: #c59b24; --orange: #c76a31; --red: #b0413a;
-  --unknown: #8b8277; --cell-bg: #e6d2ba;
-  --glass: rgba(251,246,235,.6); --glass-2: rgba(243,236,221,.55);
-  --glass-line: rgba(90,70,40,.22); --glass-hi: 0 1px 0 rgba(255,255,255,.6) inset;
-  --sep: rgba(21,18,16,.1); --row-hov: rgba(21,18,16,.05);
-  --shadow-pop: 0 24px 50px rgba(61,45,28,.28), 0 2px 8px rgba(61,45,28,.16);
-  --wall: linear-gradient(165deg,#eee2cb 0%,#f6f0e4 55%,#e0d0b3 100%);
-  --blob-a: rgba(200,117,85,.3); --blob-b: rgba(63,125,78,.22);
-}
-.hr[data-theme="terminal"] {
-  --sans: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  --pop-radius: 14px; --widget-radius: 18px;
-  --bg: #050805; --bg-grid: rgba(51,255,102,.04); --panel: #070b07; --panel-2: #060906;
-  --line: #123c1c; --line-strong: #1d5a2b; --ink: #33ff66; --ink-2: #1fae47; --ink-3: #157a32;
-  --accent: #33ff66; --green: #33ff66; --yellow: #e8ff47; --orange: #ffb347; --red: #ff4747;
-  --unknown: #1d5a2b; --cell-bg: #0a140c; --cell-glow: 0 0 8px;
-  --glass: rgba(7,12,8,.62); --glass-2: rgba(5,9,6,.55);
-  --glass-line: rgba(51,255,102,.24); --glass-hi: 0 1px 0 rgba(51,255,102,.1) inset;
-  --sep: rgba(51,255,102,.12); --row-hov: rgba(51,255,102,.07);
-  --shadow-pop: 0 28px 70px rgba(0,0,0,.7), 0 0 26px rgba(51,255,102,.09);
-  --wall: radial-gradient(120% 130% at 30% 0%,#08130a 0%,#040704 60%,#020402 100%);
-  --blob-a: rgba(51,255,102,.2); --blob-b: rgba(232,255,71,.1);
-}
-.hr[data-theme="terminal"] .glowable { text-shadow: 0 0 4px rgba(51,255,102,.35); }
-
-/* widget shell: the wall the glass sits on */
-.hr { display: none; position: fixed; inset: 0; z-index: 2; overflow: auto;
-      align-items: safe center; justify-content: center; padding: 12px;
-      background: var(--wall); font-family: var(--mono); color: var(--ink); }
-body.is-widget .hr { display: flex; }
-body.is-widget .shell { display: none; }
-.hr-wall { position: fixed; inset: 0; overflow: hidden; pointer-events: none; }
-.hr-blob { position: absolute; border-radius: 50%; filter: blur(70px); }
-.hr-blob-a { top: -12%; right: 8%; width: 56%; height: 48%; background: var(--blob-a); }
-.hr-blob-b { bottom: -16%; left: 4%; width: 62%; height: 52%; background: var(--blob-b); }
-.hr-blob-c { top: 30%; left: 38%; width: 40%; height: 40%; background: var(--blob-a);
-             opacity: .55; }
-.hr-grid { position: absolute; inset: 0;
-           background-image: linear-gradient(var(--bg-grid) 1px, transparent 1px),
-                             linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px);
-           background-size: 32px 32px; }
-.hr-surface { position: relative; z-index: 1; display: flex; align-items: center;
-              justify-content: center; width: 100%; }
-
-/* liquid glass card */
-.hr-glass { background: var(--glass);
-            backdrop-filter: blur(38px) saturate(170%);
-            -webkit-backdrop-filter: blur(38px) saturate(170%);
-            border: 1px solid var(--glass-line);
-            box-shadow: var(--shadow-pop), var(--glass-hi); overflow: hidden; }
-.hr-pop { width: 352px; max-width: 100%; border-radius: var(--pop-radius); }
-
-/* popover: header + freshness dot */
-.hr-phead { display: flex; align-items: center; gap: 8px; padding: 12px 15px 9px; }
-.hr-appname { font: 700 12px var(--mono); color: var(--ink); }
-.hr-sp { flex: 1 1 auto; }
-.hr-dot { position: relative; flex: none; width: 7px; height: 7px; border-radius: 50%;
-          background: var(--dotc, var(--unknown)); }
-.hr-dot.is-live::after { content: ""; position: absolute; inset: -4px;
-                         border: 1px solid var(--dotc, var(--unknown));
-                         border-radius: 50%; }
-.hr-fresh { font: 500 9px var(--mono); color: var(--ink-3); }
-
-/* popover: headline block */
-.hr-hl { padding: 2px 15px 13px; border-bottom: 1px solid var(--sep); }
-.hr-hlrow { display: flex; align-items: baseline; gap: 10px; }
-.hr-hlval { font: 700 34px/1 var(--mono); letter-spacing: -.02em; }
-.hr-hllabel { font: 700 8.5px var(--mono); letter-spacing: .13em; color: var(--ink-3);
-              text-transform: uppercase; }
-.hr-hlbar { margin-top: 9px; position: relative; height: 10px; border-radius: 3px;
-            background: var(--cell-bg); overflow: hidden; }
-.hr-hlfill { position: absolute; top: 0; bottom: 0; left: 0; width: var(--fill, 0%);
-             background: var(--wtone, var(--unknown));
-             box-shadow: var(--cell-glow) var(--wtone, transparent); }
-.hr-hlticks { position: absolute; inset: 0; background-image:
-  repeating-linear-gradient(90deg, transparent 0, transparent calc(10% - 1px),
-    var(--glass-line) calc(10% - 1px), var(--glass-line) 10%); }
-.hr-hlsub { margin-top: 7px; font: 500 9px var(--mono); color: var(--ink-2); }
-.hr-hlrow.is-7 { margin-top: 10px; }
-.hr-hlval-7 { font: 700 19px/1 var(--mono); letter-spacing: -.02em; }
-.hr-hlbar.is-7 { height: 6px; margin-top: 6px; }
-
-/* popover: banner (limit hit / stale feed) */
-.hr-banner { padding: 8px 15px; font: 600 9px/1.5 var(--mono);
-             border-bottom: 1px solid var(--sep); background: var(--glass-2); }
-.hr-banner.is-red { color: var(--red); }
-.hr-banner.is-orange { color: var(--orange); }
-
-/* popover: account rows */
-.hr-accts { padding: 2px 0; }
-.hr-acct { padding: 8px 15px 9px; border-bottom: 1px solid var(--sep); cursor: default; }
-.hr-acct:hover { background: var(--row-hov); }
-.hr-arow { display: flex; align-items: center; gap: 7px; }
-.hr-aname { font: 700 11px var(--mono); color: var(--ink); white-space: nowrap;
-            overflow: hidden; text-overflow: ellipsis; min-width: 0; }
-.hr-pill { font: 600 7.5px var(--mono); letter-spacing: .08em; text-transform: uppercase;
-           color: var(--ink-3); border: 1px solid var(--sep); border-radius: 4px;
-           padding: 1.5px 5px; white-space: nowrap; }
-.hr-bdot { flex: none; width: 6px; height: 6px; border-radius: 50%;
-           background: var(--wtone, var(--unknown));
-           box-shadow: var(--cell-glow) var(--wtone, transparent); }
-.hr-badge { font: 700 8.5px var(--mono); letter-spacing: .09em; white-space: nowrap; }
-.hr-chev { font: 600 13px/1 var(--sans); color: var(--ink-3); margin-left: 2px; }
-.hr-wins { margin-top: 7px; display: flex; flex-direction: column; gap: 5px; }
-.hr-winrow { display: grid; grid-template-columns: minmax(24px, max-content) 1fr 46px; gap: 9px;
-             align-items: center; }
-.hr-wlabel { font: 700 8px var(--mono); letter-spacing: .1em; color: var(--ink-2); }
-.hr-cells { display: flex; gap: var(--cell-gap); }
-.hr-cells.h5 { height: 11px; }
-.hr-cells.h7 { height: 6px; }
-.hr-cell { flex: 1 1 0; position: relative; overflow: hidden;
-           border-radius: var(--cell-radius); background: var(--cell-bg); }
-.hr-cell::after { content: ""; position: absolute; top: 0; bottom: 0; left: 0;
-                  width: var(--fill, 0%); background: var(--wtone, var(--unknown));
-                  box-shadow: var(--cell-glow) var(--wtone, transparent); }
-.hr-wval { font: 700 10px var(--mono); text-align: right; }
-.hr-note { margin: 5px 0 0; font: 400 8.5px/1.4 var(--mono); color: var(--ink-3); }
-.hr-empty { padding: 18px 15px; font: 600 10px/1.6 var(--mono); color: var(--ink-3);
-            border-bottom: 1px solid var(--sep); }
-
-/* popover: footer */
-.hr-foot { padding: 5px 7px 6px; background: var(--glass-2); }
-.hr-btn { display: block; width: 100%; text-align: left; appearance: none;
-          background: none; border: 0; margin: 0; padding: 7px 9px; border-radius: 9px;
-          font: 600 11px var(--mono); color: var(--ink); cursor: pointer;
-          text-decoration: none; }
-.hr-btn:hover { background: var(--row-hov); }
-.hr-btn:disabled { opacity: .55; cursor: wait; }
-.hr-schema { display: flex; justify-content: flex-end; padding: 3px 9px 1px;
-             font: 400 7px var(--mono); color: var(--ink-3); opacity: .7; }
-
-/* fail-closed tone classes: unknown/dim carry NO live color, ever */
-.hr-tone-green { --wtone: var(--green); color: var(--green); }
-.hr-tone-yellow { --wtone: var(--yellow); color: var(--yellow); }
-.hr-tone-orange { --wtone: var(--orange); color: var(--orange); }
-.hr-tone-red { --wtone: var(--red); color: var(--red); }
-.hr-tone-unknown { --wtone: var(--unknown); color: var(--ink-3); }
-.hr-tone-dim { --wtone: var(--unknown); color: var(--ink-3); }
-
-/* desktop widget: small (206x206) and medium (438x206) */
-.hr-card { padding: 16px; display: flex; flex-direction: column;
-           border-radius: var(--widget-radius); }
-.hr-card.small { width: 206px; height: 206px; }
-.hr-card.medium { width: 438px; height: 206px; padding: 14px 18px; display: grid;
-                  grid-template-columns: 140px 1fr; gap: 20px; }
-.hr-chead { display: flex; align-items: center; gap: 6px; }
-.hr-mark { font: 700 10px var(--mono); color: var(--accent); }
-.hr-brand { font: 600 7.5px var(--mono); letter-spacing: .14em;
-            text-transform: uppercase; color: var(--ink-3); }
-.hr-cmid { flex: 1 1 auto; display: flex; flex-direction: column;
-           justify-content: center; }
-.hr-cval { font: 700 46px/1 var(--mono); letter-spacing: -.03em; }
-.hr-card.medium .hr-cval { font-size: 38px; }
-.hr-clabel { margin-top: 7px; font: 600 8px var(--mono); letter-spacing: .13em;
-             text-transform: uppercase; color: var(--ink-3); }
-.hr-bars { display: flex; align-items: flex-end; gap: 3px; height: 30px; }
-.hr-bar { flex: 1 1 0; border-radius: 2px; height: var(--h, 4%);
-          background: var(--wtone, var(--unknown));
-          box-shadow: var(--cell-glow) var(--wtone, transparent); }
-.hr-bar.is-dim { opacity: .55; box-shadow: none; }
-.hr-bar.is-held { opacity: .3; box-shadow: none; }
-.hr-liveline { margin-top: 8px; font: 500 8.5px var(--mono); color: var(--ink-2); }
-.hr-mleft { display: flex; flex-direction: column; min-width: 0; }
-.hr-mcol { display: flex; flex-direction: column; justify-content: center; gap: 6px;
-           min-width: 0; }
-.hr-mrow { display: grid; grid-template-columns: 110px 1fr 36px; gap: 9px;
-           align-items: center; }
-.hr-mname { font: 600 9px var(--mono); color: var(--ink-2); white-space: nowrap;
-            overflow: hidden; text-overflow: ellipsis; }
-.hr-mbar { position: relative; height: 4px; border-radius: 2px;
-           background: var(--cell-bg); overflow: hidden; }
-.hr-mfill { position: absolute; top: 0; bottom: 0; left: 0; width: var(--fill, 0%);
-            background: var(--wtone, var(--unknown));
-            box-shadow: var(--cell-glow) var(--wtone, transparent); }
-.hr-mbar.is-dim .hr-mfill { opacity: .55; box-shadow: none; }
-.hr-mval { font: 700 9.5px var(--mono); text-align: right; }
-
-@media (prefers-reduced-motion: no-preference) {
-  .hr-dot.is-live::after { animation: hr-pulse 1.8s ease-out infinite; }
-}
-@keyframes hr-pulse { from { opacity: .6; transform: scale(.6); }
-                      to { opacity: 0; transform: scale(1.7); } }
-</style>
+<link rel="stylesheet" href="static/css/dashboard.css">
 </head>
 <body>
 <main class="shell">
   <header class="toolbar">
     <div class="brand">
       <h1 class="title" id="title">headroom</h1>
-      <p class="subtitle" id="subtitle">Remaining capacity across your AI subscriptions</p>
+      <p class="subtitle" id="subtitle">Remaining capacity · every subscription · live, no tokens spent</p>
     </div>
     <p class="snapshot"><span id="snapshot-age">Connecting…</span><br>
       <span id="source-line">live usage feed</span></p>
@@ -504,9 +24,210 @@ body.is-widget .shell { display: none; }
         <option value="paper">Paper</option>
         <option value="terminal">Terminal</option>
       </select>
+      <button class="manage-btn" id="manage-open" type="button" title="Add, edit cost, or remove accounts">+ Accounts</button>
       <button class="refresh" id="refresh" type="button">Refresh</button>
     </div>
   </header>
+
+  <div class="manage-backdrop" id="manage-backdrop" hidden></div>
+  <aside class="manage-panel" id="manage-panel" aria-label="Manage accounts" hidden>
+    <div class="manage-head">
+      <h2>Accounts</h2>
+      <button type="button" class="manage-close" id="manage-close">Close</button>
+    </div>
+    <p class="manage-hint">Multiple Claude / Codex / Grok accounts work like original headroom — each extra login gets its own isolated home under <code>~/.headroom/homes/&lt;slot&gt;</code>.</p>
+    <div class="manage-msg" id="manage-msg" role="status"></div>
+
+    <section class="manage-section">
+      <h3>Connected <span id="manage-count" style="font-weight:500;color:var(--ink-3)"></span></h3>
+      <div class="manage-list" id="manage-list"><p class="manage-hint">Loading…</p></div>
+    </section>
+
+    <section class="manage-section">
+      <h3>Found on this Mac</h3>
+      <p class="manage-hint">Default logins + any isolated multi-account homes. Adopt unused ones in one click.</p>
+      <div class="manage-detect" id="manage-detect"></div>
+    </section>
+
+    <section class="manage-section">
+      <h3>Add another account</h3>
+      <div class="manage-field">
+        <label for="add-provider">Provider</label>
+        <select id="add-provider">
+          <option value="claude">Claude (multi-account OK)</option>
+          <option value="codex">Codex / OpenAI (multi-account OK)</option>
+          <option value="grok">Grok (multi-account OK)</option>
+          <option value="manus">Manus (API key per slot)</option>
+          <option value="nvidia">NVIDIA (API key / free tier)</option>
+        </select>
+      </div>
+      <div class="manage-field" id="add-mode-wrap">
+        <label for="add-mode">How to add</label>
+        <select id="add-mode">
+          <option value="fresh">New login — isolated home (2nd/3rd account)</option>
+          <option value="adopt">Adopt existing path already logged in</option>
+        </select>
+      </div>
+      <div class="manage-row">
+        <div class="manage-field">
+          <label for="add-name">Slot name</label>
+          <input id="add-name" type="text" placeholder="claude-2" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="manage-field">
+          <label for="add-cost">$/month</label>
+          <input id="add-cost" type="number" min="0" step="1" placeholder="20">
+        </div>
+      </div>
+      <div class="manage-field" id="add-home-wrap" hidden>
+        <label for="add-home">Config home to adopt</label>
+        <input id="add-home" type="text" placeholder="~/.claude or ~/.headroom/homes/work" spellcheck="false">
+      </div>
+      <div class="manage-field" id="add-email-wrap">
+        <label for="add-email">Email label (optional)</label>
+        <input id="add-email" type="email" placeholder="you@example.com" autocomplete="off">
+      </div>
+      <div class="manage-field" id="add-key-wrap" hidden>
+        <label for="add-key">API key</label>
+        <input id="add-key" type="password" placeholder="key…" autocomplete="off" spellcheck="false">
+      </div>
+      <div id="add-fresh-box" class="manage-hint" style="display:none;white-space:pre-wrap;border:1px dashed var(--line);padding:10px;border-radius:8px;margin-bottom:8px"></div>
+      <p class="manage-hint" id="add-year-hint">Yearly = monthly × 12 · multi-account = separate slot names</p>
+      <div class="manage-actions">
+        <button type="button" class="primary" id="add-submit">Prepare / add account</button>
+        <button type="button" id="add-finish" hidden>I've logged in — connect slot</button>
+        <button type="button" id="add-copy-cmd" hidden>Copy login command</button>
+      </div>
+    </section>
+
+    <section class="manage-section" id="burn-goal-section">
+      <h3>Use it or lose it</h3>
+      <p class="manage-hint">Burn X credits/tokens with a provider before a deadline. Countdown + email + browser push when time is running out.</p>
+      <div class="manage-field">
+        <label for="burn-label">Goal label</label>
+        <input id="burn-label" type="text" placeholder="NVIDIA free year credits" spellcheck="false">
+      </div>
+      <div class="manage-row">
+        <div class="manage-field">
+          <label for="burn-provider">Provider</label>
+          <select id="burn-provider">
+            <option value="any">Any / all</option>
+            <option value="nvidia">NVIDIA</option>
+            <option value="manus">Manus</option>
+            <option value="grok">Grok</option>
+            <option value="claude">Claude</option>
+            <option value="codex">Codex</option>
+          </select>
+        </div>
+        <div class="manage-field">
+          <label for="burn-unit">Unit</label>
+          <select id="burn-unit">
+            <option value="tokens">Tokens</option>
+            <option value="credits">Credits</option>
+            <option value="requests">Requests</option>
+            <option value="units">Generic units</option>
+          </select>
+        </div>
+      </div>
+      <div class="manage-row">
+        <div class="manage-field">
+          <label for="burn-target">Amount to use (X)</label>
+          <input id="burn-target" type="number" min="1" step="1" placeholder="100000">
+        </div>
+        <div class="manage-field">
+          <label for="burn-deadline">Use-by date</label>
+          <input id="burn-deadline" type="date">
+        </div>
+      </div>
+      <div class="manage-field">
+        <label for="burn-email">Notify email</label>
+        <input id="burn-email" type="email" placeholder="you@example.com" autocomplete="email">
+      </div>
+      <label class="manage-field" style="flex-direction:row;align-items:center;gap:8px">
+        <input id="burn-notify-email" type="checkbox" checked>
+        <span style="text-transform:none;letter-spacing:0;font-weight:500;color:var(--ink-2)">Email alerts</span>
+      </label>
+      <label class="manage-field" style="flex-direction:row;align-items:center;gap:8px">
+        <input id="burn-notify-browser" type="checkbox" checked>
+        <span style="text-transform:none;letter-spacing:0;font-weight:500;color:var(--ink-2)">Browser push on this machine</span>
+      </label>
+      <div class="manage-actions">
+        <button type="button" class="primary" id="burn-create">Create goal + countdown</button>
+        <button type="button" id="burn-enable-push">Enable browser notifications</button>
+      </div>
+      <p class="manage-hint" style="margin-top:10px">Optional SMTP for email (stored in secrets.json):</p>
+      <div class="manage-row">
+        <div class="manage-field">
+          <label for="smtp-host">SMTP host</label>
+          <input id="smtp-host" type="text" placeholder="smtp.gmail.com" spellcheck="false">
+        </div>
+        <div class="manage-field">
+          <label for="smtp-port">Port</label>
+          <input id="smtp-port" type="number" value="587">
+        </div>
+      </div>
+      <div class="manage-row">
+        <div class="manage-field">
+          <label for="smtp-user">SMTP user</label>
+          <input id="smtp-user" type="text" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="manage-field">
+          <label for="smtp-pass">SMTP password</label>
+          <input id="smtp-pass" type="password" autocomplete="off">
+        </div>
+      </div>
+      <div class="manage-actions">
+        <button type="button" id="smtp-save">Save SMTP</button>
+      </div>
+    </section>
+
+    <section class="manage-section" id="insights-key-section">
+      <h3>Insights API key (NVIDIA free tier)</h3>
+      <p class="manage-hint">Get a free key at build.nvidia.com → API keys. Stored only in ~/.headroom/secrets.json (0600). Also accepts NVIDIA_API_KEY / NVDIA_API_KEY env.</p>
+      <div class="manage-field">
+        <label for="insights-key">API key</label>
+        <input id="insights-key" type="password" placeholder="nvapi-…" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="manage-row">
+        <div class="manage-field">
+          <label for="insights-model">Model</label>
+          <input id="insights-model" type="text" value="meta/llama-3.1-8b-instruct" spellcheck="false">
+        </div>
+        <div class="manage-field">
+          <label for="insights-base">Base URL</label>
+          <input id="insights-base" type="text" value="https://integrate.api.nvidia.com/v1" spellcheck="false">
+        </div>
+      </div>
+      <p class="manage-hint" id="insights-key-status">Checking key status…</p>
+      <div class="manage-actions">
+        <button type="button" class="primary" id="insights-key-save">Save key</button>
+        <button type="button" class="danger" id="insights-key-clear">Remove key</button>
+        <button type="button" id="insights-key-test">Test · generate</button>
+      </div>
+    </section>
+
+    <section class="manage-section" id="edit-section" hidden>
+      <h3>Edit <span id="edit-name-label"></span></h3>
+      <div class="manage-row">
+        <div class="manage-field">
+          <label for="edit-cost">$/month</label>
+          <input id="edit-cost" type="number" min="0" step="1">
+        </div>
+        <div class="manage-field">
+          <label for="edit-email">Expected email</label>
+          <input id="edit-email" type="email" autocomplete="off">
+        </div>
+      </div>
+      <p class="manage-hint" id="edit-year-hint"></p>
+      <label class="manage-field" style="flex-direction:row;align-items:center;gap:8px">
+        <input id="edit-reserved" type="checkbox">
+        <span style="text-transform:none;letter-spacing:0;font-weight:500;color:var(--ink-2)">Reserved (track only — never auto-route)</span>
+      </label>
+      <div class="manage-actions">
+        <button type="button" class="primary" id="edit-save">Save changes</button>
+        <button type="button" id="edit-cancel">Cancel</button>
+      </div>
+    </section>
+  </aside>
 
   <section class="summary" aria-label="Fleet summary">
     <div class="summary-item">
@@ -536,6 +257,7 @@ body.is-widget .shell { display: none; }
   </section>
 
   <div class="statusline" id="status" aria-live="polite">Loading usage readings…</div>
+
   <div id="providers" aria-live="polite"></div>
 
   <footer class="legend" aria-label="Capacity colours">
@@ -545,6 +267,87 @@ body.is-widget .shell { display: none; }
     <span class="legend-item tone-red"><span class="swatch"></span>0–10% left</span>
     <span class="legend-item tone-unknown"><span class="swatch"></span>unknown</span>
   </footer>
+
+  <section class="accounts-bar" id="accounts-bar" aria-label="Manage monitored accounts">
+    <p class="accounts-bar-copy" id="accounts-bar-copy">
+      <strong>Accounts you monitor</strong> — add Claude, Codex, Grok, or Manus, set monthly cost, or remove a slot.
+    </p>
+    <div class="accounts-bar-actions">
+      <button type="button" class="primary" id="accounts-bar-manage">Add / edit accounts</button>
+      <button type="button" id="accounts-bar-refresh">Refresh usage</button>
+    </div>
+  </section>
+
+  <section class="waste-panel" id="waste-panel" aria-label="Fleet usage since tracking">
+    <div class="waste-stat">
+      <span class="lab">Tracking since</span>
+      <span class="val" id="usage-since">—</span>
+      <span class="sub" id="usage-since-sub">install / first collect</span>
+    </div>
+    <div class="waste-stat">
+      <span class="lab">Used (running total)</span>
+      <span class="val" id="usage-used">—</span>
+      <span class="sub">units observed across windows</span>
+    </div>
+    <div class="waste-stat">
+      <span class="lab">Wasted allotments</span>
+      <span class="val is-warn" id="usage-waste">—</span>
+      <span class="sub">left unused when a window reset</span>
+    </div>
+    <div class="waste-stat">
+      <span class="lab">Resets watched</span>
+      <span class="val" id="usage-resets">—</span>
+      <span class="sub">use-it-or-lose-it roll-overs</span>
+    </div>
+  </section>
+
+  <section class="history-panel" id="history-panel" aria-label="Usage history">
+    <div class="history-head">
+      <h2 class="history-title">Capacity history</h2>
+      <div class="history-controls" role="group" aria-label="History range">
+        <button type="button" data-hist-range="day">Day</button>
+        <button type="button" data-hist-range="week" class="is-active">Week</button>
+        <button type="button" data-hist-range="month">Month</button>
+        <span style="width:8px"></span>
+        <button type="button" data-hist-metric="left" class="is-active">Remaining %</button>
+        <button type="button" data-hist-metric="used">Used %</button>
+      </div>
+    </div>
+    <div class="history-chart-wrap" id="history-chart-wrap">
+      <div class="history-empty" id="history-empty">Collecting local history… refresh a few times to build the trend.</div>
+      <svg id="history-svg" viewBox="0 0 800 280" preserveAspectRatio="none" role="img" aria-label="Capacity over time"></svg>
+      <div class="history-tooltip" id="history-tooltip"></div>
+    </div>
+    <div class="history-legend" id="history-legend"></div>
+    <p class="history-meta" id="history-meta">Stored locally under ~/.headroom/state/history.jsonl · 90-day retention</p>
+  </section>
+
+  <section class="burn-panel" id="burn-panel" aria-label="Use it or lose it">
+    <div class="burn-head">
+      <h2 class="burn-title">Use it or lose it</h2>
+      <div class="insights-actions">
+        <button type="button" class="primary" id="burn-open-create">+ New deadline</button>
+        <button type="button" id="burn-check-now">Check alerts</button>
+      </div>
+    </div>
+    <div class="burn-list" id="burn-list">
+      <p class="burn-empty">No burn goals yet. Set an email + deadline + amount to burn before credits expire.</p>
+    </div>
+  </section>
+
+  <section class="insights-panel" id="insights-panel" aria-label="Automatic insights">
+    <div class="insights-head">
+      <h2 class="insights-title">Automatic insights</h2>
+      <div class="insights-actions">
+        <span class="insights-badge is-off" id="insights-badge">NVIDIA · not configured</span>
+        <button type="button" id="insights-setup">Set API key</button>
+        <button type="button" class="primary" id="insights-refresh">Generate</button>
+      </div>
+    </div>
+    <pre class="insights-body is-muted" id="insights-body">Add a free NVIDIA API key to get automatic fleet insights (capacity, spend, what to rotate next).</pre>
+    <p class="insights-meta" id="insights-meta">Keys stay local in ~/.headroom/secrets.json · never sent to the usage dashboard feed</p>
+  </section>
+
   <p class="credit">tracked by <a href="https://github.com/domanski-ai/headroom">headroom</a> —
     usage read straight from your providers, no tokens spent</p>
 </main>
@@ -560,623 +363,8 @@ body.is-widget .shell { display: none; }
 </div>
 
 <script>
-"use strict";
-const CONFIG = /*__HEADROOM_CONFIG__*/ null;
-const DATA_URL = "usage.json";
-const CACHE_KEY = "headroom-cache-" + ((CONFIG && CONFIG.redact) ? "r" : "f");
-const SNAPSHOT_MAX_AGE = CONFIG&&Number.isFinite(CONFIG.snapshot_max_age)?CONFIG.snapshot_max_age:900;
-const OBSERVATION_MAX_AGE = CONFIG&&Number.isFinite(CONFIG.observation_max_age)?CONFIG.observation_max_age:1800;
-let requestNumber = 0;
-
-/* ------------------------------------------------------------- helpers */
-function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));}
-function clamp(v,lo,hi){return Math.min(hi,Math.max(lo,v));}
-function tone(left){if(left==null)return"unknown";if(left<=10)return"red";if(left<=30)return"orange";if(left<=50)return"yellow";return"green";}
-function age(epoch){if(!Number.isFinite(epoch))return"time unknown";const s=Math.max(0,Math.floor(Date.now()/1e3-epoch));if(s<60)return s+"s ago";if(s<3600)return Math.floor(s/60)+"m ago";if(s<86400)return Math.floor(s/3600)+"h "+Math.floor(s%3600/60)+"m ago";return Math.floor(s/86400)+"d ago";}
-function untilReset(epoch){if(!Number.isFinite(epoch))return"reset not reported";const s=epoch-Math.floor(Date.now()/1e3);if(s<=0)return"reset due";if(s<86400){const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return"resets in "+(h?h+"h ":"")+m+"m";}return"resets "+new Intl.DateTimeFormat(undefined,{weekday:"short",hour:"2-digit",minute:"2-digit"}).format(new Date(1e3*epoch));}
-let snapshotState="held",sourceFailed=false; /* old/failed sources demote every row */
-function epochState(epoch,maxAge){const now=Date.now()/1e3;if(!Number.isFinite(epoch)||epoch>now)return"held";return now-epoch>maxAge?"stale":"current";}
-function projected(a){return a&&a.__display&&typeof a.__display==="object"?a.__display:null;}
-function intrinsicWindowState(a,key){
-  const d=projected(a),w=d&&d.windows&&d.windows[key];
-  if(!w||w.state==="held")return"held";
-  if(w.state==="stale")return"stale";
-  const timed=epochState(w.observed_at,OBSERVATION_MAX_AGE);
-  if(timed!=="current")return timed;
-  return w.state==="limited"?"limited":(w.state==="current"?"current":"held");
-}
-function displayState(a){
-  if(sourceFailed)return"stale";
-  if(snapshotState!=="current")return snapshotState;
-  const d=projected(a);
-  if(!d||d.state==="held")return"held";
-  if(d.state==="stale")return"stale";
-  const captured=epochState(a&&a.captured_at,OBSERVATION_MAX_AGE);
-  if(captured!=="current")return captured;
-  /* 5h is optional only for a live codex seat (OpenAI lifted it): skip an
-     absent 5h so it can't force "held". 7d is always counted (mandatory), and
-     a non-codex seat always counts 5h too, so a missing 5h there still holds
-     (fail-closed). Grok SuperGrok meters a monthly allotment only. */
-  const win=(d&&d.windows)||{};
-  const keys=(a.provider==="grok"||a.provider==="manus")?["month"]
-    :["5h","7d"].filter(k=>k==="7d"||a.provider!=="codex"||win[k]!==undefined);
-  const states=keys.map(k=>intrinsicWindowState(a,k));
-  if(states.includes("held"))return"held";
-  if(states.includes("stale"))return"stale";
-  return states.includes("limited")?"limited":"current";
-}
-function windowState(a,key){const state=displayState(a);return state==="held"||state==="stale"?state:intrinsicWindowState(a,key);}
-function windowView(a,key){
-  const d=projected(a),w=d&&d.windows&&d.windows[key],state=windowState(a,key),accountState=displayState(a);
-  const limited=accountState==="limited"&&state==="limited";
-  /* A "limited" account can still have "current" windows with valid readings
-     (e.g. 5h is fine but 7d hit the cap).  Show left_percent for any current
-     window, not only when the account-level state is also current. */
-  const currentWin=state==="current"&&w;
-  const left=currentWin&&Number.isFinite(w.left_percent)?w.left_percent:(limited&&w&&Number.isFinite(w.last_observed_left_percent)?w.last_observed_left_percent:null);
-  const projTone=currentWin&&["green","yellow","orange","red"].includes(w.tone)?w.tone:null;
-  const safeTone=projTone||(left!=null?tone(left):"unknown");
-  return{state:state,left:left,tone:safeTone};
-}
-function isCurrent(a){return displayState(a)==="current";}
-
-function windowLabel(key){
-  if(key==="5h")return"Session 5h";
-  if(key==="7d")return"Weekly all";
-  if(key==="month")return"Monthly allotment";
-  if(key.startsWith("scoped:"))return"Weekly "+key.slice(7);
-  return key;
-}
-function windowColumns(accounts){
-  const keys=["5h","7d"];
-  accounts.forEach(a=>Object.keys(a.windows||{}).forEach(k=>{
-    if((k.startsWith("scoped:")||k==="month")&&!keys.includes(k))keys.push(k);}));
-  return keys;
-}
-
-/* -------------------------------------------------------------- render */
-function meterMarkup(left,displayTone){
-  let cells="";
-  for(let i=0;i<10;i++){
-    const fill=left==null?0:clamp((left-10*i)*10,0,100);
-    cells+='<span class="cell" style="--fill:'+fill+'%"></span>';
-  }
-  return '<div class="meter tone-'+(displayTone||tone(left))+'" role="img" aria-label="'+(left==null?"unknown":Math.round(left)+"% remaining")+'">'+cells+"</div>";
-}
-function windowMarkup(account,key){
-  const w=(account.windows||{})[key]||null;
-  const view=windowView(account,key),left=view.left;
-  const unknown=left==null;
-  /* A standard window absent from a live CODEX/GROK account is a lifted/N/A
-     limit, not a failed read: render it neutrally, never as a fake 0% or an
-     n/a error. Codex: 5h lifted. Grok: only monthly allotment exists, so 5h/7d
-     are not metered. Gate on provider + not-held so limited seats still read
-     cleanly, and other providers still fail closed to "n/a". */
-  const absentLimit=!w&&!key.startsWith("scoped:")
-    &&((account.provider==="codex"&&key==="5h")
-       ||((account.provider==="grok"||account.provider==="manus")
-          &&(key==="5h"||key==="7d")))
-    &&displayState(account)!=="held";
-  const value=unknown?(absentLimit?"—":"n/a"):Math.round(left)+"% left";
-  const note=unknown?(absentLimit?"no "+key+" limit":(w?"reading unavailable":(key.startsWith("scoped:")?"no scoped cap":"no reading yet"))):untilReset(w.resets_at);
-  return '<div class="win"><span class="win-name">'+esc(windowLabel(key))+
-    '</span><span class="win-value tone-'+view.tone+'">'+esc(value)+"</span>"+
-    meterMarkup(left,view.tone)+'<p class="win-note">'+esc(note)+"</p></div>";
-}
-// Calm, specific state per account. Codex reads its CLI's own telemetry, so
-// idle/limited are EXPECTED states — label them clearly, never as "broken".
-function accountState(account){
-  const state=displayState(account);
-  if(state==="current"){
-    return{cls:"live",label:"Live",note:"observed "+age(account.captured_at)};
-  }
-  if(state==="limited")return{cls:"limited",label:"At limit",note:"window full · observed "+age(account.captured_at)};
-  if(state==="stale")return{cls:"held",label:"Stale",note:"last verified "+age(account.captured_at)};
-  const code=account.error_code||"";
-  const isCodex=account.provider==="codex";
-  if(code==="codex_usage_limit"||/usage limit/i.test(account.note||""))
-    return{cls:"held",label:"Held",note:account.retry_at?("resets "+untilReset(account.retry_at)):"usage limit reported"};
-  if(code==="codex_reauth_required")
-    return{cls:"held",label:"Sign-in expired",note:"run `codex login` on this account"};
-  if(isCodex&&account.stale)
-    return{cls:"idle",label:"Idle",note:"last seen "+age(account.captured_at)+" · run Codex to refresh"};
-  if(isCodex&&/no .*telemetry|no rate_limits/i.test(account.note||""))
-    return{cls:"idle",label:"Waiting",note:"run Codex once to start tracking"};
-  return{cls:"held",label:"Held",note:account.note||account.error_code||"no verified reading"};
-}
-function formatCost(usd){
-  if(usd==null||!Number.isFinite(Number(usd)))return null;
-  const n=Number(usd);
-  return Number.isInteger(n)?"$"+n+"/mo":"$"+n.toFixed(2)+"/mo";
-}
-function accountMarkup(account,columns){
-  const s=accountState(account);
-  const dot=s.cls==="live"?'<span class="live-dot" aria-hidden="true"></span>':"";
-  const cost=formatCost(account.monthly_cost_usd);
-  const planBits=[account.plan||account.provider,cost].filter(Boolean).join(" · ");
-  return '<article class="account is-'+s.cls+'" style="--win-cols:'+columns.length+'">'+
-    '<div class="acct-identity"><span class="acct-email">'+esc(account.email||account.name)+"</span>"+
-    '<div class="acct-meta"><span>'+esc(account.name)+"</span><span>"+esc(planBits)+"</span></div></div>"+
-    columns.map(k=>windowMarkup(account,k)).join("")+
-    '<div class="state"><span class="state-badge state-'+s.cls+'">'+dot+esc(s.label)+"</span>"+
-    '<p class="state-note">'+esc(s.note)+"</p></div></article>";
-}
-function providerMarkup(provider,accounts){
-  if(!accounts.length)return"";
-  const columns=windowColumns(accounts);
-  const titles={claude:"Claude",codex:"Codex",grok:"Grok",manus:"Manus"};
-  const title=titles[provider]||provider;
-  const spend=accounts.reduce((s,a)=>s+(Number.isFinite(Number(a.monthly_cost_usd))?Number(a.monthly_cost_usd):0),0);
-  const sub=spend>0?(formatCost(spend)+" fleet"):"real-time";
-  return '<section class="provider"><header class="provider-head">'+
-    '<h2 class="provider-name">'+esc(title)+'</h2><span class="provider-count">'+
-    accounts.length+(accounts.length===1?" subscription":" subscriptions")+
-    ' <span class="provider-mode">· '+esc(sub)+'</span></span></header>'+
-    accounts.map(a=>accountMarkup(a,columns)).join("")+"</section>";
-}
-function validate(data){
-  if(!data||!Number.isFinite(data.generated)||!Array.isArray(data.accounts))
-    throw new Error("usage snapshot invalid");
-  const display=data._headroom_display;
-  if(!display||display.schema!=="headroom_widget@1"||!display.freshness||typeof display.freshness.state!=="string"||!Array.isArray(display.accounts)||display.accounts.length!==data.accounts.length)
-    throw new Error("display projection invalid");
-  data.accounts.forEach(a=>{
-    if(!a||typeof a.name!=="string")throw new Error("invalid account record");
-    Object.values(a.windows||{}).forEach(w=>{
-      if(w&&w.used_percent!=null&&(!Number.isFinite(w.used_percent)||w.used_percent<0||w.used_percent>100))
-        throw new Error("invalid usage percentage");});});
-  return data;
-}
-function render(data,forceNoncurrent){
-  const now=Date.now()/1e3,display=data._headroom_display;
-  if(display.freshness.state==="held"||!Number.isFinite(data.generated)||data.generated>now) snapshotState="held";
-  else if(display.freshness.state!=="current"||now-data.generated>SNAPSHOT_MAX_AGE) snapshotState="stale";
-  else snapshotState="current";
-  sourceFailed=forceNoncurrent===true||data.refresh_failed===true;
-  const accounts=data.accounts.map((a,i)=>Object.assign({},a,{__display:display.accounts[i]}));
-  const current=accounts.filter(isCurrent);
-  /* Include current windows from limited accounts in summary metrics,
-     not just fully-current accounts — windowView already handles the mixed case. */
-  const readings=[];
-  accounts.forEach(a=>["5h","7d","month"].forEach(k=>{
-    const v=windowView(a,k);if(v.left!=null&&v.state==="current")readings.push({left:v.left,who:a.email||a.name});}));
-  const avg=readings.length?Math.round(readings.reduce((s,r)=>s+r.left,0)/readings.length):null;
-  const lowest=readings.length?readings.reduce((b,r)=>r.left<b.left?r:b):null;
-  const claude=accounts.filter(a=>a.provider==="claude");
-  const codex=accounts.filter(a=>a.provider==="codex");
-  const grok=accounts.filter(a=>a.provider==="grok");
-  const manus=accounts.filter(a=>a.provider==="manus");
-  const fleetSpend=accounts.reduce((s,a)=>s+(Number.isFinite(Number(a.monthly_cost_usd))?Number(a.monthly_cost_usd):0),0);
-  set("verified",current.length+"/"+accounts.length);
-  set("average",avg==null?"n/a":avg+"%");
-  set("lowest",lowest?Math.round(lowest.left)+"%":"n/a");
-  set("lowest-account",lowest?lowest.who:"no current readings");
-  set("account-count",String(accounts.length));
-  const bits=[];
-  if(claude.length)bits.push("Claude "+claude.length);
-  if(codex.length)bits.push("Codex "+codex.length);
-  if(grok.length)bits.push("Grok "+grok.length);
-  if(manus.length)bits.push("Manus "+manus.length);
-  if(fleetSpend>0)bits.push(formatCost(fleetSpend)+" total");
-  set("account-note",bits.join(" · ")||"–");
-  /* top-bar instruments */
-  document.getElementById("verified-viz").innerHTML=accounts.map(a=>
-    '<span class="seg '+(isCurrent(a)?"is-on":"is-off")+'" title="'+esc(a.name)+": "+(isCurrent(a)?"verified":"held")+'"></span>').join("");
-  const gauge=document.getElementById("average-viz");
-  gauge.className="gauge tone-"+tone(avg);
-  gauge.querySelector(".gauge-fill").style.setProperty("--fill",(avg==null?0:avg)+"%");
-  document.getElementById("lowest-viz").innerHTML=meterMarkup(lowest?lowest.left:null);
-  document.getElementById("fleet-viz").innerHTML=accounts.map(a=>{
-    const primary=(a.provider==="grok"||a.provider==="manus")?"month":"5h";
-    const view=windowView(a,primary),left=view.left;
-    if(view.state!=="current"||left==null)return'<span class="fbar is-unknown" title="'+esc(a.name)+': unknown"></span>';
-    return'<span class="fbar tone-'+view.tone+'" style="--h:'+Math.max(4,left)+'%" title="'+esc(a.name)+": "+Math.round(left)+'% left"></span>';
-  }).join("");
-  set("snapshot-age","snapshot "+age(data.generated));
-  set("source-line",current.length+" of "+accounts.length+" verified"
-    +(fleetSpend>0?" · "+formatCost(fleetSpend)+" fleet":""));
-  document.getElementById("providers").innerHTML=
-    providerMarkup("claude",claude)+providerMarkup("codex",codex)
-    +providerMarkup("grok",grok)+providerMarkup("manus",manus);
-  const warnings=(data.integrity_warnings||[]).slice();
-  if(sourceFailed)warnings.unshift("refresh failed — readings shown as held until collection succeeds");
-  if(snapshotState!=="current")warnings.unshift("snapshot is noncurrent (maximum "+Math.floor(SNAPSHOT_MAX_AGE/60)+" minutes) — readings shown as held until a fresh collect");
-  const status=document.getElementById("status");
-  status.textContent=warnings.length?("⚠ "+warnings.join(" — ")):"Full meters are available capacity. Colors show what's left, not what's used.";
-  status.className="statusline"+(warnings.length?" is-error":"");
-}
-function renderError(message){
-  document.getElementById("providers").innerHTML=
-    '<div class="empty">Usage feed unavailable<small>'+esc(message)+
-    " — no stale value promoted to live.</small></div>";
-  set("snapshot-age","no trustworthy snapshot");
-  set("source-line","refresh to retry");
-  const status=document.getElementById("status");
-  status.textContent="Live data could not be verified.";
-  status.className="statusline is-error";
-}
-function set(id,text){document.getElementById(id).textContent=text;}
-
-/* ---------------------------------------------------------------- load */
-async function load(manual){
-  const requestId=++requestNumber;
-  const button=document.getElementById("refresh");
-  if(manual){button.disabled=true;button.textContent="Refreshing…";}
-  try{
-    const controller=new AbortController();
-    const timer=setTimeout(()=>controller.abort(),12e3);
-    const response=await fetch(DATA_URL+"?t="+Date.now(),{cache:"no-store",signal:controller.signal});
-    clearTimeout(timer);
-    if(!response.ok)throw new Error("feed returned HTTP "+response.status);
-    const data=validate(await response.json());
-    if(requestId===requestNumber){
-      render(data);
-      // key the cache by the redaction setting so a cache written while emails
-      // were visible is never reused after privacy is turned on
-      try{localStorage.setItem(CACHE_KEY,JSON.stringify(data));}catch(e){}
-    }
-  }catch(error){
-    if(requestId===requestNumber){
-      let cached=null;
-      try{cached=validate(JSON.parse(localStorage.getItem(CACHE_KEY)||"null"));}catch(e){}
-      // Only reuse a RECENT, non-future cache. An old cache may predate a
-      // privacy change or a limit change; beyond an hour (or dated in the
-      // future) we refuse it rather than resurface stale data as a snapshot.
-      const cacheAge=cached&&Number.isFinite(cached.generated)?(Date.now()/1e3-cached.generated):Infinity;
-      if(cached&&cacheAge>=0&&cacheAge<=3600){render(cached,true);
-        const status=document.getElementById("status");
-        status.textContent="Feed unreachable ("+(error&&error.message||"error")+"). Showing last snapshot ("+age(cached.generated)+").";
-        status.className="statusline is-error";}
-      else{try{localStorage.removeItem(CACHE_KEY);}catch(e){}
-        renderError(error&&error.message?error.message:"unknown feed error");}
-    }
-  }finally{
-    if(manual&&requestId===requestNumber){button.disabled=false;button.textContent="Refresh";}
-  }
-}
-
-/* =================================================== liquid-glass widget */
-/* The /widget surface consumes ONLY the versioned /widget.json projection
-   (headroom_widget@1) — names + providers + window states, never emails.
-   FAIL-CLOSED IS SACRED: the single place a live tone can be produced is the
-   `st==="current"` branch of hrWindow(); stale/held/offline readings render
-   the unknown grey with the last-observed value (or n/a), never a live color. */
-const HR_URL="widget.json";
-let hrData=null,hrSize="popup",hrLastOffline=false,hrRequest=0;
-function hrTone(left){return left==null?"unknown":left<=10?"red":left<=30?"orange":left<=50?"yellow":"green";}
-function hrPct(v){return Number.isFinite(v)?clamp(v,0,100):null;}
-function hrAgeText(s){if(!Number.isFinite(s))return"age unknown";s=Math.max(0,Math.floor(s));if(s<60)return s+"s ago";if(s<3600)return Math.floor(s/60)+"m ago";return Math.floor(s/3600)+"h "+Math.floor(s%3600/60)+"m ago";}
-function hrClock(epoch){if(!Number.isFinite(epoch))return null;try{return new Intl.DateTimeFormat(undefined,{hour:"numeric",minute:"2-digit"}).format(new Date(1e3*epoch));}catch(e){return null;}}
-/* projection -> tone/value mapping. The ONLY live-color branch requires the
-   window to be state "current" AND carry a finite left_percent. */
-function hrWindow(w){
-  const st=w&&typeof w.state==="string"?w.state:"held";
-  const live=hrPct(w&&w.left_percent);
-  if(st==="current"&&live!=null)
-    return{tone:hrTone(live),fill:live,value:Math.round(live)+"%",live:true};
-  const last=hrPct(w&&w.last_observed_left_percent);
-  if(st==="limited")
-    return{tone:"red",fill:last==null?0:last,value:(last==null?0:Math.round(last))+"%",live:false};
-  if(st==="stale"&&last!=null)
-    return{tone:"unknown",fill:last,value:Math.round(last)+"%",live:false};
-  return{tone:"unknown",fill:null,value:"n/a",live:false};
-}
-/* offline / noncurrent feed: every reading is shown grey at its last-observed
-   value — a demoted window can never yield anything but the unknown tone. */
-function hrDemoteWindow(w){
-  const left=w&&Number.isFinite(w.left_percent)?w.left_percent:(w&&w.last_observed_left_percent);
-  const last=hrPct(left);
-  if(last!=null)return{tone:"unknown",fill:last,value:Math.round(last)+"%",live:false};
-  return{tone:"unknown",fill:null,value:"n/a",live:false};
-}
-/* headroom_widget@1 structural validation: anything missing or mistyped is
-   rejected before it can render — the OFFLINE view, never a live card.
-   Strict by design: a MISSING field is not null — the projection always emits
-   every contract field explicitly, so absence means a foreign/broken feed. */
-function hrFiniteOrNull(v){return v===null||(typeof v==="number"&&Number.isFinite(v));}
-function hrValidWindow(w){
-  if(!w||typeof w!=="object"||Array.isArray(w))return false;
-  if(!["current","limited","stale","held"].includes(w.state))return false;
-  if(!hrFiniteOrNull(w.left_percent)||!hrFiniteOrNull(w.last_observed_left_percent)
-    ||!hrFiniteOrNull(w.resets_at)||!hrFiniteOrNull(w.observed_at))return false;
-  if(w.left_percent!=null&&(w.left_percent<0||w.left_percent>100))return false;
-  if(w.last_observed_left_percent!=null&&(w.last_observed_left_percent<0||w.last_observed_left_percent>100))return false;
-  /* value invariant: only a current window may carry a live left_percent */
-  return w.state==="current"?Number.isFinite(w.left_percent):w.left_percent==null;
-}
-function hrValidFeed(data){
-  if(!data||typeof data!=="object"||Array.isArray(data))return false;
-  if(data.schema!=="headroom_widget@1")return false;
-  const f=data.freshness;
-  if(!f||typeof f!=="object"||Array.isArray(f))return false;
-  if(!["current","stale","held"].includes(f.state))return false;
-  if(typeof f.reason!=="string")return false;
-  if(!Number.isFinite(f.evaluated_at))return false;
-  if(f.age_seconds!==null&&!(Number.isInteger(f.age_seconds)&&f.age_seconds>=0))return false;
-  if(f.state!=="held"&&f.age_seconds===null)return false;
-  if(!Array.isArray(data.accounts))return false;
-  if(!data.accounts.every(a=>a&&typeof a==="object"&&!Array.isArray(a)
-    &&typeof a.name==="string"&&typeof a.provider==="string"
-    &&["current","limited","stale","held"].includes(a.state)
-    &&a.windows&&typeof a.windows==="object"&&!Array.isArray(a.windows)
-    &&hrValidWindow(a.windows["7d"])
-    /* 5h is optional ONLY for codex (OpenAI lifted it): a live codex seat
-       reports only the weekly window. For any other provider 5h stays
-       mandatory (fail-closed); a present 5h must always be valid. 7d is
-       mandatory for everyone. */
-    &&((a.provider==="codex"&&a.windows["5h"]===undefined)||hrValidWindow(a.windows["5h"]))))return false;
-  const h=data.headline;
-  if(!h||typeof h!=="object"||Array.isArray(h))return false;
-  if(!Number.isInteger(h.current_accounts)||h.current_accounts<0)return false;
-  if(!Number.isInteger(h.total_accounts)||h.total_accounts<0)return false;
-  return h.fullest_5h_left_percent===null
-    ||(Number.isFinite(h.fullest_5h_left_percent)
-    &&h.fullest_5h_left_percent>=0&&h.fullest_5h_left_percent<=100);
-}
-function hrFreshness(data,offline){
-  const f=data&&data.freshness&&typeof data.freshness==="object"?data.freshness:{};
-  /* fail-closed: "current" is trusted ONLY with complete timing — a finite,
-     non-negative age inside the budget. Client clock drift only ever ADDS
-     age (a future-dated evaluation can never subtract age or stay current). */
-  const now=Date.now()/1e3;
-  const evaluatedAt=Number.isFinite(f.evaluated_at)?f.evaluated_at:null;
-  let age=Number.isFinite(f.age_seconds)&&f.age_seconds>=0?f.age_seconds:null;
-  if(age!=null&&evaluatedAt!=null)age+=Math.max(0,now-evaluatedAt);
-  let state=f.state==="current"||f.state==="stale"?f.state:"held";
-  if(offline&&state==="current")state="stale";
-  if(state==="current"&&(age==null||evaluatedAt==null))state="held"; /* missing timing: hold, never trust */
-  if(state==="current"&&age>SNAPSHOT_MAX_AGE)state="stale"; /* client-side fail-closed guard between polls */
-  if(evaluatedAt!=null&&evaluatedAt>now+10)state="held"; /* future evaluation beyond NTP-skew tolerance: hold, never current (sub-second clock drift must not hold a live fleet; tolerance kept tight so a future-dated feed can only freeze the age briefly) */
-  return{state:state,age:age};
-}
-function hrAccount(raw,demote){
-  const a=raw&&typeof raw==="object"?raw:{};
-  const name=typeof a.name==="string"?a.name:"unknown";
-  const provider=typeof a.provider==="string"?a.provider:"unknown";
-  let st=["current","limited","stale","held"].includes(a.state)?a.state:"held";
-  if(demote&&st!=="held")st="stale";
-  const w5=a.windows&&a.windows["5h"]||null,w7=a.windows&&a.windows["7d"]||null;
-  /* OpenAI lifted Codex's 5h: a live codex seat reports only the weekly window,
-     so an absent 5h is a lifted limit, not a failed read. Omit its row/note and
-     drive the per-account battery tile, cool clock, and timing from 7d instead
-     of a phantom "n/a" 5h. Provider-scoped: a non-codex seat (or a codex seat
-     that still has a 5h) is unchanged, and a non-codex missing 5h never reaches
-     here (hrValidFeed rejects it). */
-  const has5h=provider!=="codex"||w5!=null;
-  const wp=has5h?w5:w7; /* window backing the tile / clock / stale timing */
-  const v5=demote?hrDemoteWindow(w5):hrWindow(w5);
-  const v7=demote?hrDemoteWindow(w7):hrWindow(w7);
-  const tile=has5h?v5:v7;
-  /* model-scoped weekly windows (e.g. "scoped:Fable") ride along for display;
-     hrWindow/hrDemoteWindow are null-safe so extras need no pre-validation */
-  const extras=[];
-  if(a.windows&&typeof a.windows==="object"&&!Array.isArray(a.windows))
-    Object.keys(a.windows).sort().forEach(k=>{
-      if(k==="5h"||k==="7d"||k.indexOf("scoped:")!==0)return;
-      const w=a.windows[k];
-      extras.push({label:k.slice(7),view:demote?hrDemoteWindow(w):hrWindow(w)});
-    });
-  const badge=st==="current"?{label:"CURRENT",tone:"green",dot:true}
-    :st==="limited"?{label:"AT LIMIT",tone:"red",dot:true}
-    :st==="stale"?{label:"STALE",tone:"dim",dot:false}
-    :{label:"WAITING",tone:"dim",dot:false};
-  const cool=st==="limited"?hrClock(wp&&wp.resets_at):null;
-  let note;
-  if(st==="current")note=(has5h?"5h "+untilReset(w5&&w5.resets_at)+" · ":"")+"7d "+untilReset(w7&&w7.resets_at);
-  else if(st==="limited")note="window full — "+(cool?"cools until "+cool:"cooling")+" · 7d "+untilReset(w7&&w7.resets_at);
-  else if(st==="stale"){const seen=wp&&Number.isFinite(wp.observed_at)?wp.observed_at:null;
-    note=seen?"last verified "+age(seen):"reading held — not verified";}
-  else note="no verified reading — held, never promoted to live";
-  return{name:name,provider:provider,state:st,badge:badge,v5:v5,v7:v7,tile:tile,
-         has5h:has5h,extras:extras,cool:cool,note:note,hasW:st!=="held"};
-}
-function hrView(data,offline){
-  const fresh=hrFreshness(data,offline);
-  const demote=offline||fresh.state!=="current";
-  const rawAccounts=Array.isArray(data.accounts)?data.accounts:[];
-  const accts=rawAccounts.map(a=>hrAccount(a,demote));
-  /* headline: never trust the feed's numbers — derive the fleet's average
-     battery per window from LIVE readings only: a current window contributes
-     its left_percent, a limited window contributes an honest 0, held/stale
-     windows never move an average, whatever the feed claims. */
-  const total=accts.length;
-  const cur=demote?0:accts.filter(a=>a.state==="current").length;
-  const pool5=[],pool7=[];
-  if(!demote)rawAccounts.forEach(a=>{
-    if(!a||a.state==="held"||a.state==="stale")return;
-    [["5h",pool5],["7d",pool7]].forEach(pair=>{
-      const w=a.windows&&a.windows[pair[0]]||{};
-      if(w.state==="current"){const l=hrPct(w.left_percent);if(l!=null)pair[1].push(l);}
-      else if(w.state==="limited")pair[1].push(0);
-    });});
-  const hrAvg=pool=>pool.length?pool.reduce((s,x)=>s+x,0)/pool.length:null;
-  const avg5=hrAvg(pool5),avg7=hrAvg(pool7);
-  const hl=avg5!=null
-    ?{value:Math.round(avg5)+"%",tone:hrTone(avg5),fill:avg5,sub:""}
-    :{value:"—",tone:"dim",fill:0,
-      sub:offline?"no live readings — feed unreachable"
-        :fresh.state==="stale"?"no live readings — snapshot expired"
-        :fresh.state==="held"?"no live readings — snapshot held"
-        :"no live readings"};
-  const hl7=avg7!=null
-    ?{value:Math.round(avg7)+"%",tone:hrTone(avg7),fill:avg7}
-    :{value:"—",tone:"dim",fill:0};
-  const limited=accts.filter(a=>a.state==="limited");
-  let banner=null;
-  if(offline)banner={cls:"is-orange",text:"usage feed unreachable — readings held, never promoted to live"};
-  else if(fresh.state==="held")banner={cls:"is-orange",text:"no trusted snapshot — readings held, never promoted to live"};
-  else if(fresh.state==="stale")banner={cls:"is-orange",text:"snapshot older than "+Math.floor(SNAPSHOT_MAX_AGE/60)+"m — readings held, never promoted to live"};
-  else if(limited.length===1)banner={cls:"is-red",text:limited[0].name+" hit its 5h cap"+(limited[0].cool?" — cooling until "+limited[0].cool:"")};
-  else if(limited.length>1)banner={cls:"is-red",text:limited.length+" accounts hit their 5h cap — cooling until reset"};
-  const liveLine=offline?"0/"+total+" live · feed unreachable"
-    :fresh.state==="stale"?"0/"+total+" live · feed stale"
-    :fresh.state==="held"?"0/"+total+" live · feed held"
-    :limited.length?cur+"/"+total+" live · "+limited.length+" at limit"
-    :cur+"/"+total+" accounts live";
-  const freshText=offline?"feed unreachable"
-    :fresh.state==="held"?"no trusted snapshot"
-    :(fresh.age!=null?"snapshot "+hrAgeText(fresh.age):"snapshot age unknown")+(fresh.state==="stale"?" · stale":"");
-  const dotc=(!offline&&fresh.state==="current")?"var(--green)"
-    :(!offline&&fresh.state==="stale")?"var(--orange)":"var(--unknown)";
-  return{offline:offline,fresh:fresh,accts:accts,hl:hl,hl7:hl7,banner:banner,
-         liveLine:liveLine,freshText:freshText,dotc:dotc,
-         schema:typeof data.schema==="string"?data.schema:"headroom_widget@1"};
-}
-function hrOfflineView(){
-  return{offline:true,fresh:{state:"held",age:null},accts:[],
-    hl:{value:"—",tone:"dim",fill:0,sub:"usage feed unavailable — nothing promoted to live"},
-    hl7:{value:"—",tone:"dim",fill:0},
-    banner:{cls:"is-orange",text:"usage feed unavailable — no snapshot to show, nothing promoted to live"},
-    liveLine:"feed unreachable",freshText:"feed unreachable",dotc:"var(--unknown)",
-    schema:"headroom_widget@1"};
-}
-/* ---- markup builders (names/providers escaped; values are code-built) ---- */
-function hrCells(fill){
-  let out="";
-  for(let i=0;i<10;i++){
-    const f=fill==null?0:clamp((fill-10*i)*10,0,100);
-    out+='<span class="hr-cell" style="--fill:'+f+'%"></span>';
-  }
-  return out;
-}
-function hrDotMarkup(v){
-  return '<span class="hr-dot'+(v.fresh.state==="current"&&!v.offline?" is-live":"")+
-    '" style="--dotc:'+v.dotc+'" aria-hidden="true"></span>';
-}
-function hrAcctMarkup(a){
-  const dot=a.badge.dot?'<span class="hr-bdot hr-tone-'+a.badge.tone+'" aria-hidden="true"></span>':"";
-  const extraRows=(a.extras||[]).map(e=>
-    '<div class="hr-winrow"><span class="hr-wlabel">'+esc(e.label.toUpperCase())+'</span><span class="hr-cells h7 hr-tone-'+e.view.tone+'" role="img" aria-label="'+esc(e.label)+" "+esc(e.view.value)+'">'+hrCells(e.view.fill)+'</span><span class="hr-wval hr-tone-'+e.view.tone+'">'+esc(e.view.value)+"</span></div>").join("");
-  /* omit the 5H row when codex's 5h is lifted (a.has5h===false): no phantom
-     "5H n/a" on a live seat. The 7D row and any scoped rows still render. */
-  const fiveRow=a.has5h?'<div class="hr-winrow"><span class="hr-wlabel">5H</span><span class="hr-cells h5 hr-tone-'+a.v5.tone+'" role="img" aria-label="5h '+esc(a.v5.value)+'">'+hrCells(a.v5.fill)+'</span><span class="hr-wval hr-tone-'+a.v5.tone+'">'+esc(a.v5.value)+"</span></div>":"";
-  const wins=a.hasW?'<div class="hr-wins">'+fiveRow+
-    '<div class="hr-winrow"><span class="hr-wlabel">7D</span><span class="hr-cells h7 hr-tone-'+a.v7.tone+'" role="img" aria-label="7d '+esc(a.v7.value)+'">'+hrCells(a.v7.fill)+'</span><span class="hr-wval hr-tone-'+a.v7.tone+'">'+esc(a.v7.value)+"</span></div>"+extraRows+"</div>":"";
-  return '<div class="hr-acct"><div class="hr-arow">'+
-    '<span class="hr-aname">'+esc(a.name)+'</span>'+
-    '<span class="hr-pill">'+esc(a.provider)+'</span>'+
-    '<span class="hr-sp"></span>'+dot+
-    '<span class="hr-badge hr-tone-'+a.badge.tone+'">'+esc(a.badge.label)+'</span>'+
-    '<span class="hr-chev" aria-hidden="true">›</span></div>'+wins+
-    '<p class="hr-note">'+esc(a.note)+"</p></div>";
-}
-function hrPopMarkup(v){
-  const banner=v.banner?'<div class="hr-banner '+v.banner.cls+'">'+esc(v.banner.text)+"</div>":"";
-  const accts=v.accts.length?v.accts.map(hrAcctMarkup).join("")
-    :'<div class="hr-empty">no accounts in the usage feed'+(v.offline?" — feed unreachable":"")+"</div>";
-  return '<div class="hr-pop hr-glass glowable">'+
-    '<div class="hr-phead"><span class="hr-appname">headroom</span><span class="hr-sp"></span>'+
-      hrDotMarkup(v)+'<span class="hr-fresh">'+esc(v.freshText)+"</span></div>"+
-    '<div class="hr-hl"><div class="hr-hlrow"><span class="hr-hlval hr-tone-'+v.hl.tone+'">'+esc(v.hl.value)+'</span>'+
-      '<span class="hr-hllabel">Avg 5h battery</span></div>'+
-      '<div class="hr-hlbar" role="img" aria-label="average 5h battery"><span class="hr-hlfill hr-tone-'+v.hl.tone+'" style="--fill:'+v.hl.fill+'%"></span><span class="hr-hlticks"></span></div>'+
-      '<div class="hr-hlrow is-7"><span class="hr-hlval-7 hr-tone-'+v.hl7.tone+'">'+esc(v.hl7.value)+'</span>'+
-      '<span class="hr-hllabel">Avg 7d battery</span></div>'+
-      '<div class="hr-hlbar is-7" role="img" aria-label="average 7d battery"><span class="hr-hlfill hr-tone-'+v.hl7.tone+'" style="--fill:'+v.hl7.fill+'%"></span><span class="hr-hlticks"></span></div>'+
-      '<div class="hr-hlsub">'+(v.hl.sub||esc(v.liveLine))+"</div></div>"+banner+
-    '<div class="hr-accts">'+accts+"</div>"+
-    '<div class="hr-foot">'+
-      '<button type="button" class="hr-btn" id="hr-refresh">↻ Refresh</button>'+
-      '<a class="hr-btn" href="/" target="_blank" rel="noopener">Open Fleet Dashboard</a>'+
-      '<div class="hr-schema">'+esc(v.schema)+"</div></div></div>";
-}
-function hrBarsMarkup(v){
-  return v.accts.map(a=>{
-    /* a.tile is the per-account battery source: 5h normally, 7d when codex's
-       5h is lifted (so a healthy codex seat shows a filled 7d bar, not empty) */
-    const last=a.tile.fill==null?6:Math.max(6,a.tile.fill);
-    if(a.state==="current")return '<span class="hr-bar hr-tone-'+a.tile.tone+'" style="--h:'+last+'%" title="'+esc(a.name)+'"></span>';
-    if(a.state==="limited")return '<span class="hr-bar hr-tone-red" style="--h:6%" title="'+esc(a.name)+'"></span>';
-    if(a.state==="stale")return '<span class="hr-bar hr-tone-unknown is-dim" style="--h:'+last+'%" title="'+esc(a.name)+'"></span>';
-    return '<span class="hr-bar hr-tone-unknown is-held" style="--h:100%" title="'+esc(a.name)+'"></span>';
-  }).join("");
-}
-function hrSmallMarkup(v){
-  return '<div class="hr-card small hr-glass glowable">'+
-    '<div class="hr-chead"><span class="hr-mark">hr</span><span class="hr-brand">headroom</span><span class="hr-sp"></span>'+hrDotMarkup(v)+'</div>'+
-    '<div class="hr-cmid"><div class="hr-cval hr-tone-'+v.hl.tone+'">'+esc(v.hl.value)+'</div>'+
-      '<div class="hr-clabel">Avg 5h battery</div></div>'+
-    '<div><div class="hr-bars" role="img" aria-label="session headroom per account">'+hrBarsMarkup(v)+'</div>'+
-      '<div class="hr-liveline">'+esc(v.liveLine)+"</div></div></div>";
-}
-function hrMediumMarkup(v){
-  const rows=v.accts.map(a=>{
-    let toneCls,fill,value,dim="";
-    if(a.state==="current"){toneCls=a.tile.tone;fill=a.tile.fill==null?0:a.tile.fill;value=a.tile.value;}
-    else if(a.state==="limited"){toneCls="red";fill=2;value=a.tile.value;}
-    else if(a.state==="stale"){toneCls="unknown";fill=a.tile.fill==null?0:a.tile.fill;value=a.tile.value;dim=" is-dim";}
-    else{toneCls="unknown";fill=0;value="n/a";}
-    return '<div class="hr-mrow"><span class="hr-mname">'+esc(a.name)+'</span>'+
-      '<span class="hr-mbar'+dim+'"><span class="hr-mfill hr-tone-'+toneCls+'" style="--fill:'+fill+'%"></span></span>'+
-      '<span class="hr-mval hr-tone-'+toneCls+'">'+esc(value)+"</span></div>";
-  }).join("");
-  return '<div class="hr-card medium hr-glass glowable">'+
-    '<div class="hr-mleft"><div class="hr-chead"><span class="hr-mark">hr</span><span class="hr-brand">headroom</span></div>'+
-    '<div class="hr-cmid"><div class="hr-cval hr-tone-'+v.hl.tone+'">'+esc(v.hl.value)+'</div>'+
-      '<div class="hr-clabel">Avg 5h battery</div></div>'+
-    '<div class="hr-liveline">'+esc(v.liveLine)+'</div></div>'+
-    '<div class="hr-mcol">'+rows+"</div></div>";
-}
-function hrRender(offline){
-  hrLastOffline=offline;
-  const v=hrData?hrView(hrData,offline):hrOfflineView();
-  const surface=document.getElementById("hr-surface");
-  surface.innerHTML=hrSize==="small"?hrSmallMarkup(v)
-    :hrSize==="medium"?hrMediumMarkup(v):hrPopMarkup(v);
-  const button=document.getElementById("hr-refresh");
-  if(button)button.addEventListener("click",()=>hrLoad(true));
-}
-async function hrLoad(manual){
-  const requestId=++hrRequest;
-  const button=document.getElementById("hr-refresh");
-  if(manual&&button){button.disabled=true;button.textContent="Refreshing…";}
-  try{
-    const controller=new AbortController();
-    const timer=setTimeout(()=>controller.abort(),12e3);
-    const response=await fetch(HR_URL+"?t="+Date.now(),{cache:"no-store",signal:controller.signal});
-    clearTimeout(timer);
-    if(!response.ok)throw new Error("widget feed returned HTTP "+response.status);
-    const data=await response.json();
-    if(!hrValidFeed(data))
-      throw new Error("widget feed invalid");
-    if(requestId===hrRequest){hrData=data;hrRender(false);}
-  }catch(error){
-    /* fail closed: whatever we still hold renders grey, nothing is promoted */
-    if(requestId===hrRequest)hrRender(true);
-  }
-}
-function hrInit(size){
-  hrSize=size==="small"||size==="medium"?size:"popup";
-  hrLoad(false);
-  setInterval(()=>hrLoad(false),6e4);
-  /* keep the snapshot-age text honest between polls */
-  setInterval(()=>{if(hrData)hrRender(hrLastOffline);},15e3);
-}
-
-/* --------------------------------------------------------------- theme */
-const picker=document.getElementById("theme");
-function applyTheme(name){
-  document.documentElement.setAttribute("data-theme",name);
-  const hrRoot=document.getElementById("hr");
-  if(hrRoot)hrRoot.setAttribute("data-theme",name);
-  picker.value=name;
-  try{localStorage.setItem("headroom-theme",name);}catch(e){}
-}
-picker.addEventListener("change",()=>applyTheme(picker.value));
-(function init(){
-  const configured=CONFIG&&CONFIG.theme;
-  let stored=null;
-  try{stored=localStorage.getItem("headroom-theme");}catch(e){}
-  const params=new URLSearchParams(location.search);
-  const widgetMode=location.pathname.replace(/\/+$/,"")==="/widget"||params.get("compact")==="1";
-  document.body.classList.toggle("is-widget",widgetMode);
-  applyTheme(params.get("theme")||stored||configured||"midnight");
-  if(CONFIG&&CONFIG.title){set("title",CONFIG.title);document.title=CONFIG.title;}
-  if(widgetMode){hrInit(params.get("size"));return;}
-  document.getElementById("refresh").addEventListener("click",()=>load(true));
-  load(false);
-  setInterval(()=>load(false),6e4);
-})();
+window.__HEADROOM_CONFIG__ = /*__HEADROOM_CONFIG__*/ null;
 </script>
+<script src="static/js/app.js" defer></script>
 </body>
 </html>

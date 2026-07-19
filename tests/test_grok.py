@@ -120,6 +120,17 @@ class CostsCatalogTest(unittest.TestCase):
                 {"provider": "claude", "monthly_cost_usd": 42}, "Max 20x"),
             42.0)
 
+    def test_monthly_translates_to_annual(self):
+        from headroom import costs
+        self.assertEqual(costs.annual_cost(300), 3600.0)
+        self.assertEqual(costs.annual_cost(39.5), 474.0)
+        self.assertEqual(
+            costs.format_monthly_with_annual(300),
+            "$300/mo · $3600/yr")
+        self.assertEqual(
+            costs.format_monthly_with_annual(20),
+            "$20/mo · $240/yr")
+
 
 class ManusCreditsTest(unittest.TestCase):
     def test_periodic_quota_percent(self):
@@ -140,3 +151,34 @@ class ManusCreditsTest(unittest.TestCase):
         self.assertEqual(windows["month"]["used_percent"], 75.0)
         self.assertEqual(plan, "Manus")
         self.assertEqual(credits["total"], 100)
+        self.assertEqual(credits["spendable"], 25)
+
+    def test_live_pro_shape_string_refresh_epoch(self):
+        # Real Manus Pro payload: unwrapped, next_refresh_time as string epoch.
+        windows, credits, plan = collect.manus_credit_windows({
+            "free_credits": 4598,
+            "max_refresh_credits": 300,
+            "next_refresh_time": "1784264400",
+            "ok": True,
+            "periodic_credits": 861,
+            "pro_monthly_credits": 4000,
+            "refresh_credits": 300,
+            "refresh_interval": "daily",
+            "total_credits": 5759,
+        }, now=1784195530)
+        self.assertEqual(plan, "Manus Pro")
+        self.assertEqual(credits["spendable"], 5459)  # free + monthly left
+        self.assertEqual(credits["free"], 4598)
+        self.assertEqual(credits["periodic"], 861)
+        self.assertEqual(credits["pro_monthly"], 4000)
+        self.assertEqual(credits["refresh"], 300)
+        self.assertEqual(credits["max_refresh"], 300)
+        self.assertEqual(credits["next_refresh_time"], 1784264400)
+        self.assertEqual(windows["month"]["remaining_units"], 861.0)
+        self.assertEqual(windows["month"]["limit_units"], 4000.0)
+        self.assertEqual(windows["month"]["used_units"], 3139.0)
+        self.assertEqual(windows["5h"]["remaining_units"], 300.0)
+        self.assertEqual(windows["5h"]["limit_units"], 300.0)
+        self.assertEqual(windows["5h"]["resets_at"], 1784264400)
+        self.assertEqual(windows["5h"]["label"], "Daily refresh")
+        self.assertEqual(windows["month"]["label"], "Monthly credits")

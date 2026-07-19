@@ -7,7 +7,7 @@
   "accounts": [
     {
       "name": "personal", "email": "alex@fastmail.com", "provider": "claude",
-      "plan": "Max 20x", "monthly_cost_usd": 200, "ok": true, "stale": false, "routable": true,
+      "plan": "Max 20x", "monthly_cost_usd": 200, "annual_cost_usd": 2400, "ok": true, "stale": false, "routable": true,
       "trust_state": "verified", "identity_verified": true,
       "identity_method": "claude_auth_status", "captured_at": 0,
       "source": "anthropic_usage_api",
@@ -69,7 +69,7 @@
       "plan": "SuperGrok Heavy", "ok": true, "stale": false, "routable": true,
       "trust_state": "verified", "identity_verified": true,
       "identity_method": "grok_user_api", "captured_at": 0,
-      "source": "grok_billing_api", "monthly_cost_usd": 300,
+      "source": "grok_billing_api", "monthly_cost_usd": 300, "annual_cost_usd": 3600,
       "subscription": {"status": "active", "source": "grok_billing_api"},
       "windows": {
         "month": {"used_percent": 22.5, "resets_at": 0, "window_minutes": 44640,
@@ -82,7 +82,7 @@
       "plan": "Manus Pro", "ok": true, "stale": false, "routable": true,
       "trust_state": "verified", "identity_verified": true,
       "identity_method": "manus_available_credits", "captured_at": 0,
-      "source": "manus_credits_api", "monthly_cost_usd": 39,
+      "source": "manus_credits_api", "monthly_cost_usd": 39, "annual_cost_usd": 468,
       "credits": {"total": 2800, "periodic": 2800, "pro_monthly": 4000,
                   "free": 0, "addon": 0, "refresh": 0},
       "windows": {

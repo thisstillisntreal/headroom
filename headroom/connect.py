@@ -28,21 +28,25 @@ CREDENTIAL_FILES = {
     "codex": ["auth.json"],
     "grok": ["auth.json"],
     "manus": ["auth.json"],
+    "nvidia": ["auth.json"],
 }
 DEFAULT_HOMES = {
     "claude": "~/.claude",
     "codex": "~/.codex",
     "grok": "~/.grok",
     "manus": "~/.manus",
+    "nvidia": "~/.nvidia-headroom",
 }
 PROVIDER_BINARIES = {
     "claude": "claude", "codex": "codex", "grok": "grok", "manus": "manus",
+    "nvidia": "nvidia",
 }
 HOME_ENV = {
     "claude": "CLAUDE_CONFIG_DIR",
     "codex": "CODEX_HOME",
     "grok": "GROK_HOME",
     "manus": "MANUS_HOME",
+    "nvidia": "NVIDIA_HOME",
 }
 
 
@@ -108,6 +112,8 @@ def slot_identity(provider, home):
             identity = collector.grok_local_identity(home)
         elif provider == "manus":
             identity = collector.manus_local_identity(home)
+        elif provider == "nvidia":
+            identity = collector.nvidia_local_identity(home)
         else:
             identity = collector.codex_identity(home)
         return identity
@@ -116,8 +122,34 @@ def slot_identity(provider, home):
 
 
 def detect_existing():
-    """Discover logins already on this machine, for the wizard/adopt flow."""
+    """Discover logins already on this machine, for the wizard/adopt flow.
+
+    Includes the default provider homes (~/.claude, ~/.codex, ~/.grok, …)
+    AND any isolated multi-account homes under ~/.headroom/homes/<slot>/.
+    Multiple logins for the same provider are all returned.
+    """
     found = []
+    seen_homes = set()
+
+    def _add(provider, home, source="default"):
+        home = os.path.realpath(os.path.expanduser(home))
+        if home in seen_homes:
+            return
+        if not os.path.isdir(home):
+            return
+        identity = slot_identity(provider, home)
+        if not identity or not identity.get("email"):
+            return
+        seen_homes.add(home)
+        found.append({
+            "provider": provider,
+            "home": home,
+            "email": identity["email"],
+            "fingerprint": identity.get("account_fingerprint"),
+            "source": source,
+            "slot_hint": os.path.basename(home) if source == "homes" else provider,
+        })
+
     for provider, default in DEFAULT_HOMES.items():
         env_key = HOME_ENV[provider]
         home = os.path.expanduser(os.environ.get(env_key, default))
@@ -127,14 +159,92 @@ def detect_existing():
             if not os.environ.get("MANUS_API_KEY", "").strip():
                 continue
             os.makedirs(home, mode=0o700, exist_ok=True)
-        if not os.path.isdir(home):
-            continue
-        identity = slot_identity(provider, home)
-        if identity and identity.get("email"):
-            found.append({"provider": provider, "home": home,
-                          "email": identity["email"],
-                          "fingerprint": identity.get("account_fingerprint")})
+        _add(provider, home, source="default")
+
+    # Isolated multi-account homes (original headroom model)
+    homes_root = paths.homes_dir()
+    if os.path.isdir(homes_root):
+        try:
+            slot_names = sorted(os.listdir(homes_root))
+        except OSError:
+            slot_names = []
+        for slot in slot_names:
+            home = os.path.join(homes_root, slot)
+            if not os.path.isdir(home) or slot.startswith("."):
+                continue
+            # Infer provider from which credentials exist
+            for provider in ("claude", "codex", "grok", "manus", "nvidia"):
+                if provider == "claude":
+                    has = (os.path.exists(os.path.join(home, ".credentials.json"))
+                           or os.path.exists(os.path.join(home, ".claude.json")))
+                else:
+                    has = os.path.exists(os.path.join(home, "auth.json"))
+                if has:
+                    _add(provider, home, source="homes")
+                    break
+            else:
+                # Try each provider's identity probe anyway
+                for provider in ("claude", "codex", "grok", "manus", "nvidia"):
+                    _add(provider, home, source="homes")
+                    if any(f["home"] == os.path.realpath(home) for f in found):
+                        break
     return found
+
+
+def next_slot_name(config, provider):
+    """Suggest claude, claude-2, codex-work style free names for multi-account."""
+    taken = {a.get("name") for a in (config.get("accounts") or [])
+             if isinstance(a, dict)}
+    if provider not in taken:
+        return provider
+    for index in range(2, 100):
+        candidate = f"{provider}-{index}"
+        if candidate not in taken:
+            return candidate
+    return f"{provider}-{os.getpid()}"
+
+
+def isolated_home_path(name):
+    """Canonical multi-account home: ~/.headroom/homes/<name>."""
+    if not registry.NAME_RE.fullmatch(name):
+        raise ValueError("invalid slot name")
+    home = os.path.join(paths.homes_dir(), name)
+    if os.path.realpath(home) != os.path.realpath(
+            os.path.join(paths.homes_dir(), os.path.basename(name))):
+        raise ValueError("slot name resolves outside the homes directory")
+    return home
+
+
+def prepare_fresh_home(name, provider):
+    """Create an isolated config home for a second/third login (no login yet)."""
+    if provider not in ("claude", "codex", "grok"):
+        raise ValueError(
+            "fresh interactive login is for claude/codex/grok — "
+            "use API key connect for manus/nvidia")
+    home = isolated_home_path(name)
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    env_key = HOME_ENV[provider]
+    if provider == "claude":
+        login_cmd = f"{env_key}={home} claude auth login"
+    elif provider == "codex":
+        login_cmd = f"{env_key}={home} codex login"
+    else:
+        login_cmd = f"{env_key}={home} grok login"
+    connect_cmd = f"headroom connect {name} --provider {provider} --adopt {home}"
+    return {
+        "name": name,
+        "provider": provider,
+        "home": home,
+        "env_key": env_key,
+        "login_cmd": login_cmd,
+        "connect_cmd": connect_cmd,
+        "instructions": (
+            f"1) Run login in a terminal:\n   {login_cmd}\n"
+            f"2) Complete the browser/device login for the account you want.\n"
+            f"3) Click “Connect this slot” in the dashboard, or run:\n"
+            f"   {connect_cmd}"
+        ),
+    }
 
 
 def write_manus_auth(home, api_key, email=None, plan=None):
@@ -146,6 +256,55 @@ def write_manus_auth(home, api_key, email=None, plan=None):
     if plan:
         payload["plan"] = plan
     paths.write_json_atomic(os.path.join(home, "auth.json"), payload, mode=0o600)
+
+
+def write_nvidia_auth(home, api_key=None, email=None, plan=None,
+                      use_insights_key=False):
+    """Persist a NVIDIA API key (or link to shared insights key)."""
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    payload = {"use_insights_key": bool(use_insights_key)}
+    if api_key and str(api_key).strip():
+        payload["api_key"] = str(api_key).strip()
+        payload["use_insights_key"] = False
+    if email:
+        payload["email"] = email
+    if plan:
+        payload["plan"] = plan
+    paths.write_json_atomic(os.path.join(home, "auth.json"), payload, mode=0o600)
+
+
+def connect_nvidia_key(config, name, api_key=None, email=None,
+                       monthly_cost_usd=None, use_insights_key=False,
+                       quiet=False):
+    """Create a NVIDIA tracking slot from a key or the shared insights key."""
+    if not registry.NAME_RE.fullmatch(name):
+        print(f"slot name {name!r} invalid", file=sys.stderr)
+        return None
+    if not use_insights_key and (not api_key or not str(api_key).strip()):
+        print("nvidia API key is empty (or set use_insights_key)", file=sys.stderr)
+        return None
+    home = os.path.join(paths.homes_dir(), name)
+    write_nvidia_auth(home, api_key=api_key, email=email, plan="NVIDIA Free",
+                      use_insights_key=use_insights_key)
+    identity = slot_identity("nvidia", home)
+    if not identity:
+        print("could not bind NVIDIA identity from that API key", file=sys.stderr)
+        return None
+    duplicates = existing_fingerprints(config, "nvidia")
+    fingerprint = identity.get("account_fingerprint")
+    if fingerprint and fingerprint in duplicates:
+        print(f"that NVIDIA key is already connected as slot "
+              f"'{duplicates[fingerprint]}'", file=sys.stderr)
+        return None
+    expected = email or (identity["email"]
+                         if not str(identity["email"]).startswith("nvidia:")
+                         else None)
+    cost = monthly_cost_usd if monthly_cost_usd is not None else 0.0
+    entry = add_account(config, name, "nvidia", home, expected,
+                        monthly_cost_usd=cost)
+    if not quiet:
+        print(f"connected: {name} -> {identity['email']} (nvidia)")
+    return entry
 
 
 def connect_manus_key(config, name, api_key, email=None, monthly_cost_usd=None,
@@ -335,6 +494,19 @@ def connect_fresh(config, name, provider, quiet=False):
             monthly = default_cost
         return connect_manus_key(config, name, api_key, email=email,
                                  monthly_cost_usd=monthly, quiet=quiet)
+    if provider == "nvidia":
+        if not quiet:
+            print("NVIDIA Build API (free tier) — tracks local API usage.")
+            print("Key: build.nvidia.com → API keys, or reuse Insights key.")
+        reuse = input("Reuse Insights/NVIDIA key already on this Mac? [Y/n]: ").strip().lower()
+        use_shared = reuse in ("", "y", "yes")
+        api_key = None
+        if not use_shared:
+            api_key = input("Paste NVIDIA API key: ").strip()
+        email = input("Email label (optional): ").strip() or None
+        return connect_nvidia_key(
+            config, name, api_key=api_key, email=email,
+            monthly_cost_usd=0.0, use_insights_key=use_shared, quiet=quiet)
     if not registry.NAME_RE.fullmatch(name):
         print(f"slot name {name!r} invalid: lowercase letters, digits, - and _ "
               f"only (max 32 chars)", file=sys.stderr)

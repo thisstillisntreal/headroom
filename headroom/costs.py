@@ -29,6 +29,9 @@ DEFAULT_MONTHLY_COSTS = (
     ("manus", "pro", 39.0),
     ("manus", "starter", 19.0),
     ("manus", "free", 0.0),
+    # NVIDIA Build / NIM free tier (promo: free for a year)
+    ("nvidia", "free", 0.0),
+    ("nvidia", "nvidia", 0.0),
 )
 
 
@@ -62,9 +65,38 @@ def resolve_monthly_cost(account, plan=None):
                                 plan or account.get("plan"))
 
 
-def format_usd(amount):
+def _money(amount):
+    amount = float(amount)
+    if amount == int(amount):
+        return f"${int(amount)}"
+    return f"${amount:.2f}"
+
+
+def annual_cost(monthly):
+    """Translate monthly USD to yearly (×12), or None."""
+    if monthly is None:
+        return None
+    if isinstance(monthly, bool) or not isinstance(monthly, (int, float)):
+        return None
+    if monthly < 0 or monthly != monthly:  # NaN
+        return None
+    return float(monthly) * 12.0
+
+
+def format_usd(amount, *, period="month"):
+    """Format a USD amount. period is 'month', 'year', or 'both' (mo + /yr)."""
     if amount is None:
         return None
-    if float(amount) == int(amount):
-        return f"${int(amount)}/mo"
-    return f"${amount:.2f}/mo"
+    if period == "year":
+        return f"{_money(amount)}/yr"
+    if period == "both":
+        yearly = annual_cost(amount)
+        if yearly is None:
+            return None
+        return f"{_money(amount)}/mo · {_money(yearly)}/yr"
+    return f"{_money(amount)}/mo"
+
+
+def format_monthly_with_annual(monthly):
+    """Show monthly cost and its yearly translation."""
+    return format_usd(monthly, period="both")
